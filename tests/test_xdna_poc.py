@@ -39,6 +39,7 @@ from anima_xdna_poc.weight_cache import (
     LAYOUT_VERSION,
     PackedWeightCache,
     fingerprint_execution_source,
+    fingerprint_effective_tensors,
     fingerprint_source,
 )
 
@@ -108,6 +109,141 @@ def _save_native_blocks(path, config, prefix, count=1, fill=0.0):
 
 
 class PackedWeightCacheTests(unittest.TestCase):
+    def test_effective_weight_cache_keys_exact_values_and_reuses(self):
+        config = _tiny_block_config()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkpoint = root / "base.safetensors"
+            base = _block_tensors(config)
+            save_file(
+                {
+                    f"transformer_blocks.0.{name}": tensor
+                    for name, tensor in base.items()
+                },
+                checkpoint,
+            )
+
+            def provider(offset):
+                return lambda key: (
+                    base[key.removeprefix("transformer_blocks.0.")]
+                    + offset
+                ).to(torch.bfloat16)
+
+            first = PackedWeightCache(
+                checkpoint,
+                config,
+                0,
+                1,
+                root / "cache",
+                effective_tensor_provider=provider(1.0),
+            )
+            first_status = first.open()
+            first_identity = first.execution_identity
+            first.close()
+            reused = PackedWeightCache(
+                checkpoint,
+                config,
+                0,
+                1,
+                root / "cache",
+                effective_tensor_provider=provider(1.0),
+            )
+            reused_status = reused.open()
+            reused.close()
+            changed = PackedWeightCache(
+                checkpoint,
+                config,
+                0,
+                1,
+                root / "cache",
+                effective_tensor_provider=provider(2.0),
+            )
+            changed_status = changed.open()
+            changed.close()
+        self.assertFalse(first_status.hit)
+        self.assertTrue(reused_status.hit)
+        self.assertEqual(first_status.key, reused_status.key)
+        self.assertNotEqual(first_status.key, changed_status.key)
+        self.assertNotEqual(
+            first_identity["block_fingerprint"],
+            fingerprint_effective_tensors(provider(2.0), range(1))[
+                "block_fingerprint"
+            ],
+        )
+
+    def test_effective_weight_cache_rejects_values_changing_during_build(self):
+        config = _tiny_block_config()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkpoint = root / "base.safetensors"
+            base = _block_tensors(config)
+            save_file(
+                {
+                    f"transformer_blocks.0.{name}": tensor
+                    for name, tensor in base.items()
+                },
+                checkpoint,
+            )
+            calls = 0
+
+            def provider(key):
+                nonlocal calls
+                calls += 1
+                offset = 0.0 if calls <= 20 else 1.0
+                return (
+                    base[key.removeprefix("transformer_blocks.0.")]
+                    + offset
+                ).to(torch.bfloat16)
+
+            cache = PackedWeightCache(
+                checkpoint,
+                config,
+                0,
+                1,
+                root / "cache",
+                effective_tensor_provider=provider,
+            )
+            with self.assertRaisesRegex(
+                CacheIntegrityError, "changed while building"
+            ):
+                cache.open()
+
+    def test_effective_weight_cache_normalizes_f16_base_metadata(self):
+        config = _tiny_block_config()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkpoint = root / "base-f16.safetensors"
+            base = _block_tensors(config)
+            save_file(
+                {
+                    f"transformer_blocks.0.{name}": tensor.to(torch.float16)
+                    for name, tensor in base.items()
+                },
+                checkpoint,
+            )
+
+            def provider(key):
+                return base[
+                    key.removeprefix("transformer_blocks.0.")
+                ].clone()
+
+            cache = PackedWeightCache(
+                checkpoint,
+                config,
+                0,
+                1,
+                root / "cache",
+                effective_tensor_provider=provider,
+            )
+            cache.open()
+            execution = cache.execution_identity
+            base_execution = cache.manifest["descriptor"][
+                "base_execution_identity"
+            ]
+            cache.close()
+        self.assertEqual(execution["source_dtypes"], ["BF16"])
+        self.assertEqual(base_execution["source_dtypes"], ["F16"])
+
     def test_model_fingerprint_normalizes_non_bf16_weights(self):
         class Model:
             def __init__(self, dtype):

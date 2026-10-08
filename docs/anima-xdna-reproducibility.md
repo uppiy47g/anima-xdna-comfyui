@@ -127,6 +127,24 @@ directory. Connect the wrapped MODEL to `Anima XDNA Runtime Status` when
 collecting evidence. `Unload Anima XDNA Runtime` releases the attachment
 before a model switch.
 
+Ordinary additive Anima LoRAs can be inserted with ComfyUI's standard LoRA
+nodes between the BF16 loader and XDNA attach node. Before reading the weights,
+the attach node asks ComfyUI's public model-management API to activate that
+exact ModelPatcher. This restores the base weights when switching from a LoRA
+workflow to a no-LoRA workflow in the same process. The implementation then
+reads ModelPatcher's ordered patch entries, computes each effective block tensor
+on a private copy through ComfyUI's LoRA math and deterministic rounding,
+normalizes it to BF16, and fingerprints every byte.
+The cache build recomputes the fingerprint and atomically rejects patch
+mutation. Cache hits verify the exact effective descriptor and packed payload.
+Unsupported adapter or runtime patch types are rejected before XRT opens.
+Hybrid Turbo LoRAs may additionally use ComfyUI's legacy
+`("diff", (tensor,))` patch representation for the self/cross-attention Q/K
+norm weights. Only those four canonical norm weights per block are accepted;
+the tensor must have the exact base shape and finite values, and offsets,
+custom functions, padding, `set`, `model_as_lora`, and other block diffs remain
+rejected. Block-external patches continue through ComfyUI's normal CPU path.
+
 The stock `UNETLoader` control does not offer BF16. On the validated
 CPU-only ComfyUI setup, its default Anima dtype policy selects FP32 (the
 Anima config supports BF16, FP16, and FP32; `should_use_bf16(cpu)` is false).
@@ -144,10 +162,11 @@ bytes after model/checkpoint fingerprint equality is verified. It also warns
 if the attached block Parameters are FP32. XRT BO population is reported
 separately; it is not added to CPU Parameter bytes. We intentionally retain
 all block Parameters: `ModelPatcher.clone()` shares the underlying model
-module, and the current wrapper does not own a reversible lazy-restore,
-LoRA/patch, state-dict, or reload lifecycle for deleting them safely. The
-BF16 loader is therefore the supported memory reduction; attach does not
-mutate or release shared model weights.
+module. ModelPatcher's normal managed load may patch or restore that shared
+module when workflows switch, exactly as stock ComfyUI sampling does. The XDNA
+cache builder itself calculates supported LoRA effective weights on private CPU
+tensor copies and never writes them back, deletes them, or releases shared
+model weights. The BF16 loader remains the supported memory reduction.
 
 The explicit BF16 option changes CPU pre/post-block computation dtype compared
 with CPU-default FP32. The native checkpoint values are BF16 in both Base and

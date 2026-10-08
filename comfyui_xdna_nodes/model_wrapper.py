@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import Counter
 from dataclasses import asdict, dataclass
 import json
+import math
 from pathlib import Path
 import threading
 import time
@@ -22,6 +23,7 @@ from anima_xdna_poc.checkpoint_schema import (
     validated_variant,
 )
 from anima_xdna_poc.errors import PrototypeError, UnsupportedTensor
+from anima_xdna_poc.weight_cache import fingerprint_effective_tensors
 
 
 SUPPORTED_COMFY_COMMIT = "170594057a22673349ddf0a3d88624b7fa5865bb"
@@ -62,6 +64,8 @@ class RuntimeDiagnostics:
     source_execution_fingerprint: Optional[str] = None
     source_dtypes: Optional[list[str]] = None
     source_normalization_message: Optional[str] = None
+    lora_patch_count: int = 0
+    lora_cache_message: Optional[str] = None
     model_schema: Optional[str] = None
     model_fingerprint: Optional[str] = None
     model_variant: Optional[str] = None
@@ -87,11 +91,19 @@ class SharedRuntime:
         cache_dir: Optional[Path] = None,
         rebuild_cache: bool = False,
         qkv_chaining: bool = True,
+        effective_tensor_provider=None,
+        lora_patch_count: int = 0,
+        base_model_fingerprint: Optional[str] = None,
+        base_model_schema: Optional[str] = None,
     ):
         self.checkpoint = Path(checkpoint)
         self.cache_dir = cache_dir
         self.rebuild_cache = rebuild_cache
         self.qkv_chaining = qkv_chaining
+        self.effective_tensor_provider = effective_tensor_provider
+        self.lora_patch_count = lora_patch_count
+        self.base_model_fingerprint = base_model_fingerprint
+        self.base_model_schema = base_model_schema
         self._runtime: Optional[AnimaXDNAChainRuntime] = None
         self._refs = 1
         self._lock = threading.RLock()
@@ -109,6 +121,7 @@ class SharedRuntime:
                 cache_dir=self.cache_dir,
                 rebuild_cache=self.rebuild_cache,
                 qkv_chaining=self.qkv_chaining,
+                effective_tensor_provider=self.effective_tensor_provider,
             )
             try:
                 runtime.prepare_weight_cache()
@@ -121,22 +134,36 @@ class SharedRuntime:
                         "packed cache did not expose BF16 execution identity"
                     )
                 identity_started = time.perf_counter()
-                model_fingerprint, model_schema = fingerprint_model_blocks(diffusion_model)
+                if self.base_model_fingerprint is None:
+                    base_model_fingerprint, model_schema = (
+                        fingerprint_model_blocks(diffusion_model)
+                    )
+                else:
+                    base_model_fingerprint = self.base_model_fingerprint
+                    model_schema = self.base_model_schema
                 identity_check_ms = (
                     time.perf_counter() - identity_started
                 ) * 1000
                 source_fingerprint = identity["block_fingerprint"]
-                source_execution_fingerprint = execution_identity[
+                base_execution_identity = runtime.base_execution_identity
+                if not isinstance(base_execution_identity, dict):
+                    base_execution_identity = execution_identity
+                if base_execution_identity is None:
+                    raise RuntimeError(
+                        "packed cache did not expose base execution identity"
+                    )
+                source_execution_fingerprint = base_execution_identity[
                     "block_fingerprint"
                 ]
-                if model_fingerprint != source_execution_fingerprint:
+                if base_model_fingerprint != source_execution_fingerprint:
                     raise RuntimeError(
                         "Anima MODEL/checkpoint mismatch: the connected MODEL "
-                        "does not contain the same 28-block weights as the XDNA "
-                        f"source (MODEL {model_fingerprint[:16]}..., source "
+                        "does not contain the same base 28-block weights as the "
+                        f"XDNA source (MODEL {base_model_fingerprint[:16]}..., source "
                         f"{source_execution_fingerprint[:16]}...). Select the matching "
                         "Base or Turbo checkpoint; no dispatch was attempted."
                     )
+                model_fingerprint = execution_identity["block_fingerprint"]
                 storage_profile = _model_storage_profile(diffusion_model)
             except BaseException:
                 runtime.close()
@@ -158,6 +185,7 @@ class SharedRuntime:
             self.diagnostics.model_variant = validated_variant(
                 source_execution_fingerprint
             )
+            self.diagnostics.lora_patch_count = self.lora_patch_count
             self.diagnostics.qkv_chaining = self.qkv_chaining
             self.diagnostics.model_block_parameter_count = storage_profile[
                 "block_parameter_count"
@@ -205,6 +233,21 @@ class SharedRuntime:
                     "runs reuse this cache."
                 )
                 self.diagnostics.source_normalization_message = message
+                print(f"[Anima XDNA] {message}")
+            if self.lora_patch_count:
+                action = (
+                    "Reusing the verified"
+                    if runtime.cache_status is not None
+                    and runtime.cache_status.hit
+                    else "Created a verified"
+                )
+                message = (
+                    f"{action} BF16 packed cache for "
+                    f"{self.lora_patch_count} Anima LoRA block patches. "
+                    "The checkpoint and LoRA files are unchanged; identical "
+                    "effective weights reuse this cache."
+                )
+                self.diagnostics.lora_cache_message = message
                 print(f"[Anima XDNA] {message}")
 
     def acquire(self):
@@ -519,11 +562,6 @@ def _validate_patcher(model):
         raise RuntimeError(
             "unsupported ComfyUI ModelPatcher API; missing " + ", ".join(missing)
         )
-    if getattr(model, "patches", None):
-        raise RuntimeError(
-            "Anima XDNA does not support LoRA/model weight patches yet. "
-            "Attach it directly to an unpatched Base v1.0 or Turbo V1.1 MODEL."
-        )
     transformer_options = getattr(model, "model_options", {}).get(
         "transformer_options", {}
     )
@@ -540,6 +578,205 @@ def _validate_patcher(model):
         raise RuntimeError(
             "Load/Attach Anima XDNA Model requires a ComfyUI Anima MODEL"
         )
+
+
+def _effective_lora_provider(model):
+    patches = getattr(model, "patches", {})
+    block_patch_keys = {
+        key
+        for key in patches
+        if isinstance(key, str)
+        and key.startswith("diffusion_model.blocks.")
+    }
+    if not block_patch_keys:
+        return None, 0, None, None
+    if not hasattr(model, "get_key_patches"):
+        raise RuntimeError(
+            "unsupported ComfyUI ModelPatcher API; missing get_key_patches"
+        )
+
+    try:
+        import comfy.float
+        import comfy.lora
+        import comfy.model_management
+        import comfy.utils
+        from comfy.weight_adapter.lora import LoRAAdapter
+    except ImportError as error:
+        raise RuntimeError(
+            "ComfyUI LoRA APIs are unavailable; use the validated ComfyUI "
+            f"commit {SUPPORTED_COMFY_COMMIT}."
+        ) from error
+
+    key_patches = model.get_key_patches("diffusion_model.")
+    schema = detect_checkpoint_schema(key_patches.keys())
+    canonical_to_model = dict(schema.canonical_to_source)
+    canonical_model_keys = set(canonical_to_model.values())
+    unsupported_keys = sorted(block_patch_keys - canonical_model_keys)
+    if unsupported_keys:
+        raise RuntimeError(
+            "Anima XDNA cannot safely apply block patches outside the 560 "
+            "supported weights: " + ", ".join(unsupported_keys[:4])
+        )
+
+    entries_by_canonical = {}
+    patch_count = 0
+    for canonical_key in canonical_keys():
+        model_key = canonical_to_model[canonical_key]
+        entries = key_patches[model_key]
+        if not entries or len(entries[0]) != 2:
+            raise RuntimeError(
+                f"invalid ComfyUI patch entries for {model_key!r}"
+            )
+        for patch in entries[1:]:
+            if not isinstance(patch, tuple) or len(patch) != 5:
+                raise RuntimeError(
+                    f"unsupported ComfyUI patch structure for {model_key!r}"
+                )
+            strength, adapter, strength_model, offset, function = patch
+            if (
+                strength_model != 1.0
+                or offset is not None
+                or function is not None
+            ):
+                raise RuntimeError(
+                    "Anima XDNA supports only additive block patches without "
+                    f"model scaling, offsets, or functions; unsupported patch on "
+                    f"{model_key!r}"
+                )
+            if not isinstance(strength, (int, float)) or not math.isfinite(
+                float(strength)
+            ):
+                raise RuntimeError(
+                    f"LoRA strength for {model_key!r} must be finite"
+                )
+            base = entries[0][0]
+            if type(adapter) is tuple:
+                is_norm = model_key.endswith(
+                    (
+                        ".self_attn.q_norm.weight",
+                        ".self_attn.k_norm.weight",
+                        ".cross_attn.q_norm.weight",
+                        ".cross_attn.k_norm.weight",
+                    )
+                )
+                if (
+                    not is_norm
+                    or len(adapter) != 2
+                    or adapter[0] != "diff"
+                    or type(adapter[1]) is not tuple
+                    or len(adapter[1]) != 1
+                    or not isinstance(adapter[1][0], torch.Tensor)
+                ):
+                    raise RuntimeError(
+                        "Anima XDNA supports legacy diff patches only for "
+                        f"attention q/k norm weights; unsupported patch on {model_key!r}"
+                    )
+                diff = adapter[1][0]
+                if (
+                    tuple(diff.shape) != tuple(base.shape)
+                    or not bool(torch.isfinite(diff.float()).all())
+                ):
+                    raise RuntimeError(
+                        "Anima XDNA requires finite, exact-shape attention "
+                        f"norm diff weights on {model_key!r}"
+                    )
+                patch_count += 1
+                continue
+            if type(adapter) is not LoRAAdapter:
+                raise RuntimeError(
+                    "Anima XDNA currently supports only ordinary additive "
+                    "LoRAAdapter patches and exact attention norm diff patches; "
+                    f"unsupported patch on {model_key!r}"
+                )
+            weights = adapter.weights
+            if not isinstance(weights, tuple) or len(weights) != 6:
+                raise RuntimeError(
+                    f"invalid LoRAAdapter weights for {model_key!r}"
+                )
+            up, down, alpha, mid, dora_scale, reshape = weights
+            if (
+                not isinstance(up, torch.Tensor)
+                or not isinstance(down, torch.Tensor)
+                or up.ndim != 2
+                or down.ndim != 2
+                or up.shape[1] != down.shape[0]
+                or mid is not None
+                or dora_scale is not None
+                or reshape is not None
+                or (
+                    alpha is not None
+                    and (
+                        not isinstance(alpha, (int, float))
+                        or not math.isfinite(float(alpha))
+                    )
+                )
+                or not bool(torch.isfinite(up.float()).all())
+                or not bool(torch.isfinite(down.float()).all())
+            ):
+                raise RuntimeError(
+                    "Anima XDNA supports finite 2-D ordinary LoRA weights "
+                    f"without mid/DoRA/reshape on {model_key!r}"
+                )
+            if up.numel() == 0 or down.numel() == 0 or (
+                up.shape[0] * down.shape[1] != base.numel()
+            ):
+                raise RuntimeError(
+                    f"LoRA rank/shape does not match {model_key!r}"
+                )
+            patch_count += 1
+        entries_by_canonical[canonical_key] = (model_key, entries)
+
+    cpu = torch.device("cpu")
+
+    def base_provider(canonical_key: str) -> torch.Tensor:
+        _model_key, entries = entries_by_canonical[canonical_key]
+        base, convert = entries[0]
+        tensor = comfy.model_management.cast_to_device(
+            base, cpu, torch.bfloat16, copy=True
+        )
+        return convert(tensor, inplace=True).detach().contiguous()
+
+    base_identity = fingerprint_effective_tensors(
+        base_provider,
+        range(28),
+    )
+
+    def provider(canonical_key: str) -> torch.Tensor:
+        model_key, entries = entries_by_canonical[canonical_key]
+        base, convert = entries[0]
+        compute_dtype = comfy.model_management.lora_compute_dtype(cpu)
+        tensor = comfy.model_management.cast_to_device(
+            base, cpu, compute_dtype, copy=True
+        )
+        tensor = convert(tensor, inplace=True)
+        if entries[1:]:
+            tensor = comfy.lora.calculate_weight(
+                entries[1:],
+                tensor,
+                model_key,
+            )
+            tensor = comfy.float.stochastic_rounding(
+                tensor,
+                base.dtype,
+                seed=comfy.utils.string_to_seed(model_key),
+            )
+        tensor = tensor.detach().to(torch.bfloat16).contiguous()
+        if tuple(tensor.shape) != tuple(base.shape):
+            raise RuntimeError(
+                f"effective LoRA tensor shape changed for {model_key!r}"
+            )
+        if not bool(torch.isfinite(tensor.float()).all()):
+            raise RuntimeError(
+                f"effective LoRA tensor contains non-finite values: {model_key!r}"
+            )
+        return tensor
+
+    return (
+        provider,
+        patch_count,
+        base_identity["block_fingerprint"],
+        schema.name,
+    )
 
 
 def _model_storage_profile(diffusion_model) -> dict[str, Any]:
@@ -791,12 +1028,31 @@ class LoadAttachAnimaXDNAModel:
         path = _resolve_attach_checkpoint(model, checkpoint)
         if not path.is_file():
             raise RuntimeError(f"Anima checkpoint does not exist: {path}")
+        try:
+            import comfy.model_management
+        except ImportError as error:
+            raise RuntimeError(
+                "ComfyUI model management is unavailable"
+            ) from error
+        comfy.model_management.load_models_gpu([model])
+        (
+            effective_tensor_provider,
+            lora_patch_count,
+            base_model_fingerprint,
+            base_model_schema,
+        ) = (
+            _effective_lora_provider(model)
+        )
         patched = model.clone()
         runtime = SharedRuntime(
             path,
             Path(cache_dir) if cache_dir.strip() else None,
             rebuild_cache,
             qkv_chaining,
+            effective_tensor_provider,
+            lora_patch_count,
+            base_model_fingerprint,
+            base_model_schema,
         )
         try:
             runtime.prepare(model.model.diffusion_model)

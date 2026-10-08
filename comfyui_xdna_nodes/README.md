@@ -72,12 +72,18 @@ starting ComfyUI. The packed cache defaults to
    its default Anima policy chooses FP32. The custom loader passes BF16 through
    ComfyUI's supported `load_diffusion_model` options and refuses the result
    if any transformer-block Parameter expanded to another dtype.
-2. Connect it to **Load/Attach Anima XDNA Model**.
+2. Connect it to **Load/Attach Anima XDNA Model**. To use an Anima LoRA,
+   insert one or more standard **Load LoRA** or **Load LoRA Model Only** nodes
+   before the attach node. Strength changes and chained ordinary LoRAs produce
+   separate exact effective-weight identities.
 3. Leave `checkpoint` at **Auto (from MODEL)**. **Load Anima (BF16)** records
    its exact source on the MODEL and the attach node reuses it automatically,
    including through normal ModelPatcher clones. The file remains read-only
    and is the XDNA cache source of truth. A manual path remains available for
    MODELs loaded another way; it must contain the same block weights.
+   The attach node activates the selected ModelPatcher through ComfyUI's
+   model-management API before verification, so a LoRA-to-base workflow switch
+   restores the correct shared weights.
    If its block weights are F16 or F32, the first attach creates a verified
    BF16 packed cache without modifying the checkpoint. The ComfyUI log and
    runtime status explain this conversion; later attaches report verified
@@ -112,8 +118,15 @@ folder.
 The attach status reports block Parameter logical/unique-storage bytes and
 dtype counts after source identity matches. It warns when CPU block Parameters
 are FP32. XRT BO population is reported separately. ModelPatcher clones share
-the underlying module, so attach never deletes or replaces block Parameters;
-LoRA/patch/state-dict behavior has no safe lazy-restore contract today.
+the underlying module, so attach never deletes or replaces block Parameters.
+For ordinary additive `LoRAAdapter` patches, and exact additive legacy `diff`
+patches limited to self/cross-attention Q/K norm weights, it uses ComfyUI's
+supported weight calculation path on CPU copies, validates all 560 effective
+BF16 tensors, and builds or reuses a cache keyed by their exact values. This
+covers hybrid Turbo LoRAs that combine matrix LoRA weights with norm deltas.
+LoHa, LoKr, OFT, DoRA, reshape/mid-weight LoRA, other block diff/bias patches,
+and runtime transformer patches stop before NPU dispatch rather than being
+silently ignored.
 Fresh-process measurements on the validated host found stock FP32 loading
 used about 7.12 GB more process PrivateUsage than BF16 loading for either
 checkpoint (46.5%); see the evidence for working-set and peak counters. A
