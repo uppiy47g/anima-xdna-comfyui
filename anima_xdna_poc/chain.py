@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 import tempfile
 import time
-from typing import Optional
+from typing import Callable, Optional
 
 import torch
 
@@ -72,6 +72,9 @@ class AnimaXDNAChainRuntime:
         cache_dir: Optional[Path] = None,
         rebuild_cache: bool = False,
         qkv_chaining: bool = True,
+        effective_tensor_provider: Optional[
+            Callable[[str], torch.Tensor]
+        ] = None,
     ):
         self.checkpoint = Path(checkpoint)
         self.config: AnimaBlockConfig = load_checkpoint_config(
@@ -82,6 +85,7 @@ class AnimaXDNAChainRuntime:
         self.cache_dir = cache_dir
         self.rebuild_cache = rebuild_cache
         self.qkv_chaining = qkv_chaining
+        self.effective_tensor_provider = effective_tensor_provider
         self._weights: dict[int, AnimaBlockWeights] = {}
         self._session: Optional[ResidentXDNASession] = None
         self._packed_cache: Optional[PackedWeightCache] = None
@@ -115,6 +119,15 @@ class AnimaXDNAChainRuntime:
             return None
         return self._packed_cache.execution_identity
 
+    @property
+    def base_execution_identity(self) -> Optional[dict]:
+        if self._packed_cache is None or self._packed_cache.manifest is None:
+            return None
+        return self._packed_cache.manifest["descriptor"].get(
+            "base_execution_identity",
+            self._packed_cache.execution_identity,
+        )
+
     def close(self):
         if self._session is not None:
             self._session.__exit__(None, None, None)
@@ -144,8 +157,11 @@ class AnimaXDNAChainRuntime:
             0,
             28,
             self.cache_dir,
+            effective_tensor_provider=self.effective_tensor_provider,
         )
         self.cache_status = cache.open(self.rebuild_cache)
+        cache.effective_tensor_provider = None
+        self.effective_tensor_provider = None
         self._packed_cache = cache
 
     def weights(self, index: int, source: bool = False) -> AnimaBlockWeights:

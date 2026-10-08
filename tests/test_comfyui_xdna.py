@@ -22,6 +22,7 @@ from comfyui_xdna_nodes.model_wrapper import (
     SOURCE_PROVENANCE_KEY,
     WRAPPER_KEY,
     _file_identity_token,
+    _effective_lora_provider,
     _model_storage_profile,
     _validate_patcher,
 )
@@ -95,6 +96,21 @@ class FakePatcher:
     def get_attachment(self, key):
         return self.attachments.get(key)
 
+    def get_key_patches(self, filter_prefix=None):
+        result = {}
+        diffusion_model = self.model.diffusion_model
+        if not hasattr(diffusion_model, "named_parameters"):
+            return result
+        for name, parameter in diffusion_model.named_parameters():
+            key = f"diffusion_model.{name}"
+            if filter_prefix is not None and not key.startswith(filter_prefix):
+                continue
+            result[key] = [
+                (parameter, lambda tensor, **_kwargs: tensor),
+                *self.patches.get(key, []),
+            ]
+        return result
+
 
 class ComfyUIXDNAWrapperTests(unittest.TestCase):
     def setUp(self):
@@ -106,12 +122,86 @@ class ComfyUIXDNAWrapperTests(unittest.TestCase):
         patcher_extension.WrappersMP = WrappersMP
         comfy = types.ModuleType("comfy")
         comfy.patcher_extension = patcher_extension
+        comfy_float = types.ModuleType("comfy.float")
+        comfy_float.stochastic_rounding = (
+            lambda tensor, dtype, seed: tensor.to(dtype)
+        )
+        comfy_lora = types.ModuleType("comfy.lora")
+
+        def calculate_weight(patches, weight, key):
+            for strength, adapter, strength_model, offset, function in patches:
+                weight = adapter.calculate_weight(
+                    weight,
+                    key,
+                    strength,
+                    strength_model,
+                    offset,
+                    function,
+                )
+            return weight
+
+        comfy_lora.calculate_weight = calculate_weight
+        comfy_management = types.ModuleType("comfy.model_management")
+        comfy_management.lora_compute_dtype = lambda _device: torch.float32
+        comfy_management.load_models_gpu = mock.Mock()
+        comfy_management.cast_to_device = (
+            lambda tensor, device, dtype, copy=False: tensor.to(
+                device=device, dtype=dtype, copy=copy
+            )
+        )
+        comfy_utils = types.ModuleType("comfy.utils")
+        comfy_utils.string_to_seed = lambda value: hash(value)
+        weight_adapter = types.ModuleType("comfy.weight_adapter")
+        weight_adapter_lora = types.ModuleType("comfy.weight_adapter.lora")
+
+        class LoRAAdapter:
+            def __init__(self, loaded_keys, weights):
+                self.loaded_keys = loaded_keys
+                self.weights = weights
+
+            def calculate_weight(
+                self,
+                weight,
+                _key,
+                strength,
+                _strength_model,
+                _offset,
+                function,
+            ):
+                up, down, alpha, _mid, _dora, _reshape = self.weights
+                scale = 1.0 if alpha is None else alpha / down.shape[0]
+                transform = function or (lambda value: value)
+                return weight + transform(
+                    strength * scale * torch.mm(up.float(), down.float())
+                ).to(weight.dtype)
+
+        weight_adapter_lora.LoRAAdapter = LoRAAdapter
+        comfy.float = comfy_float
+        comfy.lora = comfy_lora
+        comfy.model_management = comfy_management
+        comfy.utils = comfy_utils
+        comfy.weight_adapter = weight_adapter
+        weight_adapter.lora = weight_adapter_lora
+        self.LoRAAdapter = LoRAAdapter
+        extra_modules = {
+            "comfy.float": comfy_float,
+            "comfy.lora": comfy_lora,
+            "comfy.model_management": comfy_management,
+            "comfy.utils": comfy_utils,
+            "comfy.weight_adapter": weight_adapter,
+            "comfy.weight_adapter.lora": weight_adapter_lora,
+        }
         self.saved = {
             name: sys.modules.get(name)
-            for name in ("comfy", "comfy.patcher_extension")
+            for name in (
+                "comfy",
+                "comfy.patcher_extension",
+                *extra_modules,
+            )
         }
         sys.modules["comfy"] = comfy
         sys.modules["comfy.patcher_extension"] = patcher_extension
+        sys.modules.update(extra_modules)
 
     def tearDown(self):
         for name, value in self.saved.items():
@@ -131,6 +221,9 @@ class ComfyUIXDNAWrapperTests(unittest.TestCase):
                 )
             self.assertIsNot(attached, source)
             self.assertIs(attached.model, source.model)
+            sys.modules["comfy.model_management"].load_models_gpu.assert_called_once_with(
+                [source]
+            )
             self.assertEqual(source.wrappers, {})
             self.assertIn("created", status)
             self.assertIn(
@@ -371,11 +464,62 @@ class ComfyUIXDNAWrapperTests(unittest.TestCase):
         gc.collect()
         self.assertEqual(runtime.snapshot()["state"], "closed")
 
-    def test_rejects_lora_and_transformer_patches(self):
+    def test_supports_ordinary_lora_without_mutating_shared_parameters(self):
         patcher = FakePatcher()
-        patcher.patches["diffusion_model.blocks.0.self_attn.q_proj.weight"] = []
-        with self.assertRaisesRegex(RuntimeError, "LoRA"):
-            _validate_patcher(patcher)
+        parameters = fake_anima_parameters(torch.bfloat16)
+        parameters["blocks.0.self_attn.q_proj.weight"] = torch.nn.Parameter(
+            torch.ones((1, 1), dtype=torch.bfloat16)
+        )
+        patcher.model.diffusion_model = FakeAnimaParameters(parameters)
+        key = "diffusion_model.blocks.0.self_attn.q_proj.weight"
+        first = self.LoRAAdapter(
+            set(),
+            (
+                torch.tensor([[2.0]]),
+                torch.tensor([[3.0]]),
+                None,
+                None,
+                None,
+                None,
+            ),
+        )
+        second = self.LoRAAdapter(
+            set(),
+            (
+                torch.tensor([[4.0]]),
+                torch.tensor([[5.0]]),
+                None,
+                None,
+                None,
+                None,
+            ),
+        )
+        patcher.patches[key] = [
+            (0.5, first, 1.0, None, None),
+            (0.25, second, 1.0, None, None),
+        ]
+        provider, patch_count, base_fingerprint, base_schema = (
+            _effective_lora_provider(patcher)
+        )
+        effective = provider("transformer_blocks.0.attn1.to_q.weight")
+        self.assertEqual(patch_count, 2)
+        self.assertIsInstance(base_fingerprint, str)
+        self.assertEqual(base_schema, "comfyui-model-wrapper")
+        self.assertEqual(effective.item(), 9.0)
+        self.assertEqual(
+            parameters["blocks.0.self_attn.q_proj.weight"].item(),
+            1.0,
+        )
+
+    def test_rejects_unsupported_lora_and_transformer_patches(self):
+        patcher = FakePatcher()
+        patcher.model.diffusion_model = FakeAnimaParameters(
+            fake_anima_parameters(torch.bfloat16)
+        )
+        key = "diffusion_model.blocks.0.self_attn.q_proj.weight"
+        patcher.patches[key] = [(1.0, object(), 1.0, None, None)]
+        with self.assertRaisesRegex(RuntimeError, "ordinary additive"):
+            _effective_lora_provider(patcher)
         patcher.patches.clear()
         patcher.model_options["transformer_options"]["patches"] = {
             "mlp_patch": [object()]

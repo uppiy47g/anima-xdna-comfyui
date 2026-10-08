@@ -14,7 +14,7 @@ from pathlib import Path
 import shutil
 import struct
 import time
-from typing import Any, Iterator, Optional
+from typing import Any, Callable, Iterator, Optional
 import uuid
 import warnings
 
@@ -40,6 +40,7 @@ CACHE_ABI = 2
 LAYOUT_VERSION = "aie2p-bf16-kn-256x256-k2048-v1"
 MODEL_FAMILY = "anima-cosmos-predict2"
 DEFAULT_CACHE_ROOT = Path.home() / ".cache" / "anima-xdna" / "weights"
+EffectiveTensorProvider = Callable[[str], torch.Tensor]
 
 
 @dataclass(frozen=True)
@@ -312,6 +313,50 @@ def fingerprint_execution_source(
     }
 
 
+def fingerprint_effective_tensors(
+    provider: EffectiveTensorProvider,
+    blocks: range,
+) -> dict[str, Any]:
+    records = []
+    for key in canonical_keys(blocks):
+        tensor = provider(key)
+        if not isinstance(tensor, torch.Tensor):
+            raise UnsupportedTensor(
+                f"effective MODEL tensor {key!r} is not a torch.Tensor"
+            )
+        if tensor.dtype not in (
+            torch.bfloat16,
+            torch.float16,
+            torch.float32,
+        ):
+            raise UnsupportedTensor(
+                f"effective MODEL tensor {key!r} has unsupported dtype "
+                f"{tensor.dtype}"
+            )
+        normalized = tensor.detach().to(
+            device="cpu", dtype=torch.bfloat16
+        ).contiguous()
+        if not bool(torch.isfinite(normalized.float()).all()):
+            raise UnsupportedTensor(
+                f"effective MODEL tensor {key!r} contains non-finite values"
+            )
+        records.append(
+            {
+                "key": key,
+                "dtype": "BF16",
+                "shape": list(normalized.shape),
+                "sha256": hashlib.sha256(
+                    normalized.view(torch.uint8).numpy()
+                ).hexdigest(),
+            }
+        )
+    return {
+        "normalization": "BF16",
+        "source_dtypes": ["BF16"],
+        "block_fingerprint": canonical_block_fingerprint(records),
+    }
+
+
 def _file_guard(path: Path) -> dict[str, int]:
     stat = path.stat()
     return {
@@ -489,6 +534,7 @@ class PackedWeightCache:
         end_block: int = 28,
         cache_dir: Optional[Path] = None,
         enabled: bool = True,
+        effective_tensor_provider: Optional[EffectiveTensorProvider] = None,
     ):
         if not 0 <= start_block < end_block <= 28:
             raise UnsupportedTensor(
@@ -500,6 +546,7 @@ class PackedWeightCache:
         self.blocks = range(start_block, end_block)
         self.root = Path(cache_dir) if cache_dir else DEFAULT_CACHE_ROOT
         self.enabled = enabled
+        self.effective_tensor_provider = effective_tensor_provider
         self.manifest: Optional[dict[str, Any]] = None
         self.status: Optional[CacheStatus] = None
         self._handle = None
@@ -507,13 +554,40 @@ class PackedWeightCache:
 
     def identify(self) -> tuple[str, dict[str, Any], CacheTimings]:
         source, timings = fingerprint_source(self.checkpoint, self.blocks)
-        namespace = CacheNamespace(source["fingerprint"])
+        effective_identity = None
+        adapter_fingerprints = ()
+        if self.effective_tensor_provider is not None:
+            effective_started = time.perf_counter()
+            effective_identity = fingerprint_effective_tensors(
+                self.effective_tensor_provider,
+                self.blocks,
+            )
+            timings = CacheTimings(
+                fingerprint_ms=timings.fingerprint_ms
+                + (time.perf_counter() - effective_started) * 1000
+            )
+            adapter_fingerprints = (
+                effective_identity["block_fingerprint"],
+            )
+        namespace = CacheNamespace(
+            source["fingerprint"],
+            adapter_fingerprints=adapter_fingerprints,
+        )
         descriptor = json.loads(
             json.dumps(
                 _cache_descriptor(source, self.config, self.blocks, namespace),
                 sort_keys=True,
             )
         )
+        if effective_identity is not None:
+            descriptor["base_execution_identity"] = (
+                fingerprint_execution_source(
+                    self.checkpoint,
+                    self.blocks,
+                    source,
+                )
+            )
+            descriptor["effective_execution_identity"] = effective_identity
         return _descriptor_key(descriptor), descriptor, timings
 
     @property
@@ -567,7 +641,11 @@ class PackedWeightCache:
                 "", self.root, False, "disabled", 0, 0, 0, 0, CacheTimings()
             )
             return self.status
-        candidate = None if rebuild else self._candidate_entry()
+        candidate = (
+            None
+            if rebuild or self.effective_tensor_provider is not None
+            else self._candidate_entry()
+        )
         if candidate is not None:
             candidate_manifest = self._read_manifest(candidate)
             with ThreadPoolExecutor(max_workers=2) as executor:
@@ -755,7 +833,12 @@ class PackedWeightCache:
         source_dtypes = sorted(
             {tensor["dtype"] for tensor in source_identity["tensors"]}
         )
-        execution_records = [] if source_dtypes != ["BF16"] else None
+        execution_records = (
+            []
+            if self.effective_tensor_provider is not None
+            or source_dtypes != ["BF16"]
+            else None
+        )
         logical_bytes = 0
         payload_hash = hashlib.sha256()
         offset = 0
@@ -795,7 +878,11 @@ class PackedWeightCache:
                             canonical_key = prefix + name
                             source = tensor_sources[canonical_key]
                             source_key = source["source_key"]
-                            tensor = sources[source["shard"]].get_tensor(source_key)
+                            tensor = (
+                                self.effective_tensor_provider(canonical_key)
+                                if self.effective_tensor_provider is not None
+                                else sources[source["shard"]].get_tensor(source_key)
+                            )
                             out_name, in_name = LINEAR_SHAPES[name]
                             expected = (dimensions[out_name], dimensions[in_name])
                             if tuple(tensor.shape) != expected:
@@ -857,8 +944,10 @@ class PackedWeightCache:
                             canonical_key = prefix + name
                             source = tensor_sources[canonical_key]
                             source_key = source["source_key"]
-                            source_tensor = sources[source["shard"]].get_tensor(
-                                source_key
+                            source_tensor = (
+                                self.effective_tensor_provider(canonical_key)
+                                if self.effective_tensor_provider is not None
+                                else sources[source["shard"]].get_tensor(source_key)
                             )
                             expected = (dimensions[NORM_SHAPES[name]],)
                             if tuple(source_tensor.shape) != expected:
@@ -916,12 +1005,28 @@ class PackedWeightCache:
                 if execution_records is None
                 else canonical_block_fingerprint(execution_records)
             )
+            expected_effective = descriptor.get(
+                "effective_execution_identity"
+            )
+            if (
+                expected_effective is not None
+                and execution_fingerprint
+                != expected_effective["block_fingerprint"]
+            ):
+                raise CacheIntegrityError(
+                    "effective MODEL weights changed while building the "
+                    "packed cache"
+                )
             manifest = {
                 "cache_key": key,
                 "descriptor": descriptor,
                 "execution_identity": {
                     "normalization": "BF16",
-                    "source_dtypes": source_dtypes,
+                    "source_dtypes": (
+                        ["BF16"]
+                        if self.effective_tensor_provider is not None
+                        else source_dtypes
+                    ),
                     "block_fingerprint": execution_fingerprint,
                 },
                 "source_guard": _source_guard(self.checkpoint),
@@ -952,11 +1057,15 @@ class PackedWeightCache:
             return status
         if self.manifest is None:
             raise RuntimeError("packed weight cache did not expose its manifest")
-        expected_execution_identity = fingerprint_execution_source(
-            self.checkpoint,
-            self.blocks,
-            self.manifest["descriptor"]["source_identity"],
+        expected_execution_identity = self.manifest["descriptor"].get(
+            "effective_execution_identity"
         )
+        if expected_execution_identity is None:
+            expected_execution_identity = fingerprint_execution_source(
+                self.checkpoint,
+                self.blocks,
+                self.manifest["descriptor"]["source_identity"],
+            )
         stored_execution_identity = self.manifest.get("execution_identity")
         if stored_execution_identity is None:
             self.manifest["execution_identity"] = expected_execution_identity

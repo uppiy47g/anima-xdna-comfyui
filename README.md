@@ -93,6 +93,15 @@ Runtime** releases the attachment. See the
 [node guide](comfyui_xdna_nodes/README.md) and
 [API insertion fragment](examples/anima_xdna_512_api.json).
 
+Standard ComfyUI **Load LoRA** or **Load LoRA Model Only** nodes may be placed
+between **Load Anima (BF16)** and the XDNA attach node. Ordinary additive
+Anima LoRAs are materialized non-destructively into exact BF16 effective
+weights. Each distinct effective 560-tensor fingerprint gets a separately
+verified packed cache; identical weights reuse it. Base checkpoints and LoRA
+files remain read-only. The attach node uses ComfyUI's managed model-loading
+lifecycle, so switching from a LoRA workflow back to the base MODEL restores
+the correct shared weights before verification.
+
 The default resident Q/K/V-chained path executes 19 XRT dispatches per block,
 532 per 28-block denoising step. `qkv_chaining=false` selects the 23/644 control.
 Historical measurements, metadata-free output images, exact gates, and
