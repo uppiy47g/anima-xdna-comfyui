@@ -27,8 +27,8 @@ back to CPU.
 
 - ComfyUI API validated at commit
   `170594057a22673349ddf0a3d88624b7fa5865bb`
-- native Base v1.0, Turbo V1.1, or WAI Nova Anima Turbo LoRA Ver V1.0 BF16
-  transformer loaded by
+- native Base v1.0, Turbo V1.1, WAI Nova Anima Turbo LoRA Ver V1.0, or
+  Radiance Turbo Anima v2.0 transformer loaded by
   **Load Anima (BF16)** (explicit ComfyUI `dtype=torch.bfloat16`)
 - matching read-only XDNA source: validated Diffusers/native Base for Base,
   or the same native Turbo checkpoint for Turbo
@@ -41,6 +41,9 @@ batch/resolution/context sizes, and training are rejected. The normal ComfyUI
 MODEL is cloned; it is not modified. Before XRT opens, the wrapper computes a
 canonical full digest over all 560 block tensors. Base/Turbo or other
 MODEL/source mismatches are rejected before BO population or dispatch.
+For an F16 or F32 source, matching is performed after the same explicit BF16
+normalization used by the XDNA packed cache. Raw source hashes and dtypes still
+remain part of the cache identity.
 
 ## Installation
 
@@ -74,6 +77,10 @@ starting ComfyUI. The packed cache defaults to
    Diffusers transformer or equivalent native Base checkpoint. For Turbo,
    select the exact same native Turbo V1.1 checkpoint as `UNETLoader`. The file
    remains read-only and is the XDNA cache source of truth.
+   If its block weights are F16 or F32, the first attach creates a verified
+   BF16 packed cache without modifying the checkpoint. The ComfyUI log and
+   runtime status explain this conversion; later attaches report verified
+   cache reuse.
 4. Connect the returned MODEL to the normal sampler.
 5. Use **Anima XDNA Runtime Status** to inspect cache state, first/warm timing,
    dispatches, transfers, BO population, allocations, and resident reuse.

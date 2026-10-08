@@ -38,6 +38,7 @@ from anima_xdna_poc.weight_cache import (
     CacheNamespace,
     LAYOUT_VERSION,
     PackedWeightCache,
+    fingerprint_execution_source,
     fingerprint_source,
 )
 
@@ -107,7 +108,7 @@ def _save_native_blocks(path, config, prefix, count=1, fill=0.0):
 
 
 class PackedWeightCacheTests(unittest.TestCase):
-    def test_model_fingerprint_normalizes_cpu_fp32_upcast(self):
+    def test_model_fingerprint_normalizes_non_bf16_weights(self):
         class Model:
             def __init__(self, dtype):
                 self.tensors = {
@@ -119,7 +120,9 @@ class PackedWeightCacheTests(unittest.TestCase):
                 return self.tensors
 
         bf16, _ = fingerprint_model_blocks(Model(torch.bfloat16))
+        fp16, _ = fingerprint_model_blocks(Model(torch.float16))
         fp32, _ = fingerprint_model_blocks(Model(torch.float32))
+        self.assertEqual(bf16, fp16)
         self.assertEqual(bf16, fp32)
         self.assertEqual(
             validated_variant(
@@ -132,6 +135,12 @@ class PackedWeightCacheTests(unittest.TestCase):
                 "b462ef63ecdcbe8e4b981e55f3a66a432a66a5fc1fc2c7cb043da8df5dc44ad5"
             ),
             "WAI Nova Anima Turbo LoRA Ver V1.0",
+        )
+        self.assertEqual(
+            validated_variant(
+                "c075e104021963603810bf7b91b5e051d50f47ed0f63291c4e78a62b46d0595c"
+            ),
+            "Radiance Turbo Anima v2.0",
         )
 
     def test_native_schemas_have_canonical_base_identity_and_separate_turbo(self):
@@ -175,6 +184,85 @@ class PackedWeightCacheTests(unittest.TestCase):
                 for tensor in manifest["descriptor"]["source_identity"]["tensors"]
             )
         )
+        self.assertEqual(
+            manifest["execution_identity"]["block_fingerprint"],
+            turbo_identity["block_fingerprint"],
+        )
+        self.assertEqual(
+            manifest["execution_identity"]["source_dtypes"],
+            ["BF16"],
+        )
+
+    def test_execution_identity_normalizes_f16_without_merging_raw_identity(self):
+        config = _tiny_block_config()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bf16_path = root / "bf16.safetensors"
+            f16_path = root / "f16.safetensors"
+            tensors = {
+                f"transformer_blocks.0.{name}": tensor
+                for name, tensor in _block_tensors(config, fill=1.5).items()
+            }
+            save_file(tensors, bf16_path)
+            save_file(
+                {key: tensor.to(torch.float16) for key, tensor in tensors.items()},
+                f16_path,
+            )
+            bf16_source, _ = fingerprint_source(bf16_path, range(1))
+            f16_source, _ = fingerprint_source(f16_path, range(1))
+            normalized = fingerprint_execution_source(
+                f16_path, range(1), f16_source
+            )
+            bf16_cache = PackedWeightCache(
+                bf16_path, config, 0, 1, root / "cache"
+            )
+            f16_cache = PackedWeightCache(
+                f16_path, config, 0, 1, root / "cache"
+            )
+            bf16_key, _, _ = bf16_cache.identify()
+            f16_key, _, _ = f16_cache.identify()
+            f16_cache.open()
+            manifest_identity = f16_cache.execution_identity
+            f16_cache.close()
+        self.assertNotEqual(
+            bf16_source["block_fingerprint"],
+            f16_source["block_fingerprint"],
+        )
+        self.assertNotEqual(bf16_key, f16_key)
+        self.assertEqual(
+            normalized["block_fingerprint"],
+            bf16_source["block_fingerprint"],
+        )
+        self.assertEqual(manifest_identity, normalized)
+        self.assertEqual(normalized["source_dtypes"], ["F16"])
+
+    def test_tampered_execution_identity_is_rejected(self):
+        config = _tiny_block_config()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkpoint = root / "f16.safetensors"
+            tensors = {
+                f"transformer_blocks.0.{name}": tensor.to(torch.float16)
+                for name, tensor in _block_tensors(config, fill=1.5).items()
+            }
+            save_file(tensors, checkpoint)
+            cache = PackedWeightCache(
+                checkpoint, config, 0, 1, root / "cache"
+            )
+            status = cache.open()
+            cache.close()
+            manifest_path = status.path / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["execution_identity"]["block_fingerprint"] = "0" * 64
+            manifest_path.write_text(
+                json.dumps(manifest), encoding="utf-8"
+            )
+            with self.assertRaisesRegex(
+                CacheIntegrityError, "execution identity"
+            ):
+                PackedWeightCache(
+                    checkpoint, config, 0, 1, root / "cache"
+                ).open()
 
     def test_schema_resolver_rejects_incomplete_checkpoint(self):
         with self.assertRaisesRegex(UnsupportedTensor, "matches=none"):

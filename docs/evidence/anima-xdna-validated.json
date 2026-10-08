@@ -12,6 +12,7 @@
     "qkv_chaining": "commit containing this evidence record",
     "bf16_model_loader": "commit containing this evidence record",
     "wai_nova_support": "commit containing this evidence record",
+    "f16_execution_identity": "commit containing this evidence record",
     "comfyui": "170594057a22673349ddf0a3d88624b7fa5865bb"
   },
   "tested_system": {
@@ -24,7 +25,8 @@
     "models": [
       "Anima Base v1.0",
       "Anima Turbo V1.1",
-      "WAI Nova Anima Turbo LoRA Ver V1.0"
+      "WAI Nova Anima Turbo LoRA Ver V1.0",
+      "Radiance Turbo Anima v2.0"
     ],
     "shape": {
       "latent": [1, 16, 1, 64, 64],
@@ -717,6 +719,69 @@
         },
         "image_validation": "Both outputs decoded as 512x512 RGB PNG with one prompt metadata entry and were visually inspected for corruption.",
         "timing_note": "Single cold/resident pair. The resident run changed the seed to force KSampler execution, so this is not a same-seed output-equivalence comparison."
+      }
+    },
+    "radiance_turbo_anima_v2_0": {
+      "status": "measured_real_checkpoint_and_comfyui",
+      "source_file": {
+        "bytes": 4182282440,
+        "sha256": "e6648a5f72d650d04a09bb2fc6ed99bb362eecae9368d3944b307fff23dd1a50",
+        "tensor_count": 685,
+        "checkpoint_kind": "native ComfyUI diffusion model"
+      },
+      "tensor_layout": {
+        "diffusion_model_tensors": 685,
+        "block_parameters": 560,
+        "source_block_dtype": "float16",
+        "execution_block_dtype": "bfloat16",
+        "source_schema": "native-model-diffusion-model"
+      },
+      "runtime": {
+        "raw_source_block_fingerprint": "b874ac8651bde5bd0ea8bfb5403ae64ce340a2c525d6669abb0f14711fb85110",
+        "bf16_execution_block_fingerprint": "c075e104021963603810bf7b91b5e051d50f47ed0f63291c4e78a62b46d0595c",
+        "model_block_fingerprint": "c075e104021963603810bf7b91b5e051d50f47ed0f63291c4e78a62b46d0595c",
+        "execution_fingerprints_match": true,
+        "cache_key": "02af9642883592b7a1f7de8b3a634cd4e45dab455029f6638577db0a64fc1c1e",
+        "cache_packed_bytes": 3963645952,
+        "source_checkpoint_unchanged": true
+      },
+      "chain_validation": {
+        "fixture": "Radiance real-preprocessing fixture captured from ComfyUI",
+        "dispatches_qkv_chained": 532,
+        "dispatches_control": 644,
+        "qkv_block_outputs_bitwise_equal": true,
+        "cached_uncached_output_bitwise_equal": true,
+        "worst_block": 13,
+        "worst_intermediate_normalized_rms_error": 0.08419897180838715,
+        "intermediate_gate": 0.10,
+        "intermediate_gate_status": "passed",
+        "final_normalized_rms_error": 0.014452038180358366,
+        "final_gate": 0.02,
+        "final_gate_status": "passed"
+      },
+      "comfyui": {
+        "settings": {
+          "width": 512,
+          "height": 512,
+          "steps": 4,
+          "cfg": 1.0,
+          "sampler": "euler",
+          "scheduler": "simple"
+        },
+        "cold": {
+          "seed": 202005,
+          "prompt_seconds": 92.78,
+          "png_bytes": 431487,
+          "png_sha256": "d47c5f98240b4b8c6aec05ffa5cfec1854c37f1cd02466ff98fbe8538f7d541b"
+        },
+        "resident": {
+          "seed": 202006,
+          "prompt_seconds": 46.77,
+          "png_bytes": 409026,
+          "png_sha256": "1ae105109715fa2babecac356e5735360be35d5770958bc230928918b19fceb7"
+        },
+        "image_validation": "Both outputs decoded as 512x512 RGB PNG with one prompt metadata entry and were visually inspected for corruption.",
+        "normalization_message_verified": true
       }
     }
   },

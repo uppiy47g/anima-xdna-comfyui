@@ -257,6 +257,11 @@ class ComfyUIXDNAWrapperTests(unittest.TestCase):
             "schema": "native-model-diffusion-model",
             "block_fingerprint": "source",
         }
+        chain.execution_identity = {
+            "normalization": "BF16",
+            "source_dtypes": ["BF16"],
+            "block_fingerprint": "source",
+        }
         chain.cache_status = None
         with (
             mock.patch(
@@ -333,6 +338,11 @@ class ComfyUIXDNAWrapperTests(unittest.TestCase):
             "schema": "native-model-diffusion-model",
             "block_fingerprint": "same",
         }
+        chain.execution_identity = {
+            "normalization": "BF16",
+            "source_dtypes": ["BF16"],
+            "block_fingerprint": "same",
+        }
         chain.cache_status = None
         with (
             mock.patch(
@@ -352,6 +362,51 @@ class ComfyUIXDNAWrapperTests(unittest.TestCase):
         )
         self.assertTrue(
             all(parameter.dtype == torch.float32 for parameter in parameters.values())
+        )
+        runtime.close()
+
+    def test_f16_source_reports_bf16_packed_cache_guidance(self):
+        parameters = fake_anima_parameters(torch.bfloat16)
+        diffusion_model = FakeAnimaParameters(parameters)
+        runtime = SharedRuntime(Path("fixture.safetensors"))
+        chain = mock.Mock()
+        chain.source_identity = {
+            "schema": "native-model-diffusion-model",
+            "block_fingerprint": "raw-f16",
+        }
+        chain.execution_identity = {
+            "normalization": "BF16",
+            "source_dtypes": ["F16"],
+            "block_fingerprint": "normalized",
+        }
+        chain.cache_status = None
+        with (
+            mock.patch(
+                "comfyui_xdna_nodes.model_wrapper.AnimaXDNAChainRuntime",
+                return_value=chain,
+            ),
+            mock.patch(
+                "comfyui_xdna_nodes.model_wrapper.fingerprint_model_blocks",
+                return_value=("normalized", "comfyui-anima-module"),
+            ),
+            mock.patch("builtins.print") as output,
+        ):
+            runtime.prepare(diffusion_model)
+        snapshot = runtime.snapshot()
+        self.assertEqual(snapshot["source_fingerprint"], "raw-f16")
+        self.assertEqual(
+            snapshot["source_execution_fingerprint"], "normalized"
+        )
+        self.assertIn(
+            "original checkpoint is unchanged",
+            snapshot["source_normalization_message"],
+        )
+        self.assertIn(
+            "future runs reuse this cache",
+            snapshot["source_normalization_message"],
+        )
+        output.assert_called_once_with(
+            "[Anima XDNA] " + snapshot["source_normalization_message"]
         )
         runtime.close()
 

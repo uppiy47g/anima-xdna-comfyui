@@ -57,6 +57,9 @@ class RuntimeDiagnostics:
     cache: Optional[dict[str, Any]] = None
     source_schema: Optional[str] = None
     source_fingerprint: Optional[str] = None
+    source_execution_fingerprint: Optional[str] = None
+    source_dtypes: Optional[list[str]] = None
+    source_normalization_message: Optional[str] = None
     model_schema: Optional[str] = None
     model_fingerprint: Optional[str] = None
     model_variant: Optional[str] = None
@@ -110,18 +113,26 @@ class SharedRuntime:
                 identity = runtime.source_identity
                 if identity is None:
                     raise RuntimeError("packed cache did not expose source identity")
+                execution_identity = runtime.execution_identity
+                if execution_identity is None:
+                    raise RuntimeError(
+                        "packed cache did not expose BF16 execution identity"
+                    )
                 identity_started = time.perf_counter()
                 model_fingerprint, model_schema = fingerprint_model_blocks(diffusion_model)
                 identity_check_ms = (
                     time.perf_counter() - identity_started
                 ) * 1000
                 source_fingerprint = identity["block_fingerprint"]
-                if model_fingerprint != source_fingerprint:
+                source_execution_fingerprint = execution_identity[
+                    "block_fingerprint"
+                ]
+                if model_fingerprint != source_execution_fingerprint:
                     raise RuntimeError(
                         "Anima MODEL/checkpoint mismatch: the connected MODEL "
                         "does not contain the same 28-block weights as the XDNA "
                         f"source (MODEL {model_fingerprint[:16]}..., source "
-                        f"{source_fingerprint[:16]}...). Select the matching "
+                        f"{source_execution_fingerprint[:16]}...). Select the matching "
                         "Base or Turbo checkpoint; no dispatch was attempted."
                     )
                 storage_profile = _model_storage_profile(diffusion_model)
@@ -136,9 +147,15 @@ class SharedRuntime:
             self.diagnostics.state = "prepared"
             self.diagnostics.source_schema = identity["schema"]
             self.diagnostics.source_fingerprint = source_fingerprint
+            self.diagnostics.source_execution_fingerprint = (
+                source_execution_fingerprint
+            )
+            self.diagnostics.source_dtypes = execution_identity["source_dtypes"]
             self.diagnostics.model_schema = model_schema
             self.diagnostics.model_fingerprint = model_fingerprint
-            self.diagnostics.model_variant = validated_variant(source_fingerprint)
+            self.diagnostics.model_variant = validated_variant(
+                source_execution_fingerprint
+            )
             self.diagnostics.qkv_chaining = self.qkv_chaining
             self.diagnostics.model_block_parameter_count = storage_profile[
                 "block_parameter_count"
@@ -172,6 +189,21 @@ class SharedRuntime:
                 if runtime.cache_status is not None
                 else None
             )
+            if execution_identity["source_dtypes"] != ["BF16"]:
+                action = (
+                    "Reusing the verified"
+                    if runtime.cache_status is not None
+                    and runtime.cache_status.hit
+                    else "Created a verified"
+                )
+                message = (
+                    f"{action} BF16 packed cache for "
+                    f"{'/'.join(execution_identity['source_dtypes'])} source "
+                    "weights. The original checkpoint is unchanged; future "
+                    "runs reuse this cache."
+                )
+                self.diagnostics.source_normalization_message = message
+                print(f"[Anima XDNA] {message}")
 
     def acquire(self):
         with self._lock:

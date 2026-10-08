@@ -273,6 +273,14 @@ tensor content, architecture/key map, layout ABI, future adapter/quantization
 namespace, tool versions, and NPU target. Manifest and payload digests are
 verified; build publication is locked and atomic.
 
+F16 and F32 source tensors are explicitly converted to BF16 during packing.
+The raw source identity remains unchanged and continues to determine cache
+isolation and source-integrity checks. A separate BF16 execution fingerprint
+is stored in the manifest and compared with the BF16 ComfyUI MODEL, so dtype
+normalization does not weaken MODEL/source mismatch rejection. Runtime status
+and the ComfyUI log report whether this derived cache was created or reused
+and state that the original checkpoint is unchanged.
+
 The validated 28-block entry contains 644 tensors, occupies 3,963,645,952
 bytes, and has 88,080,384 bytes of padding. Cold build was 19.834–19.865 s;
 a new-process verified warm hit was 4.330–4.546 s. BO upload is still required
@@ -540,8 +548,8 @@ $env:ANIMA_XDNA_CHAIN_FIXTURE = "<CAPTURED_REAL_BLOCK_INPUT_PT>"
 
 ## Limitations and troubleshooting
 
-Only Base v1.0, Turbo V1.1, WAI Nova Anima Turbo LoRA Ver V1.0, and the fixed
-shape above are validated. Other Preview/Aesthetic
+Only Base v1.0, Turbo V1.1, WAI Nova Anima Turbo LoRA Ver V1.0, Radiance
+Turbo Anima v2.0, and the fixed shape above are validated. Other Preview/Aesthetic
 checkpoints, LoRA/LLLite/ModelPatcher transformer patches, INT8, training,
 other resolutions, other context sizes, and user batches above one are
 rejected. CFG batch 2 is executed sequentially on the single-tenant NPU.
@@ -570,6 +578,32 @@ with seed changed from 424242 to 424243 forced sampling while reusing the
 attached runtime and completed in 54.25 seconds (11.59 seconds/iteration).
 These are a single cold/resident pair, not a stable speed benchmark or a
 same-seed image-equivalence test.
+
+## Radiance Turbo Anima v2.0
+
+The validated 4,182,282,440-byte checkpoint contains 685
+`model.diffusion_model.*` tensors. Its 560 transformer-block tensors use F16
+source storage and match the existing 28-block Anima 2B schema. The raw source
+block fingerprint is
+`b874ac8651bde5bd0ea8bfb5403ae64ce340a2c525d6669abb0f14711fb85110`;
+after the same explicit BF16 normalization used by the packed cache, its
+execution fingerprint is
+`c075e104021963603810bf7b91b5e051d50f47ed0f63291c4e78a62b46d0595c`.
+That normalized fingerprint matched the BF16 ComfyUI MODEL exactly. The raw
+identity remains distinct and produced cache key
+`02af9642883592b7a1f7de8b3a634cd4e45dab455029f6638577db0a64fc1c1e`.
+
+Validation used a preprocessing fixture captured from Radiance itself. The
+532-dispatch chained and 644-dispatch control paths matched bitwise, as did
+cached and uncached execution. Worst intermediate CPU-oracle NRMS was
+0.084199 at block 13 and final NRMS was 0.014452, passing the standard 0.10
+intermediate and 0.02 final gates.
+
+A controlled 512x512, four-step Euler/simple, CFG-1 ComfyUI run produced valid
+RGB images. The cold prompt completed in 92.78 seconds; a second prompt with a
+different seed forced sampling while reusing the attached runtime and
+completed in 46.77 seconds. The log explicitly reported reuse of the verified
+BF16 packed cache and that the F16 checkpoint remained unchanged.
 
 - **`dependency unavailable`:** use the same Python 3.13 environment for
   ComfyUI, `pyxrt`, Triton-XDNA, and this package.
