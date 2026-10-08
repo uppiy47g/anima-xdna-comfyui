@@ -84,8 +84,10 @@ converter or activation-capture package.
 ## Usage and evidence
 
 Load the native checkpoint with **Load Anima (BF16)**, connect its MODEL to
-**Load/Attach Anima XDNA Model**, set a matching read-only checkpoint source,
-then connect the wrapped MODEL to the normal sampler. **Anima XDNA Runtime
+**Load/Attach Anima XDNA Model**, and leave `checkpoint` at
+**Auto (from MODEL)**. The loader carries the exact read-only source into the
+attach node, so it only needs to be selected once. Then connect the wrapped
+MODEL to the normal sampler. **Anima XDNA Runtime
 Status** reports residency, dispatches and transfers; **Unload Anima XDNA
 Runtime** releases the attachment. See the
 [node guide](comfyui_xdna_nodes/README.md) and

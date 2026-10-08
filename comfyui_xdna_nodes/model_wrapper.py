@@ -27,6 +27,8 @@ from anima_xdna_poc.errors import PrototypeError, UnsupportedTensor
 SUPPORTED_COMFY_COMMIT = "170594057a22673349ddf0a3d88624b7fa5865bb"
 WRAPPER_KEY = "anima_xdna2_resident"
 ATTACHMENT_KEY = "anima_xdna2_runtime"
+SOURCE_PROVENANCE_KEY = "anima_xdna2_source_provenance"
+AUTO_CHECKPOINT = "Auto (from MODEL)"
 SUPPORTED_SHAPE = (1, 16, 1, 64, 64)
 
 
@@ -611,6 +613,16 @@ def _file_identity_token(path: Path) -> str:
 _ANIMA_MODEL_CATEGORIES = ("diffusion_models", "checkpoints")
 
 
+@dataclass(frozen=True)
+class ModelSourceProvenance:
+    selector: str
+    path: str
+    identity_token: str
+
+    def on_model_patcher_clone(self):
+        return self
+
+
 def _anima_model_selector(value: str) -> tuple[str, str]:
     category, separator, name = value.partition(":")
     if not separator:
@@ -621,6 +633,38 @@ def _anima_model_selector(value: str) -> tuple[str, str]:
             "'diffusion_models:<name>' / 'checkpoints:<name>'"
         )
     return category, name
+
+
+def _auto_checkpoint_path(model) -> Path:
+    get_attachment = getattr(model, "get_attachment", None)
+    provenance = (
+        get_attachment(SOURCE_PROVENANCE_KEY)
+        if callable(get_attachment)
+        else None
+    )
+    if not isinstance(provenance, ModelSourceProvenance):
+        raise RuntimeError(
+            "Auto checkpoint selection requires a MODEL loaded by "
+            "Load Anima (BF16). Use that loader or enter the matching "
+            "checkpoint path manually."
+        )
+    path = Path(provenance.path)
+    if not path.is_file():
+        raise RuntimeError(
+            f"Auto-selected Anima checkpoint does not exist: {path}"
+        )
+    if _file_identity_token(path) != provenance.identity_token:
+        raise RuntimeError(
+            "The auto-selected Anima checkpoint changed after the MODEL was "
+            "loaded. Reload the MODEL before attaching XDNA."
+        )
+    return path
+
+
+def _resolve_attach_checkpoint(model, checkpoint: str) -> Path:
+    if checkpoint.strip() == AUTO_CHECKPOINT:
+        return _auto_checkpoint_path(model)
+    return Path(checkpoint)
 
 
 class LoadAnimaBF16:
@@ -674,6 +718,21 @@ class LoadAnimaBF16:
                 "ComfyUI did not retain all Anima transformer-block Parameters "
                 "as BF16; refusing to load a memory-expanded MODEL."
             )
+        set_attachment = getattr(model, "set_attachments", None)
+        if not callable(set_attachment):
+            raise RuntimeError(
+                "ComfyUI ModelPatcher attachments are unavailable; use the "
+                f"validated ComfyUI commit {SUPPORTED_COMFY_COMMIT}."
+            )
+        resolved = Path(path).resolve()
+        set_attachment(
+            SOURCE_PROVENANCE_KEY,
+            ModelSourceProvenance(
+                selector=unet_name,
+                path=str(resolved),
+                identity_token=_file_identity_token(resolved),
+            ),
+        )
         return (model,)
 
 
@@ -685,7 +744,7 @@ class LoadAttachAnimaXDNAModel:
                 "model": ("MODEL",),
                 "checkpoint": (
                     "STRING",
-                    {"default": "path/to/Anima-Base-v1.0/transformer/diffusion_pytorch_model.safetensors"},
+                    {"default": AUTO_CHECKPOINT},
                 ),
                 "rebuild_cache": ("BOOLEAN", {"default": False}),
             },
@@ -707,10 +766,12 @@ class LoadAttachAnimaXDNAModel:
         rebuild_cache,
         cache_dir="",
         qkv_chaining=True,
+        model=None,
         **_kwargs,
     ):
+        path = _resolve_attach_checkpoint(model, checkpoint)
         identity = {
-            "checkpoint": _file_identity_token(Path(checkpoint)),
+            "checkpoint": _file_identity_token(path),
             "rebuild_cache": bool(rebuild_cache),
             "cache_dir": str(Path(cache_dir).expanduser().resolve(strict=False))
             if cache_dir.strip()
@@ -723,7 +784,7 @@ class LoadAttachAnimaXDNAModel:
         self, model, checkpoint, rebuild_cache, cache_dir="", qkv_chaining=True
     ):
         _validate_patcher(model)
-        path = Path(checkpoint)
+        path = _resolve_attach_checkpoint(model, checkpoint)
         if not path.is_file():
             raise RuntimeError(f"Anima checkpoint does not exist: {path}")
         patched = model.clone()

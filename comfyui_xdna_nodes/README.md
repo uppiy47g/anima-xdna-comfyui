@@ -73,10 +73,11 @@ starting ComfyUI. The packed cache defaults to
    ComfyUI's supported `load_diffusion_model` options and refuses the result
    if any transformer-block Parameter expanded to another dtype.
 2. Connect it to **Load/Attach Anima XDNA Model**.
-3. Set `checkpoint` to the matching source. For Base, use the validated Base
-   Diffusers transformer or equivalent native Base checkpoint. For Turbo,
-   select the exact same native Turbo V1.1 checkpoint as `UNETLoader`. The file
-   remains read-only and is the XDNA cache source of truth.
+3. Leave `checkpoint` at **Auto (from MODEL)**. **Load Anima (BF16)** records
+   its exact source on the MODEL and the attach node reuses it automatically,
+   including through normal ModelPatcher clones. The file remains read-only
+   and is the XDNA cache source of truth. A manual path remains available for
+   MODELs loaded another way; it must contain the same block weights.
    If its block weights are F16 or F32, the first attach creates a verified
    BF16 packed cache without modifying the checkpoint. The ComfyUI log and
    runtime status explain this conversion; later attaches report verified

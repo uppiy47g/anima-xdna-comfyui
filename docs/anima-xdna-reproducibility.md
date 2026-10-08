@@ -118,8 +118,10 @@ additional arguments. The XDNA runtime remains available through
 Use `Anima XDNA 2 / Load Anima (BF16)` to load the native Base or Turbo model,
 then insert
 `Anima XDNA 2 / Load/Attach Anima XDNA Model` between its MODEL output and the
-normal sampler MODEL input. Set `checkpoint` to the matching Base source or
-the same native Turbo checkpoint. Leave `rebuild_cache=false`; leave `cache_dir` empty for
+normal sampler MODEL input. Leave `checkpoint` at `Auto (from MODEL)` to reuse
+the exact read-only source recorded by the BF16 loader. A manual path remains
+available for compatible MODELs loaded elsewhere and is still subject to the
+same full fingerprint check. Leave `rebuild_cache=false`; leave `cache_dir` empty for
 `%USERPROFILE%\.cache\anima-xdna\weights`, or use another user-owned ASCII
 directory. Connect the wrapped MODEL to `Anima XDNA Runtime Status` when
 collecting evidence. `Unload Anima XDNA Runtime` releases the attachment

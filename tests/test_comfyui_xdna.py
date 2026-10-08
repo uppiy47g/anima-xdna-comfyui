@@ -11,12 +11,16 @@ import torch
 from anima_xdna_poc.checkpoint_schema import NATIVE_NAMES, canonical_keys
 from comfyui_xdna_nodes.model_wrapper import (
     ATTACHMENT_KEY,
+    AUTO_CHECKPOINT,
     LoadAnimaBF16,
     AnimaXDNARuntimeStatus,
     LoadAttachAnimaXDNAModel,
+    ModelSourceProvenance,
     RuntimeAttachment,
     SharedRuntime,
+    SOURCE_PROVENANCE_KEY,
     WRAPPER_KEY,
+    _file_identity_token,
     _model_storage_profile,
     _validate_patcher,
 )
@@ -135,6 +139,68 @@ class ComfyUIXDNAWrapperTests(unittest.TestCase):
             attachment = attached.get_attachment(ATTACHMENT_KEY)
             self.assertIsInstance(attachment, RuntimeAttachment)
             attachment.cleanup()
+
+    def test_attach_defaults_to_auto_checkpoint_selection(self):
+        checkpoint_input = LoadAttachAnimaXDNAModel.INPUT_TYPES()["required"][
+            "checkpoint"
+        ]
+        self.assertEqual(checkpoint_input[1]["default"], AUTO_CHECKPOINT)
+
+    def test_attach_auto_uses_loader_provenance(self):
+        with TemporaryDirectory() as temporary:
+            checkpoint = Path(temporary, "model.safetensors")
+            checkpoint.write_bytes(b"fixture")
+            source = FakePatcher()
+            source.set_attachments(
+                SOURCE_PROVENANCE_KEY,
+                ModelSourceProvenance(
+                    selector="diffusion_models:model.safetensors",
+                    path=str(checkpoint.resolve()),
+                    identity_token=_file_identity_token(checkpoint),
+                ),
+            )
+            cloned = source.clone()
+            with mock.patch.object(SharedRuntime, "prepare"):
+                attached, _ = LoadAttachAnimaXDNAModel().attach(
+                    cloned, AUTO_CHECKPOINT, False
+                )
+            attachment = attached.get_attachment(ATTACHMENT_KEY)
+            self.assertEqual(attachment.runtime.checkpoint, checkpoint.resolve())
+            attachment.cleanup()
+
+    def test_attach_auto_requires_loader_provenance(self):
+        with self.assertRaisesRegex(
+            RuntimeError, "requires a MODEL loaded by Load Anima"
+        ):
+            LoadAttachAnimaXDNAModel().attach(
+                FakePatcher(), AUTO_CHECKPOINT, False
+            )
+
+    def test_attach_auto_rejects_checkpoint_changed_after_load(self):
+        with TemporaryDirectory() as temporary:
+            checkpoint = Path(temporary, "model.safetensors")
+            checkpoint.write_bytes(b"first")
+            source = FakePatcher()
+            source.set_attachments(
+                SOURCE_PROVENANCE_KEY,
+                ModelSourceProvenance(
+                    selector="diffusion_models:model.safetensors",
+                    path=str(checkpoint.resolve()),
+                    identity_token="loaded-identity",
+                ),
+            )
+            with (
+                mock.patch(
+                    "comfyui_xdna_nodes.model_wrapper._file_identity_token",
+                    return_value="changed-identity",
+                ),
+                self.assertRaisesRegex(
+                    RuntimeError, "changed after the MODEL was loaded"
+                ),
+            ):
+                LoadAttachAnimaXDNAModel().attach(
+                    source, AUTO_CHECKPOINT, False
+                )
 
     def test_attach_cache_identity_is_stable_until_checkpoint_or_options_change(self):
         with TemporaryDirectory() as temporary:
@@ -411,12 +477,9 @@ class ComfyUIXDNAWrapperTests(unittest.TestCase):
         runtime.close()
 
     def test_bf16_loader_passes_explicit_dtype_to_comfyui(self):
-        model = types.SimpleNamespace(
-            model=types.SimpleNamespace(
-                diffusion_model=FakeAnimaParameters(
-                    fake_anima_parameters(torch.bfloat16)
-                )
-            )
+        model = FakePatcher()
+        model.model.diffusion_model = FakeAnimaParameters(
+            fake_anima_parameters(torch.bfloat16)
         )
         comfy_sd = types.ModuleType("comfy.sd")
         comfy_sd.load_diffusion_model = mock.Mock(return_value=model)
@@ -426,24 +489,38 @@ class ComfyUIXDNAWrapperTests(unittest.TestCase):
         folder_paths.get_full_path_or_raise = mock.Mock(
             return_value="anima.safetensors"
         )
-        with mock.patch.dict(
-            "sys.modules",
-            {"comfy": comfy, "comfy.sd": comfy_sd, "folder_paths": folder_paths},
+        with (
+            mock.patch.dict(
+                "sys.modules",
+                {
+                    "comfy": comfy,
+                    "comfy.sd": comfy_sd,
+                    "folder_paths": folder_paths,
+                },
+            ),
+            mock.patch(
+                "comfyui_xdna_nodes.model_wrapper._file_identity_token",
+                return_value="source-identity",
+            ),
         ):
             (loaded,) = LoadAnimaBF16().load("anima.safetensors")
         self.assertIs(loaded, model)
+        provenance = loaded.get_attachment(SOURCE_PROVENANCE_KEY)
+        self.assertIsInstance(provenance, ModelSourceProvenance)
+        self.assertEqual(
+            provenance.selector,
+            "anima.safetensors",
+        )
+        self.assertEqual(provenance.identity_token, "source-identity")
         comfy_sd.load_diffusion_model.assert_called_once_with(
             "anima.safetensors",
             model_options={"dtype": torch.bfloat16},
         )
 
     def test_bf16_loader_loads_qualified_full_checkpoint(self):
-        model = types.SimpleNamespace(
-            model=types.SimpleNamespace(
-                diffusion_model=FakeAnimaParameters(
-                    fake_anima_parameters(torch.bfloat16)
-                )
-            )
+        model = FakePatcher()
+        model.model.diffusion_model = FakeAnimaParameters(
+            fake_anima_parameters(torch.bfloat16)
         )
         comfy_sd = types.ModuleType("comfy.sd")
         comfy_sd.load_diffusion_model = mock.Mock(return_value=model)
@@ -453,9 +530,19 @@ class ComfyUIXDNAWrapperTests(unittest.TestCase):
         folder_paths.get_full_path_or_raise = mock.Mock(
             return_value="wai-nova.safetensors"
         )
-        with mock.patch.dict(
-            "sys.modules",
-            {"comfy": comfy, "comfy.sd": comfy_sd, "folder_paths": folder_paths},
+        with (
+            mock.patch.dict(
+                "sys.modules",
+                {
+                    "comfy": comfy,
+                    "comfy.sd": comfy_sd,
+                    "folder_paths": folder_paths,
+                },
+            ),
+            mock.patch(
+                "comfyui_xdna_nodes.model_wrapper._file_identity_token",
+                return_value="source-identity",
+            ),
         ):
             (loaded,) = LoadAnimaBF16().load(
                 "checkpoints:wai-nova.safetensors"
@@ -470,12 +557,9 @@ class ComfyUIXDNAWrapperTests(unittest.TestCase):
         )
 
     def test_bf16_loader_rejects_dtype_expansion(self):
-        model = types.SimpleNamespace(
-            model=types.SimpleNamespace(
-                diffusion_model=FakeAnimaParameters(
-                    fake_anima_parameters(torch.float32)
-                )
-            )
+        model = FakePatcher()
+        model.model.diffusion_model = FakeAnimaParameters(
+            fake_anima_parameters(torch.float32)
         )
         comfy_sd = types.ModuleType("comfy.sd")
         comfy_sd.load_diffusion_model = mock.Mock(return_value=model)
