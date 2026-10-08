@@ -1,4 +1,5 @@
 import gc
+import json
 import sys
 import types
 import unittest
@@ -145,6 +146,15 @@ class ComfyUIXDNAWrapperTests(unittest.TestCase):
             "checkpoint"
         ]
         self.assertEqual(checkpoint_input[1]["default"], AUTO_CHECKPOINT)
+
+    def test_attach_auto_cache_identity_does_not_require_evaluated_model(self):
+        identity = LoadAttachAnimaXDNAModel.IS_CHANGED(
+            AUTO_CHECKPOINT, False
+        )
+        self.assertEqual(
+            json.loads(identity)["checkpoint"],
+            AUTO_CHECKPOINT,
+        )
 
     def test_attach_auto_uses_loader_provenance(self):
         with TemporaryDirectory() as temporary:

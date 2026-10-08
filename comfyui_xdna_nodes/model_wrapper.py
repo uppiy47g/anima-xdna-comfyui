@@ -769,9 +769,13 @@ class LoadAttachAnimaXDNAModel:
         model=None,
         **_kwargs,
     ):
-        path = _resolve_attach_checkpoint(model, checkpoint)
+        checkpoint_identity = (
+            AUTO_CHECKPOINT
+            if checkpoint.strip() == AUTO_CHECKPOINT
+            else _file_identity_token(Path(checkpoint))
+        )
         identity = {
-            "checkpoint": _file_identity_token(path),
+            "checkpoint": checkpoint_identity,
             "rebuild_cache": bool(rebuild_cache),
             "cache_dir": str(Path(cache_dir).expanduser().resolve(strict=False))
             if cache_dir.strip()
