@@ -12,6 +12,11 @@ generation. XDNA executes Linear and attention QK/AV GEMMs. Qwen, patch/time
 embeddings, normalization, RoPE, softmax, GELU, residuals, sampling, final
 projection, and VAE decoding remain on CPU.
 
+## Development log
+
+Development notes, experiment history, and progress reports are published on
+https://note.com/loyal_owl5720/m/m79af97ed02e5
+
 ## Supported configuration
 
 - Windows x64, AMD XDNA 2 / AIE2P (`npu2`), current AMD NPU driver.
