@@ -27,6 +27,8 @@ from anima_xdna_poc.errors import PrototypeError, UnsupportedTensor
 SUPPORTED_COMFY_COMMIT = "170594057a22673349ddf0a3d88624b7fa5865bb"
 WRAPPER_KEY = "anima_xdna2_resident"
 ATTACHMENT_KEY = "anima_xdna2_runtime"
+SOURCE_PROVENANCE_KEY = "anima_xdna2_source_provenance"
+AUTO_CHECKPOINT = "Auto (from MODEL)"
 SUPPORTED_SHAPE = (1, 16, 1, 64, 64)
 
 
@@ -57,6 +59,9 @@ class RuntimeDiagnostics:
     cache: Optional[dict[str, Any]] = None
     source_schema: Optional[str] = None
     source_fingerprint: Optional[str] = None
+    source_execution_fingerprint: Optional[str] = None
+    source_dtypes: Optional[list[str]] = None
+    source_normalization_message: Optional[str] = None
     model_schema: Optional[str] = None
     model_fingerprint: Optional[str] = None
     model_variant: Optional[str] = None
@@ -110,18 +115,26 @@ class SharedRuntime:
                 identity = runtime.source_identity
                 if identity is None:
                     raise RuntimeError("packed cache did not expose source identity")
+                execution_identity = runtime.execution_identity
+                if execution_identity is None:
+                    raise RuntimeError(
+                        "packed cache did not expose BF16 execution identity"
+                    )
                 identity_started = time.perf_counter()
                 model_fingerprint, model_schema = fingerprint_model_blocks(diffusion_model)
                 identity_check_ms = (
                     time.perf_counter() - identity_started
                 ) * 1000
                 source_fingerprint = identity["block_fingerprint"]
-                if model_fingerprint != source_fingerprint:
+                source_execution_fingerprint = execution_identity[
+                    "block_fingerprint"
+                ]
+                if model_fingerprint != source_execution_fingerprint:
                     raise RuntimeError(
                         "Anima MODEL/checkpoint mismatch: the connected MODEL "
                         "does not contain the same 28-block weights as the XDNA "
                         f"source (MODEL {model_fingerprint[:16]}..., source "
-                        f"{source_fingerprint[:16]}...). Select the matching "
+                        f"{source_execution_fingerprint[:16]}...). Select the matching "
                         "Base or Turbo checkpoint; no dispatch was attempted."
                     )
                 storage_profile = _model_storage_profile(diffusion_model)
@@ -136,9 +149,15 @@ class SharedRuntime:
             self.diagnostics.state = "prepared"
             self.diagnostics.source_schema = identity["schema"]
             self.diagnostics.source_fingerprint = source_fingerprint
+            self.diagnostics.source_execution_fingerprint = (
+                source_execution_fingerprint
+            )
+            self.diagnostics.source_dtypes = execution_identity["source_dtypes"]
             self.diagnostics.model_schema = model_schema
             self.diagnostics.model_fingerprint = model_fingerprint
-            self.diagnostics.model_variant = validated_variant(source_fingerprint)
+            self.diagnostics.model_variant = validated_variant(
+                source_execution_fingerprint
+            )
             self.diagnostics.qkv_chaining = self.qkv_chaining
             self.diagnostics.model_block_parameter_count = storage_profile[
                 "block_parameter_count"
@@ -172,6 +191,21 @@ class SharedRuntime:
                 if runtime.cache_status is not None
                 else None
             )
+            if execution_identity["source_dtypes"] != ["BF16"]:
+                action = (
+                    "Reusing the verified"
+                    if runtime.cache_status is not None
+                    and runtime.cache_status.hit
+                    else "Created a verified"
+                )
+                message = (
+                    f"{action} BF16 packed cache for "
+                    f"{'/'.join(execution_identity['source_dtypes'])} source "
+                    "weights. The original checkpoint is unchanged; future "
+                    "runs reuse this cache."
+                )
+                self.diagnostics.source_normalization_message = message
+                print(f"[Anima XDNA] {message}")
 
     def acquire(self):
         with self._lock:
@@ -576,16 +610,76 @@ def _file_identity_token(path: Path) -> str:
     return json.dumps(identity, sort_keys=True, separators=(",", ":"))
 
 
+_ANIMA_MODEL_CATEGORIES = ("diffusion_models", "checkpoints")
+
+
+@dataclass(frozen=True)
+class ModelSourceProvenance:
+    selector: str
+    path: str
+    identity_token: str
+
+    def on_model_patcher_clone(self):
+        return self
+
+
+def _anima_model_selector(value: str) -> tuple[str, str]:
+    category, separator, name = value.partition(":")
+    if not separator:
+        return "diffusion_models", value
+    if category not in _ANIMA_MODEL_CATEGORIES or not name:
+        raise ValueError(
+            "Anima model selector must be an unqualified diffusion model or "
+            "'diffusion_models:<name>' / 'checkpoints:<name>'"
+        )
+    return category, name
+
+
+def _auto_checkpoint_path(model) -> Path:
+    get_attachment = getattr(model, "get_attachment", None)
+    provenance = (
+        get_attachment(SOURCE_PROVENANCE_KEY)
+        if callable(get_attachment)
+        else None
+    )
+    if not isinstance(provenance, ModelSourceProvenance):
+        raise RuntimeError(
+            "Auto checkpoint selection requires a MODEL loaded by "
+            "Load Anima (BF16). Use that loader or enter the matching "
+            "checkpoint path manually."
+        )
+    path = Path(provenance.path)
+    if not path.is_file():
+        raise RuntimeError(
+            f"Auto-selected Anima checkpoint does not exist: {path}"
+        )
+    if _file_identity_token(path) != provenance.identity_token:
+        raise RuntimeError(
+            "The auto-selected Anima checkpoint changed after the MODEL was "
+            "loaded. Reload the MODEL before attaching XDNA."
+        )
+    return path
+
+
+def _resolve_attach_checkpoint(model, checkpoint: str) -> Path:
+    if checkpoint.strip() == AUTO_CHECKPOINT:
+        return _auto_checkpoint_path(model)
+    return Path(checkpoint)
+
+
 class LoadAnimaBF16:
     @classmethod
     def INPUT_TYPES(cls):
         import folder_paths
 
+        models = [
+            f"{category}:{name}"
+            for category in _ANIMA_MODEL_CATEGORIES
+            for name in folder_paths.get_filename_list(category)
+        ]
         return {
             "required": {
-                "unet_name": (
-                    folder_paths.get_filename_list("diffusion_models"),
-                )
+                "unet_name": (models,)
             }
         }
 
@@ -597,16 +691,16 @@ class LoadAnimaBF16:
     def IS_CHANGED(cls, unet_name):
         import folder_paths
 
-        path = folder_paths.get_full_path_or_raise("diffusion_models", unet_name)
+        category, name = _anima_model_selector(unet_name)
+        path = folder_paths.get_full_path_or_raise(category, name)
         return _file_identity_token(Path(path))
 
     def load(self, unet_name):
         import comfy.sd
         import folder_paths
 
-        path = folder_paths.get_full_path_or_raise(
-            "diffusion_models", unet_name
-        )
+        category, name = _anima_model_selector(unet_name)
+        path = folder_paths.get_full_path_or_raise(category, name)
         model = comfy.sd.load_diffusion_model(
             path,
             model_options={"dtype": torch.bfloat16},
@@ -624,6 +718,21 @@ class LoadAnimaBF16:
                 "ComfyUI did not retain all Anima transformer-block Parameters "
                 "as BF16; refusing to load a memory-expanded MODEL."
             )
+        set_attachment = getattr(model, "set_attachments", None)
+        if not callable(set_attachment):
+            raise RuntimeError(
+                "ComfyUI ModelPatcher attachments are unavailable; use the "
+                f"validated ComfyUI commit {SUPPORTED_COMFY_COMMIT}."
+            )
+        resolved = Path(path).resolve()
+        set_attachment(
+            SOURCE_PROVENANCE_KEY,
+            ModelSourceProvenance(
+                selector=unet_name,
+                path=str(resolved),
+                identity_token=_file_identity_token(resolved),
+            ),
+        )
         return (model,)
 
 
@@ -635,7 +744,7 @@ class LoadAttachAnimaXDNAModel:
                 "model": ("MODEL",),
                 "checkpoint": (
                     "STRING",
-                    {"default": "path/to/Anima-Base-v1.0/transformer/diffusion_pytorch_model.safetensors"},
+                    {"default": AUTO_CHECKPOINT},
                 ),
                 "rebuild_cache": ("BOOLEAN", {"default": False}),
             },
@@ -657,10 +766,16 @@ class LoadAttachAnimaXDNAModel:
         rebuild_cache,
         cache_dir="",
         qkv_chaining=True,
+        model=None,
         **_kwargs,
     ):
+        checkpoint_identity = (
+            AUTO_CHECKPOINT
+            if checkpoint.strip() == AUTO_CHECKPOINT
+            else _file_identity_token(Path(checkpoint))
+        )
         identity = {
-            "checkpoint": _file_identity_token(Path(checkpoint)),
+            "checkpoint": checkpoint_identity,
             "rebuild_cache": bool(rebuild_cache),
             "cache_dir": str(Path(cache_dir).expanduser().resolve(strict=False))
             if cache_dir.strip()
@@ -673,7 +788,7 @@ class LoadAttachAnimaXDNAModel:
         self, model, checkpoint, rebuild_cache, cache_dir="", qkv_chaining=True
     ):
         _validate_patcher(model)
-        path = Path(checkpoint)
+        path = _resolve_attach_checkpoint(model, checkpoint)
         if not path.is_file():
             raise RuntimeError(f"Anima checkpoint does not exist: {path}")
         patched = model.clone()

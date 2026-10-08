@@ -1,9 +1,10 @@
-# Anima Base v1.0 and Turbo V1.1 on AMD XDNA 2
+# Anima-compatible BF16 checkpoints on AMD XDNA 2
 
 ## Scope and claim
 
-This repository demonstrates Anima Base v1.0 and Turbo V1.1 image generation with their 28 DiT
-transformer blocks accelerated on AMD XDNA 2 through Triton-XDNA and XRT.
+This repository demonstrates Anima Base v1.0, Turbo V1.1, and the WAI Nova
+Anima Turbo LoRA Ver V1.0 full checkpoint with their 28 DiT transformer
+blocks accelerated on AMD XDNA 2 through Triton-XDNA and XRT.
 Safetensors remain the read-only source of truth. No ONNX conversion, Vitis AI
 Execution Provider, or converted distributable model is used.
 
@@ -32,7 +33,7 @@ This dated, non-exhaustive search is not an absolute novelty claim.
 | XRT SDK | 2.21.75 |
 | ComfyUI | `170594057a22673349ddf0a3d88624b7fa5865bb` |
 | Wrapper source | `737338d76bf2a7dcf9806aaba5d6d936499b95ab` |
-| Models | Anima Base v1.0 and Turbo V1.1, BF16 |
+| Models | Anima Base v1.0, Turbo V1.1, and WAI Nova Anima Turbo LoRA Ver V1.0, BF16 transformer |
 | Shape | batch 1, latent `[1,16,1,64,64]`, 512×512, context `[1,512,1024]` |
 
 The exact structured measurements and artifact digests are in
@@ -117,8 +118,10 @@ additional arguments. The XDNA runtime remains available through
 Use `Anima XDNA 2 / Load Anima (BF16)` to load the native Base or Turbo model,
 then insert
 `Anima XDNA 2 / Load/Attach Anima XDNA Model` between its MODEL output and the
-normal sampler MODEL input. Set `checkpoint` to the matching Base source or
-the same native Turbo checkpoint. Leave `rebuild_cache=false`; leave `cache_dir` empty for
+normal sampler MODEL input. Leave `checkpoint` at `Auto (from MODEL)` to reuse
+the exact read-only source recorded by the BF16 loader. A manual path remains
+available for compatible MODELs loaded elsewhere and is still subject to the
+same full fingerprint check. Leave `rebuild_cache=false`; leave `cache_dir` empty for
 `%USERPROFILE%\.cache\anima-xdna\weights`, or use another user-owned ASCII
 directory. Connect the wrapped MODEL to `Anima XDNA Runtime Status` when
 collecting evidence. `Unload Anima XDNA Runtime` releases the attachment
@@ -271,6 +274,14 @@ safetensors container or a persistent device pointer. Its key includes source
 tensor content, architecture/key map, layout ABI, future adapter/quantization
 namespace, tool versions, and NPU target. Manifest and payload digests are
 verified; build publication is locked and atomic.
+
+F16 and F32 source tensors are explicitly converted to BF16 during packing.
+The raw source identity remains unchanged and continues to determine cache
+isolation and source-integrity checks. A separate BF16 execution fingerprint
+is stored in the manifest and compared with the BF16 ComfyUI MODEL, so dtype
+normalization does not weaken MODEL/source mismatch rejection. Runtime status
+and the ComfyUI log report whether this derived cache was created or reused
+and state that the original checkpoint is unchanged.
 
 The validated 28-block entry contains 644 tensors, occupies 3,963,645,952
 bytes, and has 88,080,384 bytes of padding. Cold build was 19.834–19.865 s;
@@ -539,10 +550,62 @@ $env:ANIMA_XDNA_CHAIN_FIXTURE = "<CAPTURED_REAL_BLOCK_INPUT_PT>"
 
 ## Limitations and troubleshooting
 
-Only Base v1.0, Turbo V1.1, and the fixed shape above are validated. Preview/Aesthetic
+Only Base v1.0, Turbo V1.1, WAI Nova Anima Turbo LoRA Ver V1.0, Radiance
+Turbo Anima v2.0, and the fixed shape above are validated. Other Preview/Aesthetic
 checkpoints, LoRA/LLLite/ModelPatcher transformer patches, INT8, training,
 other resolutions, other context sizes, and user batches above one are
 rejected. CFG batch 2 is executed sequentially on the single-tenant NPU.
+
+## WAI Nova Anima Turbo LoRA Ver V1.0
+
+The validated 5,628,192,370-byte safetensors is a full ComfyUI checkpoint,
+not a LoRA delta: 685 `model.diffusion_model.*`, 311 `cond_stage_model.*`,
+and 194 `first_stage_model.*` tensors. Its 560 BF16 transformer-block tensors
+match the existing 28-block Anima 2B schema. The canonical block fingerprint
+is `b462ef63ecdcbe8e4b981e55f3a66a432a66a5fc1fc2c7cb043da8df5dc44ad5`;
+the packed-cache key is
+`9b9cad017254a1d54f27d533ae47fcf52e77149ef4fcd90db57b4e0db3bcfdf1`.
+
+Real XDNA validation used the existing Turbo preprocessing fixture. The
+532-dispatch chained and 644-dispatch control paths matched bitwise at every
+block. The worst intermediate CPU-oracle NRMS was 0.109668 at block 13,
+slightly above the Turbo V1.1 0.10 gate, while final NRMS was 0.014393 and
+remained below the 0.02 final gate. This wider intermediate drift is recorded
+as a model-specific limitation rather than silently widening the Turbo gate.
+
+A controlled 512x512, four-step Euler/simple, CFG-1 ComfyUI run produced valid
+RGB images with the established prompt and separate Qwen/VAE nodes. The cold
+prompt completed in 88.29 seconds (16.28 seconds/iteration); a second prompt
+with seed changed from 424242 to 424243 forced sampling while reusing the
+attached runtime and completed in 54.25 seconds (11.59 seconds/iteration).
+These are a single cold/resident pair, not a stable speed benchmark or a
+same-seed image-equivalence test.
+
+## Radiance Turbo Anima v2.0
+
+The validated 4,182,282,440-byte checkpoint contains 685
+`model.diffusion_model.*` tensors. Its 560 transformer-block tensors use F16
+source storage and match the existing 28-block Anima 2B schema. The raw source
+block fingerprint is
+`b874ac8651bde5bd0ea8bfb5403ae64ce340a2c525d6669abb0f14711fb85110`;
+after the same explicit BF16 normalization used by the packed cache, its
+execution fingerprint is
+`c075e104021963603810bf7b91b5e051d50f47ed0f63291c4e78a62b46d0595c`.
+That normalized fingerprint matched the BF16 ComfyUI MODEL exactly. The raw
+identity remains distinct and produced cache key
+`02af9642883592b7a1f7de8b3a634cd4e45dab455029f6638577db0a64fc1c1e`.
+
+Validation used a preprocessing fixture captured from Radiance itself. The
+532-dispatch chained and 644-dispatch control paths matched bitwise, as did
+cached and uncached execution. Worst intermediate CPU-oracle NRMS was
+0.084199 at block 13 and final NRMS was 0.014452, passing the standard 0.10
+intermediate and 0.02 final gates.
+
+A controlled 512x512, four-step Euler/simple, CFG-1 ComfyUI run produced valid
+RGB images. The cold prompt completed in 92.78 seconds; a second prompt with a
+different seed forced sampling while reusing the attached runtime and
+completed in 46.77 seconds. The log explicitly reported reuse of the verified
+BF16 packed cache and that the F16 checkpoint remained unchanged.
 
 - **`dependency unavailable`:** use the same Python 3.13 environment for
   ComfyUI, `pyxrt`, Triton-XDNA, and this package.

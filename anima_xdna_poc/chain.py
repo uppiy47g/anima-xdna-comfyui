@@ -109,6 +109,12 @@ class AnimaXDNAChainRuntime:
             return None
         return self._packed_cache.manifest["descriptor"]["source_identity"]
 
+    @property
+    def execution_identity(self) -> Optional[dict]:
+        if self._packed_cache is None:
+            return None
+        return self._packed_cache.execution_identity
+
     def close(self):
         if self._session is not None:
             self._session.__exit__(None, None, None)

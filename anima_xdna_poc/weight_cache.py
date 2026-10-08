@@ -260,6 +260,58 @@ def fingerprint_source(
     )
 
 
+def fingerprint_execution_source(
+    checkpoint: Path,
+    blocks: range,
+    source_identity: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    source = source_identity
+    if source is None:
+        source, _ = fingerprint_source(checkpoint, blocks)
+    source_dtypes = sorted({tensor["dtype"] for tensor in source["tensors"]})
+    if source_dtypes == ["BF16"]:
+        return {
+            "normalization": "BF16",
+            "source_dtypes": source_dtypes,
+            "block_fingerprint": source["block_fingerprint"],
+        }
+
+    checkpoint = Path(checkpoint).resolve()
+    source_files, _ = _source_files(checkpoint)
+    tensor_sources = {tensor["key"]: tensor for tensor in source["tensors"]}
+    records = []
+    with ExitStack() as stack:
+        sources = {
+            _source_name(checkpoint, path): stack.enter_context(
+                safe_open(path, framework="pt", device="cpu")
+            )
+            for path in source_files
+        }
+        for key in canonical_keys(blocks):
+            record = tensor_sources[key]
+            tensor = (
+                sources[record["shard"]]
+                .get_tensor(record["source_key"])
+                .to(torch.bfloat16)
+                .contiguous()
+            )
+            records.append(
+                {
+                    "key": key,
+                    "dtype": "BF16",
+                    "shape": list(tensor.shape),
+                    "sha256": hashlib.sha256(
+                        tensor.view(torch.uint8).numpy()
+                    ).hexdigest(),
+                }
+            )
+    return {
+        "normalization": "BF16",
+        "source_dtypes": source_dtypes,
+        "block_fingerprint": canonical_block_fingerprint(records),
+    }
+
+
 def _file_guard(path: Path) -> dict[str, int]:
     stat = path.stat()
     return {
@@ -464,6 +516,12 @@ class PackedWeightCache:
         )
         return _descriptor_key(descriptor), descriptor, timings
 
+    @property
+    def execution_identity(self) -> Optional[dict[str, Any]]:
+        if self.manifest is None:
+            return None
+        return self.manifest.get("execution_identity")
+
     def entry_path(self, key: str) -> Path:
         return self.root / key
 
@@ -527,6 +585,8 @@ class PackedWeightCache:
                 source_valid
                 and verified_manifest == candidate_manifest
                 and candidate_manifest.get("cache_key") == candidate.name
+                and _descriptor_key(candidate_manifest["descriptor"])
+                == candidate.name
             ):
                 self.manifest = candidate_manifest
                 self.status = self._status(
@@ -691,6 +751,11 @@ class PackedWeightCache:
         temporary = self.root / f".{key}.{uuid.uuid4().hex}.tmp"
         temporary.mkdir()
         records = []
+        source_identity = descriptor["source_identity"]
+        source_dtypes = sorted(
+            {tensor["dtype"] for tensor in source_identity["tensors"]}
+        )
+        execution_records = [] if source_dtypes != ["BF16"] else None
         logical_bytes = 0
         payload_hash = hashlib.sha256()
         offset = 0
@@ -748,6 +813,18 @@ class PackedWeightCache:
                                     f"{tensor.dtype}"
                                 )
                             logical_bytes += tensor.numel() * tensor.element_size()
+                            normalized = tensor.to(torch.bfloat16).contiguous()
+                            if execution_records is not None:
+                                execution_records.append(
+                                    {
+                                        "key": canonical_key,
+                                        "dtype": "BF16",
+                                        "shape": list(normalized.shape),
+                                        "sha256": hashlib.sha256(
+                                            normalized.view(torch.uint8).numpy()
+                                        ).hexdigest(),
+                                    }
+                                )
                             for start in range(0, tensor.shape[1], 2048):
                                 end = min(start + 2048, tensor.shape[1])
                                 packed_shape = _layout_shape(tensor.shape[0], end - start)
@@ -755,9 +832,7 @@ class PackedWeightCache:
                                     packed_shape, dtype=torch.bfloat16
                                 )
                                 packed[: end - start, : tensor.shape[0]] = (
-                                    tensor[:, start:end]
-                                    .to(torch.bfloat16)
-                                    .T.contiguous()
+                                    normalized[:, start:end].T.contiguous()
                                 )
                                 raw = packed.view(torch.uint8).numpy().tobytes()
                                 payload.write(raw)
@@ -804,6 +879,17 @@ class PackedWeightCache:
                                 source_tensor.numel() * source_tensor.element_size()
                             )
                             tensor = source_tensor.to(torch.bfloat16).contiguous()
+                            if execution_records is not None:
+                                execution_records.append(
+                                    {
+                                        "key": canonical_key,
+                                        "dtype": "BF16",
+                                        "shape": list(tensor.shape),
+                                        "sha256": hashlib.sha256(
+                                            tensor.view(torch.uint8).numpy()
+                                        ).hexdigest(),
+                                    }
+                                )
                             raw = tensor.view(torch.uint8).numpy().tobytes()
                             payload.write(raw)
                             payload_hash.update(raw)
@@ -825,9 +911,19 @@ class PackedWeightCache:
                             offset += len(raw)
                     payload.flush()
                     os.fsync(payload.fileno())
+            execution_fingerprint = (
+                source_identity["block_fingerprint"]
+                if execution_records is None
+                else canonical_block_fingerprint(execution_records)
+            )
             manifest = {
                 "cache_key": key,
                 "descriptor": descriptor,
+                "execution_identity": {
+                    "normalization": "BF16",
+                    "source_dtypes": source_dtypes,
+                    "block_fingerprint": execution_fingerprint,
+                },
                 "source_guard": _source_guard(self.checkpoint),
                 "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                 "tensor_count": len(records),
@@ -854,6 +950,27 @@ class PackedWeightCache:
         status = self.ensure(rebuild)
         if not self.enabled:
             return status
+        if self.manifest is None:
+            raise RuntimeError("packed weight cache did not expose its manifest")
+        expected_execution_identity = fingerprint_execution_source(
+            self.checkpoint,
+            self.blocks,
+            self.manifest["descriptor"]["source_identity"],
+        )
+        stored_execution_identity = self.manifest.get("execution_identity")
+        if stored_execution_identity is None:
+            self.manifest["execution_identity"] = expected_execution_identity
+            manifest_path = status.path / "manifest.json"
+            temporary = status.path / f".manifest.{uuid.uuid4().hex}.tmp"
+            temporary.write_text(
+                json.dumps(self.manifest, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            os.replace(temporary, manifest_path)
+        elif stored_execution_identity != expected_execution_identity:
+            raise CacheIntegrityError(
+                "cache BF16 execution identity does not match its source"
+            )
         payload = status.path / "weights.bin"
         started = time.perf_counter()
         self._handle = payload.open("rb")

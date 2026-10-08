@@ -49,6 +49,12 @@ VALIDATED_VARIANT_FINGERPRINTS = {
     "066b4281037504b1b7200ecd65b4182fc765ed882ecd5ca650db7308246a8dee": (
         "Turbo V1.1"
     ),
+    "b462ef63ecdcbe8e4b981e55f3a66a432a66a5fc1fc2c7cb043da8df5dc44ad5": (
+        "WAI Nova Anima Turbo LoRA Ver V1.0"
+    ),
+    "c075e104021963603810bf7b91b5e051d50f47ed0f63291c4e78a62b46d0595c": (
+        "Radiance Turbo Anima v2.0"
+    ),
 }
 
 
@@ -149,7 +155,7 @@ def fingerprint_model_blocks(diffusion_model) -> tuple[str, str]:
                 f"MODEL tensor {source_key!r} has unsupported dtype {tensor.dtype}"
             )
         contiguous = tensor.detach().to(device="cpu").contiguous()
-        if contiguous.dtype == torch.float32:
+        if contiguous.dtype != torch.bfloat16:
             contiguous = contiguous.to(torch.bfloat16)
             dtype = "BF16"
         raw = contiguous.view(torch.uint8).numpy()

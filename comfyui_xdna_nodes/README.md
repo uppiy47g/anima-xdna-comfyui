@@ -1,8 +1,9 @@
 # Anima XDNA 2 ComfyUI MODEL wrapper
 
 This custom-node package replaces only the 28 `transformer_blocks` in ComfyUI's
-native Anima Base v1.0 or Turbo V1.1 diffusion model with the resident Triton-XDNA/XRT
-runtime. It does **not** use ONNX or Vitis AI EP.
+native Anima Base v1.0, Turbo V1.1, or validated WAI Nova Anima Turbo LoRA
+Ver V1.0 diffusion model with the resident Triton-XDNA/XRT runtime. It does
+**not** use ONNX or Vitis AI EP.
 
 For an isolated Windows setup, sanitized launcher/model-path templates, the
 full verification ladder, image evidence, and machine-readable measurements,
@@ -26,7 +27,8 @@ back to CPU.
 
 - ComfyUI API validated at commit
   `170594057a22673349ddf0a3d88624b7fa5865bb`
-- native Base v1.0 or Turbo V1.1 BF16 checkpoint loaded by
+- native Base v1.0, Turbo V1.1, WAI Nova Anima Turbo LoRA Ver V1.0, or
+  Radiance Turbo Anima v2.0 transformer loaded by
   **Load Anima (BF16)** (explicit ComfyUI `dtype=torch.bfloat16`)
 - matching read-only XDNA source: validated Diffusers/native Base for Base,
   or the same native Turbo checkpoint for Turbo
@@ -39,6 +41,9 @@ batch/resolution/context sizes, and training are rejected. The normal ComfyUI
 MODEL is cloned; it is not modified. Before XRT opens, the wrapper computes a
 canonical full digest over all 560 block tensors. Base/Turbo or other
 MODEL/source mismatches are rejected before BO population or dispatch.
+For an F16 or F32 source, matching is performed after the same explicit BF16
+normalization used by the XDNA packed cache. Raw source hashes and dtypes still
+remain part of the cache identity.
 
 ## Installation
 
@@ -59,22 +64,37 @@ starting ComfyUI. The packed cache defaults to
 
 ## Nodes
 
-1. Load the native Anima Base or Turbo MODEL with **Load Anima (BF16)**.
+1. Load the native Anima MODEL with **Load Anima (BF16)**. Its selector
+   includes both `diffusion_models:` transformer files and `checkpoints:`
+   full checkpoints; unqualified legacy workflow values still resolve as
+   `diffusion_models`.
    The normal `UNETLoader` does not expose BF16; on the validated CPU setup
    its default Anima policy chooses FP32. The custom loader passes BF16 through
    ComfyUI's supported `load_diffusion_model` options and refuses the result
    if any transformer-block Parameter expanded to another dtype.
 2. Connect it to **Load/Attach Anima XDNA Model**.
-3. Set `checkpoint` to the matching source. For Base, use the validated Base
-   Diffusers transformer or equivalent native Base checkpoint. For Turbo,
-   select the exact same native Turbo V1.1 checkpoint as `UNETLoader`. The file
-   remains read-only and is the XDNA cache source of truth.
+3. Leave `checkpoint` at **Auto (from MODEL)**. **Load Anima (BF16)** records
+   its exact source on the MODEL and the attach node reuses it automatically,
+   including through normal ModelPatcher clones. The file remains read-only
+   and is the XDNA cache source of truth. A manual path remains available for
+   MODELs loaded another way; it must contain the same block weights.
+   If its block weights are F16 or F32, the first attach creates a verified
+   BF16 packed cache without modifying the checkpoint. The ComfyUI log and
+   runtime status explain this conversion; later attaches report verified
+   cache reuse.
 4. Connect the returned MODEL to the normal sampler.
 5. Use **Anima XDNA Runtime Status** to inspect cache state, first/warm timing,
    dispatches, transfers, BO population, allocations, and resident reuse.
 6. Use **Unload Anima XDNA Runtime** before switching checkpoints when an
    immediate release is required. Garbage collection also releases the
    attachment.
+
+   The validated WAI Nova file is a full ComfyUI checkpoint containing Anima,
+   Qwen, and VAE tensors, not a standalone LoRA delta. The BF16 loader extracts
+   its `model.diffusion_model.*` Anima component; use the normal Qwen and VAE
+   workflow nodes for the remaining components. The XDNA source selector must
+   reference the same full checkpoint so the 560-tensor canonical fingerprint
+   check remains exact.
 
 `qkv_chaining` defaults to enabled. It only fuses the three Q/K/V projection
 launches within each attention module; LayerNorm/AdaLN, RMSNorm, RoPE,
