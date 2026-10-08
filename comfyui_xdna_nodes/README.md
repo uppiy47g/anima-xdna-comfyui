@@ -1,8 +1,9 @@
 # Anima XDNA 2 ComfyUI MODEL wrapper
 
 This custom-node package replaces only the 28 `transformer_blocks` in ComfyUI's
-native Anima Base v1.0 or Turbo V1.1 diffusion model with the resident Triton-XDNA/XRT
-runtime. It does **not** use ONNX or Vitis AI EP.
+native Anima Base v1.0, Turbo V1.1, or validated WAI Nova Anima Turbo LoRA
+Ver V1.0 diffusion model with the resident Triton-XDNA/XRT runtime. It does
+**not** use ONNX or Vitis AI EP.
 
 For an isolated Windows setup, sanitized launcher/model-path templates, the
 full verification ladder, image evidence, and machine-readable measurements,
@@ -26,7 +27,8 @@ back to CPU.
 
 - ComfyUI API validated at commit
   `170594057a22673349ddf0a3d88624b7fa5865bb`
-- native Base v1.0 or Turbo V1.1 BF16 checkpoint loaded by
+- native Base v1.0, Turbo V1.1, or WAI Nova Anima Turbo LoRA Ver V1.0 BF16
+  transformer loaded by
   **Load Anima (BF16)** (explicit ComfyUI `dtype=torch.bfloat16`)
 - matching read-only XDNA source: validated Diffusers/native Base for Base,
   or the same native Turbo checkpoint for Turbo
@@ -59,7 +61,10 @@ starting ComfyUI. The packed cache defaults to
 
 ## Nodes
 
-1. Load the native Anima Base or Turbo MODEL with **Load Anima (BF16)**.
+1. Load the native Anima MODEL with **Load Anima (BF16)**. Its selector
+   includes both `diffusion_models:` transformer files and `checkpoints:`
+   full checkpoints; unqualified legacy workflow values still resolve as
+   `diffusion_models`.
    The normal `UNETLoader` does not expose BF16; on the validated CPU setup
    its default Anima policy chooses FP32. The custom loader passes BF16 through
    ComfyUI's supported `load_diffusion_model` options and refuses the result
@@ -75,6 +80,13 @@ starting ComfyUI. The packed cache defaults to
 6. Use **Unload Anima XDNA Runtime** before switching checkpoints when an
    immediate release is required. Garbage collection also releases the
    attachment.
+
+   The validated WAI Nova file is a full ComfyUI checkpoint containing Anima,
+   Qwen, and VAE tensors, not a standalone LoRA delta. The BF16 loader extracts
+   its `model.diffusion_model.*` Anima component; use the normal Qwen and VAE
+   workflow nodes for the remaining components. The XDNA source selector must
+   reference the same full checkpoint so the 560-tensor canonical fingerprint
+   check remains exact.
 
 `qkv_chaining` defaults to enabled. It only fuses the three Q/K/V projection
 launches within each attention module; LayerNorm/AdaLN, RMSNorm, RoPE,

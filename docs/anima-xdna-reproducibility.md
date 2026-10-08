@@ -1,9 +1,10 @@
-# Anima Base v1.0 and Turbo V1.1 on AMD XDNA 2
+# Anima-compatible BF16 checkpoints on AMD XDNA 2
 
 ## Scope and claim
 
-This repository demonstrates Anima Base v1.0 and Turbo V1.1 image generation with their 28 DiT
-transformer blocks accelerated on AMD XDNA 2 through Triton-XDNA and XRT.
+This repository demonstrates Anima Base v1.0, Turbo V1.1, and the WAI Nova
+Anima Turbo LoRA Ver V1.0 full checkpoint with their 28 DiT transformer
+blocks accelerated on AMD XDNA 2 through Triton-XDNA and XRT.
 Safetensors remain the read-only source of truth. No ONNX conversion, Vitis AI
 Execution Provider, or converted distributable model is used.
 
@@ -32,7 +33,7 @@ This dated, non-exhaustive search is not an absolute novelty claim.
 | XRT SDK | 2.21.75 |
 | ComfyUI | `170594057a22673349ddf0a3d88624b7fa5865bb` |
 | Wrapper source | `737338d76bf2a7dcf9806aaba5d6d936499b95ab` |
-| Models | Anima Base v1.0 and Turbo V1.1, BF16 |
+| Models | Anima Base v1.0, Turbo V1.1, and WAI Nova Anima Turbo LoRA Ver V1.0, BF16 transformer |
 | Shape | batch 1, latent `[1,16,1,64,64]`, 512×512, context `[1,512,1024]` |
 
 The exact structured measurements and artifact digests are in
@@ -539,10 +540,36 @@ $env:ANIMA_XDNA_CHAIN_FIXTURE = "<CAPTURED_REAL_BLOCK_INPUT_PT>"
 
 ## Limitations and troubleshooting
 
-Only Base v1.0, Turbo V1.1, and the fixed shape above are validated. Preview/Aesthetic
+Only Base v1.0, Turbo V1.1, WAI Nova Anima Turbo LoRA Ver V1.0, and the fixed
+shape above are validated. Other Preview/Aesthetic
 checkpoints, LoRA/LLLite/ModelPatcher transformer patches, INT8, training,
 other resolutions, other context sizes, and user batches above one are
 rejected. CFG batch 2 is executed sequentially on the single-tenant NPU.
+
+## WAI Nova Anima Turbo LoRA Ver V1.0
+
+The validated 5,628,192,370-byte safetensors is a full ComfyUI checkpoint,
+not a LoRA delta: 685 `model.diffusion_model.*`, 311 `cond_stage_model.*`,
+and 194 `first_stage_model.*` tensors. Its 560 BF16 transformer-block tensors
+match the existing 28-block Anima 2B schema. The canonical block fingerprint
+is `b462ef63ecdcbe8e4b981e55f3a66a432a66a5fc1fc2c7cb043da8df5dc44ad5`;
+the packed-cache key is
+`9b9cad017254a1d54f27d533ae47fcf52e77149ef4fcd90db57b4e0db3bcfdf1`.
+
+Real XDNA validation used the existing Turbo preprocessing fixture. The
+532-dispatch chained and 644-dispatch control paths matched bitwise at every
+block. The worst intermediate CPU-oracle NRMS was 0.109668 at block 13,
+slightly above the Turbo V1.1 0.10 gate, while final NRMS was 0.014393 and
+remained below the 0.02 final gate. This wider intermediate drift is recorded
+as a model-specific limitation rather than silently widening the Turbo gate.
+
+A controlled 512x512, four-step Euler/simple, CFG-1 ComfyUI run produced valid
+RGB images with the established prompt and separate Qwen/VAE nodes. The cold
+prompt completed in 88.29 seconds (16.28 seconds/iteration); a second prompt
+with seed changed from 424242 to 424243 forced sampling while reusing the
+attached runtime and completed in 54.25 seconds (11.59 seconds/iteration).
+These are a single cold/resident pair, not a stable speed benchmark or a
+same-seed image-equivalence test.
 
 - **`dependency unavailable`:** use the same Python 3.13 environment for
   ComfyUI, `pyxrt`, Triton-XDNA, and this package.

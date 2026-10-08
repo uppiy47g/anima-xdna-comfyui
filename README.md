@@ -3,8 +3,9 @@
 This project explores image generation in ComfyUI on AMD XDNA 2 NPUs through
 Triton-XDNA and XRT, without conversion pipelines such as ONNX or Vitis AI EP.
 Its long-term goal is to broaden native safetensors support so more models can
-be loaded directly. Current support is limited to Anima Base v1.0 and Turbo
-V1.1 using their original BF16 safetensors. Runtime failures are explicit,
+be loaded directly. Current support covers Anima Base v1.0, Turbo V1.1, and
+the structurally compatible WAI Nova Anima Turbo LoRA Ver V1.0 full checkpoint
+using their original BF16 transformer weights. Runtime failures are explicit,
 with no silent CPU fallback.
 
 This is an experimental **CPU-hybrid** implementation, not NPU-only image
@@ -24,7 +25,8 @@ https://note.com/loyal_owl5720/m/m79af97ed02e5
   3.10 and newer.
 - XRT SDK 2.21.75 and Triton-XDNA `3.6.0.2026093004+75679dc` were validated.
 - ComfyUI commit `170594057a22673349ddf0a3d88624b7fa5865bb`.
-- Anima Base v1.0 or Turbo V1.1, full BF16 checkpoint, batch 1, 512x512,
+- Anima Base v1.0, Turbo V1.1, or the validated WAI Nova Anima Turbo LoRA
+  Ver V1.0 full checkpoint; BF16 transformer weights, batch 1, 512x512,
   1024 image tokens and 512x1024 adapted Qwen context.
 
 Model weights, packed caches, captured tensors and vendor binaries are not

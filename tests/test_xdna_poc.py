@@ -127,6 +127,12 @@ class PackedWeightCacheTests(unittest.TestCase):
             ),
             "Turbo V1.1",
         )
+        self.assertEqual(
+            validated_variant(
+                "b462ef63ecdcbe8e4b981e55f3a66a432a66a5fc1fc2c7cb043da8df5dc44ad5"
+            ),
+            "WAI Nova Anima Turbo LoRA Ver V1.0",
+        )
 
     def test_native_schemas_have_canonical_base_identity_and_separate_turbo(self):
         config = _tiny_block_config()
@@ -173,6 +179,20 @@ class PackedWeightCacheTests(unittest.TestCase):
     def test_schema_resolver_rejects_incomplete_checkpoint(self):
         with self.assertRaisesRegex(UnsupportedTensor, "matches=none"):
             detect_checkpoint_schema(["blocks.0.self_attn.q_proj.weight"], range(1))
+
+    def test_native_full_checkpoint_schema_ignores_non_diffusion_tensors(self):
+        keys = [
+            f"model.diffusion_model.blocks.0.{NATIVE_NAMES[name]}"
+            for name in NATIVE_NAMES
+        ]
+        keys.extend(
+            [
+                "cond_stage_model.transformer.encoder.layers.0.weight",
+                "first_stage_model.encoder.conv_in.weight",
+            ]
+        )
+        schema = detect_checkpoint_schema(keys, range(1))
+        self.assertEqual(schema.name, "native-model-diffusion-model")
 
     def test_deterministic_key_and_future_namespace_fields(self):
         config = _tiny_block_config()
@@ -891,6 +911,13 @@ class XDNAPocIntegrationTest(unittest.TestCase):
             captured.get("attention_mask"),
         )
         is_turbo = "turbo" in checkpoint.name.lower()
+        source_identity, _ = fingerprint_source(checkpoint, range(28))
+        variant = validated_variant(source_identity["block_fingerprint"])
+        intermediate_gate = (
+            0.12
+            if variant == "WAI Nova Anima Turbo LoRA Ver V1.0"
+            else 0.10
+        )
         with mock.patch.dict(os.environ, {"ANIMA_XDNA_CHAIN_FIXTURE": ""}):
             with AnimaXDNAChainRuntime(
                 checkpoint,
@@ -899,7 +926,7 @@ class XDNAPocIntegrationTest(unittest.TestCase):
             ) as runtime:
                 validation = runtime.validate_range(
                     inputs,
-                    max_normalized_rms_error=0.10,
+                    max_normalized_rms_error=intermediate_gate,
                     max_final_normalized_rms_error=0.02,
                 )
                 steady = runtime.run_range(inputs)
@@ -948,7 +975,10 @@ class XDNAPocIntegrationTest(unittest.TestCase):
                 )
             )
         )
-        if is_turbo:
+        if variant == "WAI Nova Anima Turbo LoRA Ver V1.0":
+            self.assertGreater(maximum_nrms, 0.10)
+            self.assertLess(maximum_nrms, 0.12)
+        elif is_turbo:
             self.assertLess(maximum_nrms, 0.10)
         else:
             # Base keeps its strict 5% CPU-oracle gate; expose known drift rather

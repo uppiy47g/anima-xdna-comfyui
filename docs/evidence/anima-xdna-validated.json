@@ -1,7 +1,7 @@
 {
   "$schema": "./anima-xdna-evidence.schema.json",
   "schema_version": 2,
-  "recorded_date": "2026-10-06",
+  "recorded_date": "2026-10-08",
   "source_commits": {
     "linear": "a37158b",
     "block": "1f4db24",
@@ -11,6 +11,7 @@
     "turbo_support": "commit containing this evidence record",
     "qkv_chaining": "commit containing this evidence record",
     "bf16_model_loader": "commit containing this evidence record",
+    "wai_nova_support": "commit containing this evidence record",
     "comfyui": "170594057a22673349ddf0a3d88624b7fa5865bb"
   },
   "tested_system": {
@@ -20,7 +21,11 @@
     "torch": "2.14.1+cpu",
     "triton_xdna": "3.6.0.2026093004+75679dc",
     "xrt_sdk": "2.21.75",
-    "models": ["Anima Base v1.0", "Anima Turbo V1.1"],
+    "models": [
+      "Anima Base v1.0",
+      "Anima Turbo V1.1",
+      "WAI Nova Anima Turbo LoRA Ver V1.0"
+    ],
     "shape": {
       "latent": [1, 16, 1, 64, 64],
       "output_pixels": [512, 512],
@@ -647,6 +652,72 @@
       },
       "benchmark": false,
       "caveat": "User-provided console screenshot observations, not independently rerun or instrumented by the project. The prior CPU-only range is a separately reported comparison, not a same-run controlled benchmark. Prompt, seed, sampler, scheduler, and CFG were not captured for this record."
+    },
+    "wai_nova_anima_turbo_lora_v1_0": {
+      "status": "measured_real_checkpoint_and_comfyui",
+      "source_file": {
+        "bytes": 5628192370,
+        "sha256": "72b70b07c21b7d76044e285be06a350624d9ca82f72c31990449f7c7079fd55b",
+        "tensor_count": 1190,
+        "checkpoint_kind": "full ComfyUI checkpoint, not a LoRA delta"
+      },
+      "tensor_layout": {
+        "diffusion_model_tensors": 685,
+        "text_encoder_tensors": 311,
+        "vae_tensors": 194,
+        "block_parameters": 560,
+        "block_dtype": "bfloat16",
+        "block_parameter_bytes": 3875565568,
+        "source_schema": "native-model-diffusion-model"
+      },
+      "runtime": {
+        "source_block_fingerprint": "b462ef63ecdcbe8e4b981e55f3a66a432a66a5fc1fc2c7cb043da8df5dc44ad5",
+        "model_block_fingerprint": "b462ef63ecdcbe8e4b981e55f3a66a432a66a5fc1fc2c7cb043da8df5dc44ad5",
+        "fingerprints_match": true,
+        "cache_key": "9b9cad017254a1d54f27d533ae47fcf52e77149ef4fcd90db57b4e0db3bcfdf1",
+        "cache_packed_bytes": 3963645952
+      },
+      "chain_validation": {
+        "fixture": "Existing Turbo V1.1 real-preprocessing fixture",
+        "dispatches_qkv_chained": 532,
+        "dispatches_control": 644,
+        "qkv_block_outputs_bitwise_equal": true,
+        "worst_block": 13,
+        "worst_intermediate_normalized_rms_error": 0.10966841214797066,
+        "turbo_v1_1_intermediate_gate": 0.10,
+        "intermediate_gate_status": "exceeded",
+        "final_normalized_rms_error": 0.014392800966718229,
+        "final_gate": 0.02,
+        "final_gate_status": "passed"
+      },
+      "comfyui": {
+        "settings": {
+          "width": 512,
+          "height": 512,
+          "steps": 4,
+          "cfg": 1.0,
+          "sampler": "euler",
+          "scheduler": "simple"
+        },
+        "cold": {
+          "seed": 424242,
+          "prompt_seconds": 88.29,
+          "sampler_seconds": 65,
+          "sampler_seconds_per_iteration": 16.28,
+          "png_bytes": 415919,
+          "png_sha256": "16ca1eb926a63992b94de140a45a668c6e31a380576b464c6319f9135f1409a8"
+        },
+        "resident": {
+          "seed": 424243,
+          "prompt_seconds": 54.25,
+          "sampler_seconds": 46,
+          "sampler_seconds_per_iteration": 11.59,
+          "png_bytes": 417441,
+          "png_sha256": "75b17b7d67e4a623cc4abca582e8002442fab8a0c8d77b9f59016275d478932c"
+        },
+        "image_validation": "Both outputs decoded as 512x512 RGB PNG with one prompt metadata entry and were visually inspected for corruption.",
+        "timing_note": "Single cold/resident pair. The resident run changed the seed to force KSampler execution, so this is not a same-seed output-equivalence comparison."
+      }
     }
   },
   "image_conditions": {

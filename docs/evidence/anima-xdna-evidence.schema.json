@@ -82,6 +82,25 @@
         },
         "user_observed_xdna_resident_prompt_baseline": {
           "$ref": "#/$defs/userObservedResidentPromptBaseline"
+        },
+        "wai_nova_anima_turbo_lora_v1_0": {
+          "type": "object",
+          "required": [
+            "status",
+            "source_file",
+            "tensor_layout",
+            "runtime",
+            "chain_validation",
+            "comfyui"
+          ],
+          "properties": {
+            "status": {"const": "measured_real_checkpoint_and_comfyui"},
+            "source_file": {"type": "object"},
+            "tensor_layout": {"type": "object"},
+            "runtime": {"type": "object"},
+            "chain_validation": {"type": "object"},
+            "comfyui": {"type": "object"}
+          }
         }
       }
     },

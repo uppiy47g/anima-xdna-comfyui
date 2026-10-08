@@ -49,6 +49,9 @@ VALIDATED_VARIANT_FINGERPRINTS = {
     "066b4281037504b1b7200ecd65b4182fc765ed882ecd5ca650db7308246a8dee": (
         "Turbo V1.1"
     ),
+    "b462ef63ecdcbe8e4b981e55f3a66a432a66a5fc1fc2c7cb043da8df5dc44ad5": (
+        "WAI Nova Anima Turbo LoRA Ver V1.0"
+    ),
 }
 
 

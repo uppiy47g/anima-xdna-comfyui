@@ -576,16 +576,34 @@ def _file_identity_token(path: Path) -> str:
     return json.dumps(identity, sort_keys=True, separators=(",", ":"))
 
 
+_ANIMA_MODEL_CATEGORIES = ("diffusion_models", "checkpoints")
+
+
+def _anima_model_selector(value: str) -> tuple[str, str]:
+    category, separator, name = value.partition(":")
+    if not separator:
+        return "diffusion_models", value
+    if category not in _ANIMA_MODEL_CATEGORIES or not name:
+        raise ValueError(
+            "Anima model selector must be an unqualified diffusion model or "
+            "'diffusion_models:<name>' / 'checkpoints:<name>'"
+        )
+    return category, name
+
+
 class LoadAnimaBF16:
     @classmethod
     def INPUT_TYPES(cls):
         import folder_paths
 
+        models = [
+            f"{category}:{name}"
+            for category in _ANIMA_MODEL_CATEGORIES
+            for name in folder_paths.get_filename_list(category)
+        ]
         return {
             "required": {
-                "unet_name": (
-                    folder_paths.get_filename_list("diffusion_models"),
-                )
+                "unet_name": (models,)
             }
         }
 
@@ -597,16 +615,16 @@ class LoadAnimaBF16:
     def IS_CHANGED(cls, unet_name):
         import folder_paths
 
-        path = folder_paths.get_full_path_or_raise("diffusion_models", unet_name)
+        category, name = _anima_model_selector(unet_name)
+        path = folder_paths.get_full_path_or_raise(category, name)
         return _file_identity_token(Path(path))
 
     def load(self, unet_name):
         import comfy.sd
         import folder_paths
 
-        path = folder_paths.get_full_path_or_raise(
-            "diffusion_models", unet_name
-        )
+        category, name = _anima_model_selector(unet_name)
+        path = folder_paths.get_full_path_or_raise(category, name)
         model = comfy.sd.load_diffusion_model(
             path,
             model_options={"dtype": torch.bfloat16},

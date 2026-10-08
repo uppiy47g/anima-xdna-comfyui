@@ -208,6 +208,48 @@ class ComfyUIXDNAWrapperTests(unittest.TestCase):
                     LoadAnimaBF16.IS_CHANGED("model.safetensors"),
                 )
 
+    def test_bf16_loader_lists_diffusion_models_and_full_checkpoints(self):
+        folder_paths = types.ModuleType("folder_paths")
+        folder_paths.get_filename_list = mock.Mock(
+            side_effect=lambda category: {
+                "diffusion_models": ["anima.safetensors"],
+                "checkpoints": ["wai-nova.safetensors"],
+            }[category]
+        )
+        with mock.patch.dict("sys.modules", {"folder_paths": folder_paths}):
+            choices = LoadAnimaBF16.INPUT_TYPES()["required"]["unet_name"][0]
+        self.assertEqual(
+            choices,
+            [
+                "diffusion_models:anima.safetensors",
+                "checkpoints:wai-nova.safetensors",
+            ],
+        )
+
+    def test_bf16_loader_resolves_qualified_checkpoint_category(self):
+        checkpoint = Path("wai-nova.safetensors")
+        folder_paths = types.ModuleType("folder_paths")
+        folder_paths.get_full_path_or_raise = mock.Mock(
+            return_value=str(checkpoint)
+        )
+        with (
+            mock.patch.dict("sys.modules", {"folder_paths": folder_paths}),
+            mock.patch(
+                "comfyui_xdna_nodes.model_wrapper._file_identity_token",
+                return_value="identity",
+            ) as identity,
+        ):
+            self.assertEqual(
+                LoadAnimaBF16.IS_CHANGED(
+                    "checkpoints:wai-nova.safetensors"
+                ),
+                "identity",
+            )
+        folder_paths.get_full_path_or_raise.assert_called_once_with(
+            "checkpoints", "wai-nova.safetensors"
+        )
+        identity.assert_called_once_with(checkpoint)
+
     def test_identity_mismatch_closes_before_runtime_open(self):
         runtime = SharedRuntime(Path("fixture.safetensors"))
         chain = mock.Mock()
@@ -337,6 +379,38 @@ class ComfyUIXDNAWrapperTests(unittest.TestCase):
         self.assertIs(loaded, model)
         comfy_sd.load_diffusion_model.assert_called_once_with(
             "anima.safetensors",
+            model_options={"dtype": torch.bfloat16},
+        )
+
+    def test_bf16_loader_loads_qualified_full_checkpoint(self):
+        model = types.SimpleNamespace(
+            model=types.SimpleNamespace(
+                diffusion_model=FakeAnimaParameters(
+                    fake_anima_parameters(torch.bfloat16)
+                )
+            )
+        )
+        comfy_sd = types.ModuleType("comfy.sd")
+        comfy_sd.load_diffusion_model = mock.Mock(return_value=model)
+        comfy = types.ModuleType("comfy")
+        comfy.sd = comfy_sd
+        folder_paths = types.ModuleType("folder_paths")
+        folder_paths.get_full_path_or_raise = mock.Mock(
+            return_value="wai-nova.safetensors"
+        )
+        with mock.patch.dict(
+            "sys.modules",
+            {"comfy": comfy, "comfy.sd": comfy_sd, "folder_paths": folder_paths},
+        ):
+            (loaded,) = LoadAnimaBF16().load(
+                "checkpoints:wai-nova.safetensors"
+            )
+        self.assertIs(loaded, model)
+        folder_paths.get_full_path_or_raise.assert_called_once_with(
+            "checkpoints", "wai-nova.safetensors"
+        )
+        comfy_sd.load_diffusion_model.assert_called_once_with(
+            "wai-nova.safetensors",
             model_options={"dtype": torch.bfloat16},
         )
 
