@@ -1,9 +1,11 @@
-# Anima XDNA ComfyUI
+# Experimental ComfyUI Image Generation on AMD XDNA 2
 
-Native Anima Base v1.0 and Turbo V1.1 transformer acceleration on AMD XDNA 2,
-with ComfyUI custom nodes and standalone diagnostic CLIs. Original BF16
-safetensors are read-only; this project uses Triton-XDNA and XRT, **not ONNX
-or Vitis AI EP**. Runtime failures are explicit, with no silent CPU fallback.
+This project explores image generation in ComfyUI on AMD XDNA 2 NPUs through
+Triton-XDNA and XRT, without conversion pipelines such as ONNX or Vitis AI EP.
+Its long-term goal is to broaden native safetensors support so more models can
+be loaded directly. Current support is limited to Anima Base v1.0 and Turbo
+V1.1 using their original BF16 safetensors. Runtime failures are explicit,
+with no silent CPU fallback.
 
 This is an experimental **CPU-hybrid** implementation, not NPU-only image
 generation. XDNA executes Linear and attention QK/AV GEMMs. Qwen, patch/time
