@@ -1,0 +1,749 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/uppiy47g/anima-xdna-comfyui/docs/evidence/anima-xdna-evidence.schema.json",
+  "title": "Anima XDNA optimization evidence",
+  "type": "object",
+  "required": ["schema_version", "source_commits", "tested_system", "boundary", "measurements", "artifacts"],
+  "properties": {
+    "schema_version": {"const": 2},
+    "source_commits": {"type": "object"},
+    "tested_system": {"type": "object"},
+    "boundary": {"type": "object"},
+    "measurements": {
+      "type": "object",
+      "properties": {
+        "optimization_phase_profile": {
+          "type": "object",
+          "required": [
+            "status",
+            "profile_semantics",
+            "base_v1_0",
+            "turbo_v1_1",
+            "chain_28_projection",
+            "turbo_8_step_projection",
+            "comparison_with_historical_accounting",
+            "attention_scale_fusion_trial",
+            "turbo_end_to_end",
+            "qkv_chaining",
+            "synthetic_base_chain_followup"
+          ],
+          "properties": {
+            "status": {"const": "measured_profile_and_block_validation"},
+            "base_v1_0": {"$ref": "#/$defs/residentBlockProfile"},
+            "turbo_v1_1": {"$ref": "#/$defs/residentBlockProfile"},
+            "chain_28_projection": {"$ref": "#/$defs/transferProjection"},
+            "turbo_8_step_projection": {"$ref": "#/$defs/transferProjection"},
+            "qkv_chaining": {"$ref": "#/$defs/qkvChainingMeasurement"}
+          }
+        },
+        "cpu_model_memory": {
+          "type": "object",
+          "required": [
+            "status",
+            "methodology",
+            "source_checkpoint_bytes",
+            "stock_cpu_unet_dtype",
+            "bf16_loader_dtype",
+            "fp32_expected_block_parameter_bytes",
+            "bf16_measured_block_parameter_bytes",
+            "base_v1_0",
+            "turbo_v1_1",
+            "stock_fp32_memory_comparison",
+            "bf16_xrt_residency",
+            "bf16_turbo_v1_1_comfyui",
+            "xrt_bo_accounting",
+            "end_to_end_dtype_validation"
+          ],
+          "properties": {
+            "status": {"const": "measured_bf16_and_stock_fp32_loads"},
+            "methodology": {"type": "string", "minLength": 1},
+            "source_checkpoint_bytes": {"type": "integer", "minimum": 1},
+            "stock_cpu_unet_dtype": {"const": "float32"},
+            "bf16_loader_dtype": {"const": "bfloat16"},
+            "fp32_expected_block_parameter_bytes": {"type": "integer", "minimum": 1},
+            "bf16_measured_block_parameter_bytes": {"type": "integer", "minimum": 1},
+            "parameter_bytes_reduction_fraction": {"type": "number", "minimum": 0, "maximum": 1},
+            "base_v1_0": {"$ref": "#/$defs/cpuModelMemoryRun"},
+            "turbo_v1_1": {"$ref": "#/$defs/cpuModelMemoryRun"},
+            "stock_fp32_memory_comparison": {"$ref": "#/$defs/stockFp32MemoryComparison"},
+            "bf16_xrt_residency": {"$ref": "#/$defs/bf16XrtResidency"},
+            "bf16_turbo_v1_1_comfyui": {"$ref": "#/$defs/bf16TurboComfyWorkflow"},
+            "xrt_bo_accounting": {"type": "string", "minLength": 1},
+            "end_to_end_dtype_validation": {
+              "enum": [
+                "not_run",
+                "passed",
+                "passed_image_gate_with_latent_cpu_difference",
+                "failed"
+              ]
+            },
+            "dtype_quality_limit": {"type": "string", "minLength": 1}
+          }
+        },
+        "user_observed_xdna_resident_prompt_baseline": {
+          "$ref": "#/$defs/userObservedResidentPromptBaseline"
+        }
+      }
+    },
+    "artifacts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["path", "bytes", "sha256", "width", "height", "metadata_entries"],
+        "properties": {
+          "path": {"type": "string"},
+          "bytes": {"type": "integer", "minimum": 1},
+          "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "width": {"const": 512},
+          "height": {"const": 512},
+          "metadata_entries": {"const": 0}
+        }
+      }
+    }
+  },
+  "$defs": {
+    "residentBlockProfile": {
+      "type": "object",
+      "required": [
+        "steady_block_wall_ms",
+        "dispatches",
+        "resident_hits",
+        "allocations",
+        "h2d_bytes",
+        "d2h_bytes",
+        "max_abs_error",
+        "normalized_rms_error"
+      ],
+      "properties": {
+        "steady_block_wall_ms": {"type": "number", "minimum": 0},
+        "dispatches": {"const": 23},
+        "resident_hits": {"const": 23},
+        "allocations": {"const": 0},
+        "h2d_bytes": {"type": "integer", "minimum": 0},
+        "d2h_bytes": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Output bytes synchronized from the device BO for host visibility."
+        },
+        "max_abs_error": {"type": "number", "minimum": 0},
+        "normalized_rms_error": {"type": "number", "minimum": 0}
+      }
+    },
+    "transferProjection": {
+      "type": "object",
+      "required": ["status", "dispatches", "h2d_bytes", "d2h_bytes"],
+      "properties": {
+        "status": {
+          "enum": ["derived_from_steady_block_profile", "derived_not_run"]
+        },
+        "dispatches": {"type": "integer", "minimum": 1},
+        "h2d_bytes": {"type": "integer", "minimum": 0},
+        "d2h_bytes": {"type": "integer", "minimum": 0}
+      }
+    },
+    "qkvChainingMeasurement": {
+      "type": "object",
+      "required": [
+        "status",
+        "host_operations_moved",
+        "block_to_block_activation_residency",
+        "per_block",
+        "chain_28",
+        "eight_step_transfer_projection",
+        "base_v1_0_real_fixture",
+        "turbo_v1_1_real_fixture",
+        "turbo_v1_1_comfyui"
+      ],
+      "properties": {
+        "status": {"const": "measured"},
+        "host_operations_moved": {"const": false},
+        "block_to_block_activation_residency": {"const": false},
+        "per_block": {"$ref": "#/$defs/qkvTransferPair"},
+        "chain_28": {"$ref": "#/$defs/qkvChain28"},
+        "eight_step_transfer_projection": {"$ref": "#/$defs/qkvEightStepProjection"},
+        "base_v1_0_real_fixture": {"$ref": "#/$defs/qkvFixtureOutcome"},
+        "turbo_v1_1_real_fixture": {"$ref": "#/$defs/qkvFixtureOutcome"},
+        "turbo_v1_1_comfyui": {"$ref": "#/$defs/qkvComfyWorkflow"}
+      }
+    },
+    "qkvTransferPair": {
+      "type": "object",
+      "required": [
+        "dispatches_before",
+        "dispatches_after",
+        "h2d_bytes_before",
+        "h2d_bytes_after",
+        "d2h_visible_bytes_before",
+        "d2h_visible_bytes_after"
+      ],
+      "properties": {
+        "dispatches_before": {"type": "integer", "minimum": 1},
+        "dispatches_after": {"type": "integer", "minimum": 1},
+        "h2d_bytes_before": {"type": "integer", "minimum": 0},
+        "h2d_bytes_after": {"type": "integer", "minimum": 0},
+        "d2h_visible_bytes_before": {"type": "integer", "minimum": 0},
+        "d2h_visible_bytes_after": {"type": "integer", "minimum": 0}
+      }
+    },
+    "qkvChain28": {
+      "type": "object",
+      "required": [
+        "dispatches_before",
+        "dispatches_after",
+        "h2d_bytes_before",
+        "h2d_bytes_after",
+        "h2d_bytes_saved",
+        "d2h_visible_bytes_before",
+        "d2h_visible_bytes_after",
+        "reported_bo_allocation_events_before",
+        "reported_bo_allocation_events_after",
+        "base_v1_0",
+        "turbo_v1_1"
+      ],
+      "properties": {
+        "dispatches_before": {"type": "integer", "minimum": 1},
+        "dispatches_after": {"type": "integer", "minimum": 1},
+        "h2d_bytes_before": {"type": "integer", "minimum": 0},
+        "h2d_bytes_after": {"type": "integer", "minimum": 0},
+        "h2d_bytes_saved": {"type": "integer", "minimum": 0},
+        "d2h_visible_bytes_before": {"type": "integer", "minimum": 0},
+        "d2h_visible_bytes_after": {"type": "integer", "minimum": 0},
+        "reported_bo_allocation_events_before": {"type": "integer", "minimum": 0},
+        "reported_bo_allocation_events_after": {"type": "integer", "minimum": 0},
+        "base_v1_0": {"$ref": "#/$defs/chainWallMeasurement"},
+        "turbo_v1_1": {"$ref": "#/$defs/chainWallMeasurement"}
+      }
+    },
+    "chainWallMeasurement": {
+      "type": "object",
+      "required": ["separate_xdna_wall_seconds", "chained_xdna_wall_seconds", "timing_note"],
+      "properties": {
+        "separate_xdna_wall_seconds": {"type": "number", "minimum": 0},
+        "chained_xdna_wall_seconds": {"type": "number", "minimum": 0},
+        "timing_note": {"type": "string", "minLength": 1}
+      }
+    },
+    "qkvEightStepProjection": {
+      "type": "object",
+      "required": [
+        "status",
+        "dispatches_before",
+        "dispatches_after",
+        "h2d_bytes_before",
+        "h2d_bytes_after",
+        "d2h_visible_bytes_before",
+        "d2h_visible_bytes_after"
+      ],
+      "properties": {
+        "status": {"const": "derived_from_measured_28_block_chain"},
+        "dispatches_before": {"type": "integer", "minimum": 1},
+        "dispatches_after": {"type": "integer", "minimum": 1},
+        "h2d_bytes_before": {"type": "integer", "minimum": 0},
+        "h2d_bytes_after": {"type": "integer", "minimum": 0},
+        "d2h_visible_bytes_before": {"type": "integer", "minimum": 0},
+        "d2h_visible_bytes_after": {"type": "integer", "minimum": 0}
+      }
+    },
+    "qkvFixtureOutcome": {
+      "type": "object",
+      "required": [
+        "intermediate_gate",
+        "final_gate",
+        "worst_block",
+        "worst_cpu_oracle_nrms",
+        "final_cpu_oracle_nrms",
+        "gate_status",
+        "old_new_xdna_block_outputs_bitwise_equal"
+      ],
+      "properties": {
+        "intermediate_gate": {"type": "number", "exclusiveMinimum": 0},
+        "final_gate": {"type": "number", "exclusiveMinimum": 0},
+        "worst_block": {"type": "integer", "minimum": 0},
+        "worst_cpu_oracle_nrms": {"type": "number", "minimum": 0},
+        "final_cpu_oracle_nrms": {"type": "number", "minimum": 0},
+        "gate_status": {"enum": ["passed", "failed_in_both_paths"]},
+        "old_new_xdna_block_outputs_bitwise_equal": {"type": "boolean"}
+      }
+    },
+    "qkvComfyWorkflow": {
+      "type": "object",
+      "required": [
+        "status",
+        "settings",
+        "qkv_chaining_disabled_execution_seconds",
+        "qkv_chaining_enabled_execution_seconds",
+        "improvement_seconds",
+        "improvement_percent",
+        "image_pixel_equal",
+        "image_mae_8bit",
+        "image_artifacts_distributed",
+        "timing_note"
+      ],
+      "properties": {
+        "status": {"const": "measured_controlled_warm_pair"},
+        "settings": {"type": "object"},
+        "qkv_chaining_disabled_execution_seconds": {"type": "number", "minimum": 0},
+        "qkv_chaining_enabled_execution_seconds": {"type": "number", "minimum": 0},
+        "improvement_seconds": {"type": "number"},
+        "improvement_percent": {"type": "number"},
+        "image_pixel_equal": {"type": "boolean"},
+        "image_mae_8bit": {"type": "number", "minimum": 0},
+        "image_artifacts_distributed": {"type": "boolean"},
+        "timing_note": {"type": "string", "minLength": 1}
+      }
+    },
+    "cpuModelMemoryRun": {
+      "type": "object",
+      "required": [
+        "fingerprint",
+        "schema",
+        "load_seconds",
+        "block_parameter_count",
+        "block_parameter_bytes",
+        "block_unique_storage_bytes",
+        "nonblock_parameter_bytes",
+        "working_set_before",
+        "working_set_after_load",
+        "private_commit_before",
+        "private_commit_after_load",
+        "peak_working_set",
+        "peak_private_commit",
+        "page_fault_delta",
+        "modelpatcher_clone_shares_module",
+        "all_parameter_dtypes"
+      ],
+      "properties": {
+        "fingerprint": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "schema": {"const": "comfyui-anima-module"},
+        "load_seconds": {"type": "number", "minimum": 0},
+        "block_parameter_count": {"const": 560},
+        "block_parameter_bytes": {"type": "integer", "minimum": 1},
+        "block_unique_storage_bytes": {"type": "integer", "minimum": 1},
+        "nonblock_parameter_bytes": {"type": "integer", "minimum": 0},
+        "working_set_before": {"type": "integer", "minimum": 0},
+        "working_set_after_load": {"type": "integer", "minimum": 0},
+        "private_commit_before": {"type": "integer", "minimum": 0},
+        "private_commit_after_load": {"type": "integer", "minimum": 0},
+        "stock_fp32_private_commit_after_load": {"type": "integer", "minimum": 0},
+        "private_commit_reduction_bytes": {"type": "integer", "minimum": 0},
+        "peak_private_commit_reduction_bytes": {"type": "integer", "minimum": 0},
+        "peak_working_set": {"type": "integer", "minimum": 0},
+        "peak_private_commit": {"type": "integer", "minimum": 0},
+        "page_fault_delta": {"type": "integer", "minimum": 0},
+        "modelpatcher_clone_shares_module": {"const": true},
+        "all_parameter_dtypes": {
+          "type": "array",
+          "items": {"const": "torch.bfloat16"},
+          "minItems": 1,
+          "maxItems": 1
+        }
+      }
+    },
+      "stockFp32MemoryComparison": {
+        "type": "object",
+        "required": ["status", "methodology", "base_v1_0", "turbo_v1_1", "bf16_private_commit_reduction_fraction"],
+        "properties": {
+          "status": {"const": "measured_fresh_process_default_loader"},
+          "methodology": {"type": "string", "minLength": 1},
+          "base_v1_0": {"$ref": "#/$defs/stockFp32MemoryRun"},
+          "turbo_v1_1": {"$ref": "#/$defs/stockFp32MemoryRun"},
+          "bf16_private_commit_reduction_fraction": {"type": "number", "minimum": 0, "maximum": 1},
+          "interpretation": {"type": "string", "minLength": 1}
+        }
+      },
+      "stockFp32MemoryRun": {
+        "type": "object",
+        "required": [
+          "load_seconds",
+          "block_parameter_bytes",
+          "nonblock_parameter_bytes",
+          "working_set_before",
+          "working_set_after_load",
+          "private_commit_before",
+          "private_commit_after_load",
+          "peak_working_set",
+          "peak_private_commit",
+          "page_fault_delta",
+          "block_dtype_numel"
+        ],
+        "properties": {
+          "load_seconds": {"type": "number", "minimum": 0},
+          "block_parameter_bytes": {"type": "integer", "minimum": 1},
+          "nonblock_parameter_bytes": {"type": "integer", "minimum": 0},
+          "working_set_before": {"type": "integer", "minimum": 0},
+          "working_set_after_load": {"type": "integer", "minimum": 0},
+          "private_commit_before": {"type": "integer", "minimum": 0},
+          "private_commit_after_load": {"type": "integer", "minimum": 0},
+          "peak_working_set": {"type": "integer", "minimum": 0},
+          "peak_private_commit": {"type": "integer", "minimum": 0},
+          "page_fault_delta": {"type": "integer", "minimum": 0},
+          "block_dtype_numel": {"type": "object", "required": ["float32"], "properties": {"float32": {"type": "integer", "minimum": 1}}}
+        }
+      },
+      "bf16XrtResidency": {
+        "type": "object",
+        "required": ["status", "actual_comfyui_nodes_lifecycle_verified", "methodology", "base_v1_0", "turbo_v1_1", "cleanup_note"],
+        "properties": {
+          "status": {"const": "measured_sharedruntime_fixture_runs"},
+          "actual_comfyui_nodes_lifecycle_verified": {"const": true},
+          "methodology": {"type": "string", "minLength": 1},
+          "base_v1_0": {"$ref": "#/$defs/bf16XrtResidencyRun"},
+          "turbo_v1_1": {"$ref": "#/$defs/bf16XrtResidencyRun"},
+          "cleanup_note": {"type": "string", "minLength": 1}
+        }
+      },
+      "bf16XrtResidencyRun": {
+        "type": "object",
+        "required": [
+          "cache_verify_seconds",
+          "first_chain_seconds",
+          "resident_chain_seconds",
+          "dispatches_per_chain",
+          "first_h2d_bytes",
+          "resident_h2d_bytes",
+          "d2h_host_visible_bytes_per_chain",
+          "weight_population_bytes_first",
+          "weight_population_bytes_resident",
+          "resident_hits",
+          "private_commit_after_cache_verify",
+          "private_commit_after_first_chain",
+          "private_commit_after_resident_chain",
+          "peak_private_commit",
+          "peak_working_set",
+          "private_commit_after_close_gc",
+          "working_set_after_close_gc",
+          "model_fingerprint"
+        ],
+        "properties": {
+          "cache_verify_seconds": {"type": "number", "minimum": 0},
+          "first_chain_seconds": {"type": "number", "minimum": 0},
+          "resident_chain_seconds": {"type": "number", "minimum": 0},
+          "dispatches_per_chain": {"const": 532},
+          "first_h2d_bytes": {"type": "integer", "minimum": 0},
+          "resident_h2d_bytes": {"type": "integer", "minimum": 0},
+          "d2h_host_visible_bytes_per_chain": {"type": "integer", "minimum": 0},
+          "weight_population_bytes_first": {"type": "integer", "minimum": 0},
+          "weight_population_bytes_resident": {"type": "integer", "minimum": 0},
+          "resident_hits": {"const": 644},
+          "private_commit_after_cache_verify": {"type": "integer", "minimum": 0},
+          "private_commit_after_first_chain": {"type": "integer", "minimum": 0},
+          "private_commit_after_resident_chain": {"type": "integer", "minimum": 0},
+          "peak_private_commit": {"type": "integer", "minimum": 0},
+          "peak_working_set": {"type": "integer", "minimum": 0},
+          "private_commit_after_close_gc": {"type": "integer", "minimum": 0},
+          "working_set_after_close_gc": {"type": "integer", "minimum": 0},
+          "model_fingerprint": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+        }
+      },
+      "bf16TurboComfyWorkflow": {
+        "type": "object",
+        "required": [
+          "status",
+          "comfyui_commit",
+          "settings",
+          "bf16_xdna",
+          "stock_fp32_cpu_reference",
+          "latent_comparison_to_stock_fp32_cpu",
+          "image_comparison_to_stock_fp32_cpu",
+          "image_comparison_to_previous_validated_xdna",
+          "timing_note"
+        ],
+        "properties": {
+          "status": {"const": "measured_matching_workflow"},
+          "comfyui_commit": {"type": "string", "minLength": 1},
+          "settings": {"type": "object"},
+          "bf16_xdna": {
+            "type": "object",
+            "required": ["api_wall_seconds", "comfy_execution_seconds", "latent_shape", "latent_rms", "output_image_sha256"],
+            "properties": {
+              "api_wall_seconds": {"type": "number", "minimum": 0},
+              "comfy_execution_seconds": {"type": "number", "minimum": 0},
+              "latent_shape": {"type": "array", "items": {"type": "integer", "minimum": 1}, "minItems": 5, "maxItems": 5},
+              "latent_rms": {"type": "number", "minimum": 0},
+              "output_image_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+            }
+          },
+          "stock_fp32_cpu_reference": {
+            "type": "object",
+            "required": ["api_wall_seconds", "comfy_execution_seconds", "latent_rms", "reproduces_previous_reference_image_pixelwise"],
+            "properties": {
+              "api_wall_seconds": {"type": "number", "minimum": 0},
+              "comfy_execution_seconds": {"type": "number", "minimum": 0},
+              "latent_rms": {"type": "number", "minimum": 0},
+              "reproduces_previous_reference_image_pixelwise": {"type": "boolean"}
+            }
+          },
+          "latent_comparison_to_stock_fp32_cpu": {
+            "type": "object",
+            "required": ["normalized_rms_error", "max_abs_error", "mean_abs_error", "interpretation"],
+            "properties": {
+              "normalized_rms_error": {"type": "number", "minimum": 0},
+              "max_abs_error": {"type": "number", "minimum": 0},
+              "mean_abs_error": {"type": "number", "minimum": 0},
+              "interpretation": {"type": "string", "minLength": 1}
+            }
+          },
+          "image_comparison_to_stock_fp32_cpu": {
+            "type": "object",
+            "required": ["psnr_db", "ssim", "mae_8bit", "pixel_equal"],
+            "properties": {
+              "psnr_db": {"type": "number", "minimum": 0},
+              "ssim": {"type": "number", "minimum": 0, "maximum": 1},
+              "mae_8bit": {"type": "number", "minimum": 0},
+              "pixel_equal": {"type": "boolean"}
+            }
+          },
+          "image_comparison_to_previous_validated_xdna": {
+            "type": "object",
+            "required": ["pixel_equal", "mae_8bit"],
+            "properties": {
+              "pixel_equal": {"type": "boolean"},
+              "mae_8bit": {"type": "number", "minimum": 0}
+            }
+          },
+          "timing_note": {"type": "string", "minLength": 1},
+          "paired_runtime_reverification": {
+            "type": "object",
+            "required": [
+              "status",
+              "paired_prompt_api_wall_seconds",
+              "paired_prompt_comfy_execution_seconds",
+              "sampler_node_execution_seconds",
+              "runtime",
+              "latent_comparisons",
+              "image",
+              "process_memory",
+              "xrt_bo_accounting",
+              "timing_note"
+            ],
+            "properties": {
+              "status": {"const": "measured_sequential_sampler_pair"},
+              "paired_prompt_api_wall_seconds": {"type": "number", "minimum": 0},
+              "paired_prompt_comfy_execution_seconds": {"type": "number", "minimum": 0},
+              "sampler_node_execution_seconds": {
+                "type": "object",
+                "required": ["first_KSampler", "resident_KSamplerAdvanced"],
+                "properties": {
+                  "first_KSampler": {"type": "number", "minimum": 0},
+                  "resident_KSamplerAdvanced": {"type": "number", "minimum": 0}
+                }
+              },
+              "runtime": {
+                "type": "object",
+                "required": [
+                  "source_fingerprint",
+                  "model_fingerprint",
+                  "fingerprints_match",
+                  "block_parameter_dtype",
+                  "block_parameter_count",
+                  "block_parameter_bytes",
+                  "dispatches_per_chain",
+                  "last_chain_weight_population_bytes",
+                  "unload_closed",
+                  "reference_count_after_unload"
+                ],
+                "properties": {
+                  "source_fingerprint": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                  "model_fingerprint": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                  "fingerprints_match": {"const": true},
+                  "block_parameter_dtype": {"const": "bfloat16"},
+                  "block_parameter_count": {"const": 560},
+                  "block_parameter_bytes": {"type": "integer", "minimum": 1},
+                  "dispatches_per_chain": {"const": 532},
+                  "last_chain_weight_population_bytes": {"type": "integer", "minimum": 0},
+                  "unload_closed": {"const": true},
+                  "reference_count_after_unload": {"const": 0}
+                }
+              },
+              "latent_comparisons": {
+                "type": "object",
+                "required": ["resident_vs_first", "first_vs_previous_bf16_xdna"],
+                "properties": {
+                  "resident_vs_first": {"$ref": "#/$defs/bitwiseTensorComparison"},
+                  "first_vs_previous_bf16_xdna": {"$ref": "#/$defs/bitwiseTensorComparison"}
+                }
+              },
+              "image": {
+                "type": "object",
+                "required": [
+                  "first_vs_resident_pixel_equal",
+                  "first_vs_previous_qkv_path_pixel_equal",
+                  "png_sha256",
+                  "png_size_bytes",
+                  "dimensions",
+                  "mode",
+                  "metadata_entries"
+                ],
+                "properties": {
+                  "first_vs_resident_pixel_equal": {"const": true},
+                  "first_vs_previous_qkv_path_pixel_equal": {"const": true},
+                  "png_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                  "png_size_bytes": {"type": "integer", "minimum": 1},
+                  "dimensions": {"const": [512, 512]},
+                  "mode": {"const": "RGB"},
+                  "metadata_entries": {"type": "integer", "minimum": 0}
+                }
+              },
+              "process_memory": {
+                "type": "object",
+                "required": [
+                  "methodology",
+                  "sample_count",
+                  "before_workflow",
+                  "after_bf16_loader",
+                  "after_xdna_attach",
+                  "peak_sampled_during_pair",
+                  "after_unload_gc",
+                  "server_lifetime_peak_counters"
+                ],
+                "properties": {
+                  "methodology": {"type": "string", "minLength": 1},
+                  "sample_count": {"type": "integer", "minimum": 1},
+                  "before_workflow": {"$ref": "#/$defs/processMemorySample"},
+                  "after_bf16_loader": {"$ref": "#/$defs/processMemorySample"},
+                  "after_xdna_attach": {"$ref": "#/$defs/processMemorySample"},
+                  "peak_sampled_during_pair": {"$ref": "#/$defs/processMemorySample"},
+                  "after_unload_gc": {"$ref": "#/$defs/processMemorySample"},
+                  "server_lifetime_peak_counters": {
+                    "type": "object",
+                    "required": ["peak_private_commit_bytes", "peak_working_set_bytes", "scope_note"],
+                    "properties": {
+                      "peak_private_commit_bytes": {"type": "integer", "minimum": 0},
+                      "peak_working_set_bytes": {"type": "integer", "minimum": 0},
+                      "scope_note": {"type": "string", "minLength": 1}
+                    }
+                  }
+                }
+              },
+              "xrt_bo_accounting": {
+                "type": "object",
+                "required": ["last_resident_weight_population_bytes", "cache_packed_payload_bytes", "note"],
+                "properties": {
+                  "last_resident_weight_population_bytes": {"type": "integer", "minimum": 0},
+                  "cache_packed_payload_bytes": {"type": "integer", "minimum": 1},
+                  "note": {"type": "string", "minLength": 1}
+                }
+              },
+              "timing_note": {"type": "string", "minLength": 1}
+            }
+          }
+        }
+      },
+      "bitwiseTensorComparison": {
+          "type": "object",
+          "required": ["max_abs", "mean_abs", "nrms", "bitwise_equal"],
+          "properties": {
+            "max_abs": {"type": "number", "minimum": 0},
+            "mean_abs": {"type": "number", "minimum": 0},
+            "nrms": {"type": "number", "minimum": 0},
+            "bitwise_equal": {"const": true}
+          }
+        },
+        "processMemorySample": {
+          "type": "object",
+          "required": ["private_usage_bytes", "working_set_bytes"],
+          "properties": {
+            "private_usage_bytes": {"type": "integer", "minimum": 0},
+            "working_set_bytes": {"type": "integer", "minimum": 0}
+          }
+        },
+        "userObservedResidentPromptBaseline": {
+          "type": "object",
+          "required": [
+            "status",
+            "recorded_date",
+            "fix_commit",
+            "configuration",
+            "cold_prompt",
+            "unchanged_resident_prompts",
+            "prior_cpu_only_user_reported_total_seconds_range",
+            "console_observations",
+            "benchmark",
+            "caveat"
+          ],
+          "properties": {
+            "status": {"const": "user_observed_comfyui_console"},
+            "recorded_date": {"type": "string", "format": "date"},
+            "fix_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+            "configuration": {
+              "type": "object",
+              "required": ["model", "model_dtype", "execution", "width", "height", "steps"],
+              "properties": {
+                "model": {"const": "Anima Turbo V1.1"},
+                "model_dtype": {"const": "bfloat16"},
+                "execution": {"const": "XDNA attached"},
+                "width": {"const": 512},
+                "height": {"const": 512},
+                "steps": {"const": 4}
+              }
+            },
+            "cold_prompt": {
+              "type": "object",
+              "required": ["total_seconds", "sampler_progress_elapsed", "sampler_seconds_per_iteration"],
+              "properties": {
+                "total_seconds": {"type": "number", "minimum": 0},
+                "sampler_progress_elapsed": {"type": "string"},
+                "sampler_seconds_per_iteration": {"type": "number", "minimum": 0}
+              }
+            },
+            "unchanged_resident_prompts": {
+              "type": "object",
+              "required": [
+                "total_seconds",
+                "sampler_seconds_per_iteration",
+                "sampler_progress_elapsed",
+                "total_seconds_mean",
+                "total_seconds_min",
+                "total_seconds_max",
+                "sampler_seconds_per_iteration_mean",
+                "sampler_seconds_per_iteration_min",
+                "sampler_seconds_per_iteration_max"
+              ],
+              "properties": {
+                "total_seconds": {
+                  "type": "array",
+                  "items": {"type": "number", "minimum": 0},
+                  "minItems": 4,
+                  "maxItems": 4
+                },
+                "sampler_seconds_per_iteration": {
+                  "type": "array",
+                  "items": {"type": "number", "minimum": 0},
+                  "minItems": 4,
+                  "maxItems": 4
+                },
+                "sampler_progress_elapsed": {
+                  "type": "array",
+                  "items": {"type": "string"},
+                  "minItems": 4,
+                  "maxItems": 4
+                },
+                "total_seconds_mean": {"type": "number", "minimum": 0},
+                "total_seconds_min": {"type": "number", "minimum": 0},
+                "total_seconds_max": {"type": "number", "minimum": 0},
+                "sampler_seconds_per_iteration_mean": {"type": "number", "minimum": 0},
+                "sampler_seconds_per_iteration_min": {"type": "number", "minimum": 0},
+                "sampler_seconds_per_iteration_max": {"type": "number", "minimum": 0}
+              }
+            },
+            "prior_cpu_only_user_reported_total_seconds_range": {
+              "type": "array",
+              "items": {"type": "number", "minimum": 0},
+              "minItems": 2,
+              "maxItems": 2
+            },
+            "console_observations": {
+              "type": "object",
+              "required": ["complete_model_and_vae_load_lines", "resident_prompts"],
+              "properties": {
+                "complete_model_and_vae_load_lines": {"type": "string", "minLength": 1},
+                "resident_prompts": {"type": "string", "minLength": 1}
+              }
+            },
+            "benchmark": {"const": false},
+            "caveat": {"type": "string", "minLength": 1}
+          }
+        }
+  },
+  "additionalProperties": true
+}

@@ -1,0 +1,29 @@
+{
+  "1": {
+    "class_type": "LoadAnimaBF16",
+    "inputs": {
+      "unet_name": "<NATIVE_ANIMA_BASE_OR_TURBO_FILENAME>"
+    }
+  },
+  "2": {
+    "class_type": "LoadAttachAnimaXDNAModel",
+    "inputs": {
+      "model": [
+        "1",
+        0
+      ],
+      "checkpoint": "<MATCHING_BASE_OR_TURBO_SAFETENSORS>",
+      "rebuild_cache": false,
+      "cache_dir": ""
+    }
+  },
+  "3": {
+    "class_type": "AnimaXDNARuntimeStatus",
+    "inputs": {
+      "model": [
+        "2",
+        0
+      ]
+    }
+  }
+}

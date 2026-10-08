@@ -1,0 +1,41 @@
+# Models, captures, packed weights and local evidence
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.bin
+*.npz
+*.npy
+*.onnx
+*.elf
+*.dll
+*.pyd
+*.exe
+*.zip
+*.log
+evidence-local/
+workflow-local*.json
+extra_model_paths.yaml
+run-xdna.local.ps1
+.triton/
+.xrt/
+.anima-xdna-cache/
+.cache/
+
+# Python build and development artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv*/
+venv/
+build/
+dist/
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

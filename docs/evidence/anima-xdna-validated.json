@@ -1,0 +1,715 @@
+{
+  "$schema": "./anima-xdna-evidence.schema.json",
+  "schema_version": 2,
+  "recorded_date": "2026-10-06",
+  "source_commits": {
+    "linear": "a37158b",
+    "block": "1f4db24",
+    "resident_chain": "f5f7a4c",
+    "packed_cache": "ae427d7",
+    "comfyui_wrapper": "737338d76bf2a7dcf9806aaba5d6d936499b95ab",
+    "turbo_support": "commit containing this evidence record",
+    "qkv_chaining": "commit containing this evidence record",
+    "bf16_model_loader": "commit containing this evidence record",
+    "comfyui": "170594057a22673349ddf0a3d88624b7fa5865bb"
+  },
+  "tested_system": {
+    "hardware": "AMD Ryzen AI 9 365 / Strix XDNA 2",
+    "target": "npu2 / AIE2P",
+    "python": "3.13.9",
+    "torch": "2.14.1+cpu",
+    "triton_xdna": "3.6.0.2026093004+75679dc",
+    "xrt_sdk": "2.21.75",
+    "models": ["Anima Base v1.0", "Anima Turbo V1.1"],
+    "shape": {
+      "latent": [1, 16, 1, 64, 64],
+      "output_pixels": [512, 512],
+      "context": [1, 512, 1024]
+    }
+  },
+  "boundary": {
+    "npu": "All transformer-block Linear and QK/AV GEMMs",
+    "cpu": "Qwen, patch/time/RoPE preparation, norms, softmax, GELU, gates/residuals, final layer/unpatchify, sampler, and VAE",
+    "onnx": false,
+    "vitis_ai_ep": false,
+    "silent_fallback": false
+  },
+  "measurements": {
+    "single_block": {
+      "status": "measured",
+      "max_abs_error": 0.0009765625,
+      "mean_abs_error": 0.00002131443
+    },
+    "resident_block": {
+      "status": "measured",
+      "dispatches_before": 83,
+      "dispatches_after": 23,
+      "h2d_bytes_before": 612237312,
+      "h2d_bytes_after": 156631040,
+      "d2h_visible_output_bytes_before": 314048512,
+      "d2h_separate_staging_buffer_bytes_after": 0,
+      "d2h_visible_output_bytes_after": 314048512,
+      "representative_wall_ms": 252.4
+    },
+    "chain_28": {
+      "status": "measured",
+      "dispatches": 644,
+      "steady_seconds": [7.02, 7.03, 7.15],
+      "cpu_oracle_seconds": 23.19,
+      "final_normalized_rms_error": 0.007466678,
+      "worst_block": 13,
+      "worst_block_normalized_rms_error": 0.041646643
+    },
+    "packed_cache": {
+      "status": "measured",
+      "tensor_count": 644,
+      "logical_source_bytes": 3875565568,
+      "packed_bytes": 3963645952,
+      "padding_bytes": 88080384,
+      "cold_build_seconds_range": [19.834, 19.865],
+      "new_process_warm_seconds_range": [4.330, 4.546],
+      "cached_uncached_output": "bitwise equal"
+    },
+    "comfyui": {
+      "status": "measured",
+      "synthetic_complete_dit_normalized_rms": 0.01528,
+      "real_prompt_one_step_cfg_3_5_normalized_rms": 0.04067577049136162,
+      "real_prompt_two_step_cfg_1_0_normalized_rms": 0.018186910077929497,
+      "image_psnr_db": 36.3279,
+      "image_ssim": 0.845809,
+      "cold_wrapper_seconds": 26.730524,
+      "warm_wrapper_seconds": 7.729242,
+      "warm_chain_seconds": 7.566865,
+      "warm_weight_population_bytes": 0,
+      "warm_resident_hits": 644
+    },
+    "turbo_v1_1": {
+      "status": "measured",
+      "source_schema": "native-model-diffusion-model",
+      "source_block_fingerprint": "066b4281037504b1b7200ecd65b4182fc765ed882ecd5ca650db7308246a8dee",
+      "base_block_fingerprint": "083d6f88949dec38ec35579dfd16ae96f4d453074b4fdfb6c0ed965c9cd76757",
+      "cache_key": "932742447a74a7168f87fb63b59f8bd0d97bc998e627dcd01731513dabb1a94c",
+      "cache_cold_seconds": {
+        "fingerprint": 6.833,
+        "pack": 13.831,
+        "total": 21.271
+      },
+      "cache_warm_seconds": {
+        "source_validation": 0.030,
+        "payload_verification": 3.744,
+        "total": 3.853
+      },
+      "single_block": {
+        "dispatches": 23,
+        "max_abs_error": 0.0009765625,
+        "mean_abs_error": 0.0000213457
+      },
+      "chain_28": {
+        "cpu_oracle_seconds": 26.406,
+        "xdna_validation_seconds": 17.228,
+        "cold_resident_run_seconds": 18.2627362,
+        "warm_resident_run_seconds": 7.2120909,
+        "cold_weight_population_bytes": 3963617280,
+        "warm_weight_population_bytes": 0,
+        "warm_resident_hits": 644,
+        "warm_allocations": 0,
+        "dispatches": 644,
+        "worst_block": 13,
+        "worst_block_normalized_rms_error": 0.0845512,
+        "final_normalized_rms_error": 0.01003999,
+        "max_block_gate": 0.10,
+        "final_gate": 0.02,
+        "fixture": "Captured real Anima preprocessing tensors; not distributed",
+        "synthetic_seed_0_final_normalized_rms": 0.096141,
+        "synthetic_seed_0_status": "outside validated Turbo gate"
+      },
+      "comfyui": {
+        "one_step_reference_seconds": 32.026,
+        "one_step_xdna_seconds": 52.126,
+        "one_step_latent_normalized_rms": 0.026498155668377876,
+        "one_step_latent_max_abs": 0.15375906229019165,
+        "one_step_latent_mean_abs": 0.023316754028201103,
+        "first_eight_step_workflow_seconds": 139.75,
+        "second_eight_step_workflow_seconds": 136.47,
+        "image_psnr_db": 19.8550592547302,
+        "image_ssim": 0.824799478,
+        "image_mae_8bit": 10.884127298990885,
+        "settings_provenance": "Locally validated V1.1 setting; local V1.1 metadata had no official recommendation."
+      }
+    },
+    "optimization_phase_profile": {
+      "status": "measured_profile_and_block_validation",
+      "recorded_date": "2026-10-06",
+      "input": "Deterministic synthetic block-0 inputs; batch 1, 1024 image tokens, 512 context tokens",
+      "profile_semantics": {
+        "d2h_bytes": "Bytes in the XRT output BO synchronized for host visibility; no additional staging-buffer copy is implied.",
+        "npu_chain_timing": "NPUChain output synchronization is included in kernel_and_wait_ms because its API does not expose a separate D2H synchronization timer.",
+        "chain_totals": "28-block and eight-step totals below are arithmetic projections from the measured one-block profile, not independent end-to-end measurements."
+      },
+      "base_v1_0": {
+        "steady_block_wall_ms": 334.4716,
+        "cpu_oracle_block_ms": 1012.6753,
+        "host_stages_ms": 60.7095,
+        "npu_stages_ms": 269.62,
+        "kernel_and_wait_ms": 178.1319,
+        "host_copy_ms": 2.8742,
+        "cache_sync_ms": 3.4547,
+        "dispatches": 23,
+        "resident_hits": 23,
+        "allocations": 0,
+        "weight_population_bytes": 0,
+        "h2d_bytes": 156631040,
+        "d2h_bytes": 314048512,
+        "max_abs_error": 0.0009765625,
+        "normalized_rms_error": 0.002510003525971698
+      },
+      "turbo_v1_1": {
+        "steady_block_wall_ms": 342.3699,
+        "cpu_oracle_block_ms": 975.2405,
+        "host_stages_ms": 68.7125,
+        "npu_stages_ms": 268.66,
+        "kernel_and_wait_ms": 175.2777,
+        "host_copy_ms": 2.492,
+        "cache_sync_ms": 3.0048,
+        "dispatches": 23,
+        "resident_hits": 23,
+        "allocations": 0,
+        "weight_population_bytes": 0,
+        "h2d_bytes": 156631040,
+        "d2h_bytes": 314048512,
+        "max_abs_error": 0.0009765625,
+        "normalized_rms_error": 0.0025190570889108404
+      },
+      "chain_28_projection": {
+        "status": "derived_from_steady_block_profile",
+        "dispatches": 644,
+        "h2d_bytes": 4385669120,
+        "d2h_bytes": 8793358336
+      },
+      "turbo_8_step_projection": {
+        "status": "derived_not_run",
+        "dispatches": 5152,
+        "h2d_bytes": 35085352960,
+        "d2h_bytes": 70346866688
+      },
+      "comparison_with_historical_accounting": {
+        "scope": "profiling-only phase before Q/K/V chaining",
+        "dispatches_per_block_before": 23,
+        "dispatches_per_block_after": 23,
+        "h2d_bytes_per_block_before": 156631040,
+        "h2d_bytes_per_block_after": 156631040,
+        "d2h_bytes_per_block_previously_reported": 0,
+        "d2h_bytes_per_block_corrected": 314048512,
+        "performance_change_claimed": false
+      },
+      "attention_scale_fusion_trial": {
+        "status": "rejected_and_removed",
+        "blocker": "AIR compilation failed with iterator_interchange length 4 for a 2-loop operation when a scalar epilogue was added after the head matmul, both with and without an explicit BF16 cast.",
+        "host_stage_retained": "attention scaling",
+        "silent_fallback": false
+      },
+      "turbo_end_to_end": {
+        "previous_validated_seconds": 136.47,
+        "rerun_status": "measured_controlled_qkv_pair",
+        "qkv_chaining_disabled_seconds": 147.56,
+        "qkv_chaining_enabled_seconds": 139.18,
+        "improvement_seconds": 8.38,
+        "improvement_percent": 5.68,
+        "image_pixel_equal": true,
+        "image_mae_8bit": 0.0,
+        "comparison_scope": "same-server warm pair, identical settings and inputs"
+      },
+      "qkv_chaining": {
+        "status": "measured",
+        "recorded_date": "2026-10-06",
+        "implementation": "Self and cross Q/K/V BF16 Linear launches grouped in NPUChain; public shared.empty output buffers are session-owned and rebound with bound_buffers.",
+        "host_operations_moved": false,
+        "block_to_block_activation_residency": false,
+        "per_block": {
+          "dispatches_before": 23,
+          "dispatches_after": 19,
+          "h2d_bytes_before": 298188800,
+          "h2d_bytes_after": 288751616,
+          "d2h_visible_bytes_before": 314048512,
+          "d2h_visible_bytes_after": 314048512
+        },
+        "chain_28": {
+          "dispatches_before": 644,
+          "dispatches_after": 532,
+          "h2d_bytes_before": 8349286400,
+          "h2d_bytes_after": 8085045248,
+          "h2d_bytes_saved": 264241152,
+          "d2h_visible_bytes_before": 8793358336,
+          "d2h_visible_bytes_after": 8793358336,
+          "reported_bo_allocation_events_before": 542,
+          "reported_bo_allocation_events_after": 630,
+          "base_v1_0": {
+            "separate_xdna_wall_seconds": 18.3973206,
+            "chained_xdna_wall_seconds": 17.313392,
+            "timing_note": "single captured-fixture validation pair; not claimed as a stable chain-speed benchmark"
+          },
+          "turbo_v1_1": {
+            "separate_xdna_wall_seconds": 17.4180386,
+            "chained_xdna_wall_seconds": 17.8432669,
+            "timing_note": "single captured-fixture validation pair; not claimed as a stable chain-speed benchmark"
+          }
+        },
+        "eight_step_transfer_projection": {
+          "status": "derived_from_measured_28_block_chain",
+          "dispatches_before": 5152,
+          "dispatches_after": 4256,
+          "h2d_bytes_before": 66794291200,
+          "h2d_bytes_after": 64680361984,
+          "d2h_visible_bytes_before": 70346866688,
+          "d2h_visible_bytes_after": 70346866688
+        },
+        "base_v1_0_real_fixture": {
+          "fixture": "Local ComfyUI Qwen/preprocessing capture; not distributed",
+          "intermediate_gate": 0.05,
+          "final_gate": 0.02,
+          "worst_block": 14,
+          "worst_cpu_oracle_nrms": 0.07828005185861475,
+          "final_cpu_oracle_nrms": 0.008407096848914285,
+          "gate_status": "failed_in_both_paths",
+          "old_new_xdna_block_outputs_bitwise_equal": true
+        },
+        "turbo_v1_1_real_fixture": {
+          "fixture": "Local ComfyUI Qwen/preprocessing capture; not distributed",
+          "intermediate_gate": 0.10,
+          "final_gate": 0.02,
+          "worst_block": 12,
+          "worst_cpu_oracle_nrms": 0.0599235544590232,
+          "final_cpu_oracle_nrms": 0.011729881436628271,
+          "gate_status": "passed",
+          "old_new_xdna_block_outputs_bitwise_equal": true
+        },
+        "turbo_v1_1_comfyui": {
+          "status": "measured_controlled_warm_pair",
+          "settings": {
+            "prompt": "a cheerful anime girl under cherry blossoms, detailed illustration, soft daylight",
+            "negative_prompt": "worst quality, low quality, blurry, jpeg artifacts",
+            "seed": 424242,
+            "sampler": "Euler",
+            "scheduler": "simple",
+            "steps": 8,
+            "cfg": 1.0,
+            "width": 512,
+            "height": 512
+          },
+          "qkv_chaining_disabled_execution_seconds": 147.56,
+          "qkv_chaining_enabled_execution_seconds": 139.18,
+          "qkv_chaining_disabled_api_wall_seconds": 153.816,
+          "qkv_chaining_enabled_api_wall_seconds": 140.842,
+          "improvement_seconds": 8.38,
+          "improvement_percent": 5.68,
+          "image_pixel_equal": true,
+          "image_mae_8bit": 0.0,
+          "image_artifacts_distributed": false,
+          "timing_note": "same standalone ComfyUI server after warm-up; initial post-startup workflow excluded from the pair"
+        }
+      },
+      "synthetic_base_chain_followup": {
+        "status": "gate_failed_not_used_as_validation",
+        "seed": 0,
+        "max_block_gate": 0.05,
+        "worst_block": 26,
+        "worst_block_normalized_rms_error": 0.0576229,
+        "max_abs_error": 73.25,
+        "reason": "The synthetic input is not the captured model-preprocessing fixture used for the validated Base chain."
+      }
+    },
+    "cpu_model_memory": {
+      "status": "measured_bf16_and_stock_fp32_loads",
+      "methodology": "Fresh standalone ComfyUI Python process in CPU mode. BF16 loads used comfy.sd.load_diffusion_model with explicit torch.bfloat16 and CPU load/offload devices; stock FP32 loads used the same public API with default model options. Windows GetProcessMemoryInfo supplied working set, peak working set, PrivateUsage commit, peak private commit, and page-fault counts. Parameter bytes were counted from named Parameters with shared storage deduplicated. XRT BO residency was measured separately in an attached BF16 run and is not added to CPU Parameter bytes.",
+      "source_checkpoint_bytes": 4182137856,
+      "stock_cpu_unet_dtype": "float32",
+      "bf16_loader_dtype": "bfloat16",
+      "fp32_expected_block_parameter_bytes": 7751131136,
+      "bf16_measured_block_parameter_bytes": 3875565568,
+      "parameter_bytes_reduction_fraction": 0.5,
+      "base_v1_0": {
+        "fingerprint": "083d6f88949dec38ec35579dfd16ae96f4d453074b4fdfb6c0ed965c9cd76757",
+        "schema": "comfyui-anima-module",
+        "load_seconds": 3.1644384,
+        "block_parameter_count": 560,
+        "block_parameter_bytes": 3875565568,
+        "block_unique_storage_bytes": 3875565568,
+        "nonblock_parameter_bytes": 306572288,
+        "working_set_before": 424865792,
+        "working_set_after_load": 4621275136,
+        "private_commit_before": 1698131968,
+        "private_commit_after_load": 8193351680,
+        "peak_working_set": 8802463744,
+        "peak_private_commit": 12382543872,
+        "page_fault_delta": 2050673,
+        "modelpatcher_clone_shares_module": true,
+        "all_parameter_dtypes": ["torch.bfloat16"],
+        "stock_fp32_private_commit_after_load": 15317835776,
+        "private_commit_reduction_bytes": 7124484096,
+        "peak_private_commit_reduction_bytes": 7125577728
+      },
+      "turbo_v1_1": {
+        "fingerprint": "066b4281037504b1b7200ecd65b4182fc765ed882ecd5ca650db7308246a8dee",
+        "schema": "comfyui-anima-module",
+        "load_seconds": 1.7556369,
+        "block_parameter_count": 560,
+        "block_parameter_bytes": 3875565568,
+        "block_unique_storage_bytes": 3875565568,
+        "nonblock_parameter_bytes": 306572288,
+        "working_set_before": 423718912,
+        "working_set_after_load": 4620574720,
+        "private_commit_before": 1697230848,
+        "private_commit_after_load": 8192634880,
+        "peak_working_set": 8801669120,
+        "peak_private_commit": 12381786112,
+        "page_fault_delta": 2050784,
+        "modelpatcher_clone_shares_module": true,
+        "all_parameter_dtypes": ["torch.bfloat16"],
+        "stock_fp32_private_commit_after_load": 15318614016,
+        "private_commit_reduction_bytes": 7125979136,
+        "peak_private_commit_reduction_bytes": 7126806528
+      },
+      "stock_fp32_memory_comparison": {
+        "status": "measured_fresh_process_default_loader",
+        "methodology": "Separate fresh CPU-mode ComfyUI processes loaded the matching native checkpoints with comfy.sd.load_diffusion_model default model options. Both selected float32 for all 560 block Parameters. PrivateUsage and PeakPagefileUsage are process commit counters; working-set peaks include loader transients and are reported separately.",
+        "base_v1_0": {
+          "load_seconds": 6.1180424,
+          "block_parameter_bytes": 7751131136,
+          "nonblock_parameter_bytes": 613144576,
+          "working_set_before": 423104512,
+          "working_set_after_load": 3511373824,
+          "private_commit_before": 1696256000,
+          "private_commit_after_load": 15317835776,
+          "peak_working_set": 11338293248,
+          "peak_private_commit": 19508121600,
+          "page_fault_delta": 3076289,
+          "block_dtype_numel": {"float32": 1937782784}
+        },
+        "turbo_v1_1": {
+          "load_seconds": 4.2875534,
+          "block_parameter_bytes": 7751131136,
+          "nonblock_parameter_bytes": 613144576,
+          "working_set_before": 423387136,
+          "working_set_after_load": 8479027200,
+          "private_commit_before": 1697005568,
+          "private_commit_after_load": 15318614016,
+          "peak_working_set": 11492200448,
+          "peak_private_commit": 19508592640,
+          "page_fault_delta": 3075863,
+          "block_dtype_numel": {"float32": 1937782784}
+        },
+        "bf16_private_commit_reduction_fraction": 0.4651,
+        "interpretation": "BF16 reduced post-load process PrivateUsage by about 7.12 GB (46.5%) for both models. This is measured process commit, not a claim that XRT unified-memory BO bytes are additive or reduced by the same amount."
+      },
+      "bf16_xrt_residency": {
+        "status": "measured_sharedruntime_fixture_runs",
+        "actual_comfyui_nodes_lifecycle_verified": true,
+        "methodology": "Fresh CPU-mode ComfyUI process loaded the native checkpoint with explicit BF16, verified the matching packed cache and full canonical fingerprint through SharedRuntime.prepare, opened XRT, then ran the captured real-preprocessing 28-block input twice. Windows GetProcessMemoryInfo counters include process and driver/runtime effects; XRT BO population is reported separately and is not summed with CPU Parameters. These are chain-level, not sampler/image end-to-end, measurements.",
+        "base_v1_0": {
+          "cache_verify_seconds": 6.9471517,
+          "first_chain_seconds": 20.685037,
+          "resident_chain_seconds": 10.1780435,
+          "dispatches_per_chain": 532,
+          "first_h2d_bytes": 8085045248,
+          "resident_h2d_bytes": 4121427968,
+          "d2h_host_visible_bytes_per_chain": 8793358336,
+          "weight_population_bytes_first": 3963617280,
+          "weight_population_bytes_resident": 0,
+          "resident_hits": 644,
+          "private_commit_after_cache_verify": 8206528512,
+          "private_commit_after_first_chain": 15301083136,
+          "private_commit_after_resident_chain": 15695093760,
+          "peak_private_commit": 16573120512,
+          "peak_working_set": 10827235328,
+          "private_commit_after_close_gc": 9215639552,
+          "working_set_after_close_gc": 740048896,
+          "model_fingerprint": "083d6f88949dec38ec35579dfd16ae96f4d453074b4fdfb6c0ed965c9cd76757"
+        },
+        "turbo_v1_1": {
+          "cache_verify_seconds": 7.1412869,
+          "first_chain_seconds": 22.345897,
+          "resident_chain_seconds": 10.5380378,
+          "dispatches_per_chain": 532,
+          "first_h2d_bytes": 8085045248,
+          "resident_h2d_bytes": 4121427968,
+          "d2h_host_visible_bytes_per_chain": 8793358336,
+          "weight_population_bytes_first": 3963617280,
+          "weight_population_bytes_resident": 0,
+          "resident_hits": 644,
+          "private_commit_after_cache_verify": 8206225408,
+          "private_commit_after_first_chain": 15301062656,
+          "private_commit_after_resident_chain": 15560589312,
+          "peak_private_commit": 16571895808,
+          "peak_working_set": 11010252800,
+          "private_commit_after_close_gc": 8249397248,
+          "working_set_after_close_gc": 742072320,
+          "model_fingerprint": "066b4281037504b1b7200ecd65b4182fc765ed882ecd5ca650db7308246a8dee"
+        },
+        "cleanup_note": "SharedRuntime.close released the runtime and its XRT session; Python/runtime allocators did not return all process commit before process exit. The attachment still retains normal shared ModelPatcher Parameters; no destructive weight release was attempted."
+      },
+      "bf16_turbo_v1_1_comfyui": {
+        "status": "measured_matching_workflow",
+        "comfyui_commit": "170594057a22673349ddf0a3d88624b7fa5865bb",
+        "settings": {
+          "model": "native Anima Turbo V1.1",
+          "model_dtype": "bfloat16",
+          "xdna_source": "same native Turbo V1.1 checkpoint",
+          "text_encoder": "Qwen 3 0.6B",
+          "vae": "Qwen Image VAE",
+          "prompt": "a cheerful anime girl under cherry blossoms, detailed illustration, soft daylight",
+          "negative_prompt": "worst quality, low quality, blurry, jpeg artifacts",
+          "seed": 424242,
+          "sampler": "Euler",
+          "scheduler": "simple",
+          "steps": 8,
+          "cfg": 1.0,
+          "width": 512,
+          "height": 512,
+          "qkv_chaining": true
+        },
+        "bf16_xdna": {
+          "api_wall_seconds": 140.3162288,
+          "comfy_execution_seconds": 135.936,
+          "latent_shape": [1, 16, 1, 64, 64],
+          "latent_rms": 1.2368947268,
+          "output_image_sha256": "28b50de71e397429c597cb77773a10642957c44c9c2484cb0add0d2567b603f5"
+        },
+        "stock_fp32_cpu_reference": {
+          "api_wall_seconds": 115.3368555,
+          "comfy_execution_seconds": 113.005,
+          "latent_rms": 1.2388564348,
+          "reproduces_previous_reference_image_pixelwise": true
+        },
+        "latent_comparison_to_stock_fp32_cpu": {
+          "normalized_rms_error": 0.2554629743,
+          "max_abs_error": 3.8654255867,
+          "mean_abs_error": 0.1698338240,
+          "interpretation": "This compares the BF16+XDNA latent to the stock-FP32 CPU reference; a later controlled BF16+XDNA rerun matched the prior BF16+XDNA latent bitwise."
+        },
+        "image_comparison_to_stock_fp32_cpu": {
+          "psnr_db": 19.8550592547,
+          "ssim": 0.824799478,
+          "mae_8bit": 10.88412729899,
+          "pixel_equal": false
+        },
+        "image_comparison_to_previous_validated_xdna": {
+          "pixel_equal": true,
+          "mae_8bit": 0.0
+        },
+        "timing_note": "One BF16+XDNA run and one stock-FP32 CPU run on separate fresh standalone server launches. Timings are observations, not a controlled speed comparison or speedup claim.",
+        "paired_runtime_reverification": {
+          "status": "measured_sequential_sampler_pair",
+          "execution_topology": "Two sequential full samplers in one ComfyUI prompt and one attached runtime: an initial KSampler followed by KSamplerAdvanced using the same inputs and model.",
+          "paired_prompt_api_wall_seconds": 245.946,
+          "paired_prompt_comfy_execution_seconds": 244.598,
+          "sampler_node_execution_seconds": {
+            "first_KSampler": 120.737,
+            "resident_KSamplerAdvanced": 100.639
+          },
+          "runtime": {
+            "model_variant": "Turbo V1.1",
+            "source_fingerprint": "066b4281037504b1b7200ecd65b4182fc765ed882ecd5ca650db7308246a8dee",
+            "model_fingerprint": "066b4281037504b1b7200ecd65b4182fc765ed882ecd5ca650db7308246a8dee",
+            "fingerprints_match": true,
+            "block_parameter_dtype": "bfloat16",
+            "block_parameter_count": 560,
+            "block_parameter_bytes": 3875565568,
+            "block_parameters_released": false,
+            "calls": 16,
+            "chain_runs": 16,
+            "resident_reuses": 15,
+            "dispatches_per_chain": 532,
+            "last_chain_h2d_bytes": 4121427968,
+            "last_chain_host_visible_d2h_bytes": 8793358336,
+            "last_chain_weight_population_bytes": 0,
+            "last_chain_resident_hits": 644,
+            "last_error": null,
+            "unload_closed": true,
+            "reference_count_after_unload": 0
+          },
+          "latent_comparisons": {
+            "resident_vs_first": {
+              "max_abs": 0.0,
+              "mean_abs": 0.0,
+              "nrms": 0.0,
+              "bitwise_equal": true
+            },
+            "first_vs_previous_bf16_xdna": {
+              "max_abs": 0.0,
+              "mean_abs": 0.0,
+              "nrms": 0.0,
+              "bitwise_equal": true
+            }
+          },
+          "image": {
+            "first_vs_resident_pixel_equal": true,
+            "first_vs_previous_bf16_xdna_pixel_equal": true,
+            "first_vs_previous_qkv_path_pixel_equal": true,
+            "png_sha256": "1e962e2672e57964c6e5028ebee8a5d4fe87b4006800676ab3289259527b2204",
+            "png_size_bytes": 387989,
+            "dimensions": [512, 512],
+            "mode": "RGB",
+            "metadata_keys": ["prompt"],
+            "metadata_entries": 1
+          },
+          "process_memory": {
+            "methodology": "Windows GetProcessMemoryInfo PROCESS_MEMORY_COUNTERS_EX; current PrivateUsage and working set sampled approximately every 0.5 seconds across the paired prompt and unload/GC. XRT BO storage is separate and is not added to process commit. Peak counters are cumulative for the server process lifetime, which included earlier validation runs.",
+            "sample_count": 429,
+            "before_workflow": {
+              "private_usage_bytes": 2340446208,
+              "working_set_bytes": 444796928
+            },
+            "after_bf16_loader": {
+              "private_usage_bytes": 9422262272,
+              "working_set_bytes": 5145571328
+            },
+            "after_xdna_attach": {
+              "private_usage_bytes": 10627514368,
+              "working_set_bytes": 5152227328
+            },
+            "before_first_sampler": {
+              "private_usage_bytes": 10819514368,
+              "working_set_bytes": 6420963328
+            },
+            "after_first_sampler": {
+              "private_usage_bytes": 16855146496,
+              "working_set_bytes": 3520020480
+            },
+            "peak_sampled_during_pair": {
+              "private_usage_bytes": 17803005952,
+              "working_set_bytes": 10231619584
+            },
+            "after_explicit_xdna_unload": {
+              "private_usage_bytes": 11112161280,
+              "working_set_bytes": 765362176
+            },
+            "after_unload_gc": {
+              "private_usage_bytes": 2354520064,
+              "working_set_bytes": 448348160
+            },
+            "server_lifetime_peak_counters": {
+              "peak_private_commit_bytes": 19189141504,
+              "peak_working_set_bytes": 10489434112,
+              "scope_note": "Cumulative across earlier work in the same server process; the sampled paired-run peak is reported separately."
+            }
+          },
+          "xrt_bo_accounting": {
+            "last_resident_weight_population_bytes": 0,
+            "cache_packed_payload_bytes": 3963645952,
+            "note": "Packed-cache size is not an XRT BO measurement. Prior controlled cold-attach evidence records 3963617280 weight-BO bytes; no BO bytes are added to the process PrivateUsage totals."
+          },
+          "timing_note": "The two sampler durations are node timings inside a single paired prompt, not separate standalone workflow measurements or a controlled comparison against the stock FP32 loader. The overall prompt wall and ComfyUI execution durations include both samplers and the other workflow nodes."
+        }
+      },
+      "xrt_bo_accounting": "XRT BO weight_population_bytes and process commit counters are separate observations. Do not add BO bytes to CPU Parameter bytes because XRT allocations may be unified/shared with host memory.",
+      "end_to_end_dtype_validation": "passed_image_gate_with_latent_cpu_difference",
+      "dtype_quality_limit": "The BF16 Turbo 8-step decoded image is pixel-identical to the previous validated XDNA and QKV-path outputs; a later paired BF16+XDNA run also matched the previous BF16+XDNA latent bitwise. The BF16+XDNA latent differs from the stock-FP32 CPU latent by 25.55% normalized RMS. The paired sampler timings are not a comparison against the stock loader, so no speedup claim is made."
+    },
+    "user_observation_20_step": {
+      "status": "observational_non_controlled",
+      "total_seconds": 533.94,
+      "seconds_per_iteration": 25.59,
+      "benchmark": false,
+      "caveat": "Insufficient workflow and instrumentation metadata for a controlled benchmark."
+    },
+    "user_observed_xdna_resident_prompt_baseline": {
+      "status": "user_observed_comfyui_console",
+      "recorded_date": "2026-10-08",
+      "fix_commit": "62dbd6063b69c0e20d327e991bfca8337fa24334",
+      "configuration": {
+        "model": "Anima Turbo V1.1",
+        "model_dtype": "bfloat16",
+        "execution": "XDNA attached",
+        "width": 512,
+        "height": 512,
+        "steps": 4
+      },
+      "cold_prompt": {
+        "total_seconds": 105.34,
+        "sampler_progress_elapsed": "01:15",
+        "sampler_seconds_per_iteration": 18.90
+      },
+      "unchanged_resident_prompts": {
+        "total_seconds": [56.86, 56.56, 57.04, 56.77],
+        "sampler_seconds_per_iteration": [12.49, 12.53, 12.67, 12.60],
+        "sampler_progress_elapsed": ["00:49", "00:50", "00:50", "00:50"],
+        "total_seconds_mean": 56.8075,
+        "total_seconds_min": 56.56,
+        "total_seconds_max": 57.04,
+        "sampler_seconds_per_iteration_mean": 12.5725,
+        "sampler_seconds_per_iteration_min": 12.49,
+        "sampler_seconds_per_iteration_max": 12.67
+      },
+      "prior_cpu_only_user_reported_total_seconds_range": [66.09, 71.97],
+      "console_observations": {
+        "complete_model_and_vae_load_lines": "Observed on the cold prompt only.",
+        "resident_prompts": "No model/VAE complete-load or BO setup lines were observed between the four unchanged prompts; consistent with resident reuse, but not an independent runtime or BO trace."
+      },
+      "benchmark": false,
+      "caveat": "User-provided console screenshot observations, not independently rerun or instrumented by the project. The prior CPU-only range is a separately reported comparison, not a same-run controlled benchmark. Prompt, seed, sampler, scheduler, and CFG were not captured for this record."
+    }
+  },
+  "image_conditions": {
+    "status": "measured",
+    "prompt": "a cheerful anime girl under cherry blossoms, detailed illustration, soft daylight",
+    "negative_prompt": "worst quality, low quality, blurry, jpeg artifacts",
+    "seed": 424242,
+    "sampler": "Euler",
+    "steps": 2,
+    "cfg": 1.0,
+    "width": 512,
+    "height": 512,
+    "provenance": "Produced by the project's isolated reference and XDNA validation run; pixel data re-saved without PNG metadata."
+  },
+  "turbo_image_conditions": {
+    "status": "measured",
+    "prompt": "a cheerful anime girl under cherry blossoms, detailed illustration, soft daylight",
+    "negative_prompt": "worst quality, low quality, blurry, jpeg artifacts",
+    "seed": 424242,
+    "sampler": "Euler",
+    "scheduler": "simple",
+    "steps": 8,
+    "cfg": 1.0,
+    "width": 512,
+    "height": 512,
+    "provenance": "Produced by the isolated Turbo V1.1 reference and XDNA validation run; pixel data re-saved without PNG metadata."
+  },
+  "artifacts": [
+    {
+      "path": "docs/assets/comfyui-reference-2step.png",
+      "bytes": 352110,
+      "sha256": "3441322d3c6100984ca9d1b09aaaf32d1fda95d5ce61b7c6e1f842c835a57f76",
+      "width": 512,
+      "height": 512,
+      "mode": "RGB",
+      "metadata_entries": 0
+    },
+    {
+      "path": "docs/assets/comfyui-xdna-2step.png",
+      "bytes": 353879,
+      "sha256": "f108b7631be8986507dc58398b9fc75583ffc0d554bfc50f06e56d8e08a63788",
+      "width": 512,
+      "height": 512,
+      "mode": "RGB",
+      "metadata_entries": 0
+    },
+    {
+      "path": "docs/assets/anima-turbo-v11-reference-8step.png",
+      "bytes": 365452,
+      "sha256": "4a61fedcc53db82f7e4aaa169237afa902081ccc747c8f5ec01a6a34cc10ef0d",
+      "width": 512,
+      "height": 512,
+      "mode": "RGB",
+      "metadata_entries": 0
+    },
+    {
+      "path": "docs/assets/anima-turbo-v11-xdna-8step.png",
+      "bytes": 366938,
+      "sha256": "5059e446c588ebacdf061177eb637b2d50580d237526d7be32fdde3ce13fd77f",
+      "width": 512,
+      "height": 512,
+      "mode": "RGB",
+      "metadata_entries": 0
+    }
+  ]
+}

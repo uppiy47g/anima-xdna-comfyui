@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "anima-xdna-comfyui"
+version = "0.1.0"
+description = "Native Anima transformer acceleration on AMD XDNA 2 with ComfyUI nodes"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+  { name = "Anima XDNA contributors" },
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Operating System :: Microsoft :: Windows",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Topic :: Multimedia :: Graphics",
+]
+dependencies = [
+  "numpy>=1.24",
+  "safetensors>=0.4",
+  "torch>=2.0",
+  "ml_dtypes>=0.5",
+]
+
+[project.urls]
+Homepage = "https://github.com/uppiy47g/anima-xdna-comfyui"
+Repository = "https://github.com/uppiy47g/anima-xdna-comfyui"
+Issues = "https://github.com/uppiy47g/anima-xdna-comfyui/issues"
+
+[project.optional-dependencies]
+dev = [
+  "build>=1.2",
+  "jsonschema>=4.18",
+]
+
+[project.scripts]
+anima-xdna-probe = "anima_xdna_poc.cli:probe_main"
+anima-xdna-linear = "anima_xdna_poc.cli:linear_main"
+anima-xdna-block = "anima_xdna_poc.cli:block_main"
+anima-xdna-chain = "anima_xdna_poc.cli:chain_main"
+anima-xdna-cache = "anima_xdna_poc.cli:cache_main"
+
+[tool.setuptools]
+packages = ["comfyui_xdna_nodes", "anima_xdna_poc"]
+
+[tool.setuptools.package-data]
+"*" = ["README.md"]
