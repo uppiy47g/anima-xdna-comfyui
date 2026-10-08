@@ -634,20 +634,59 @@ def _effective_lora_provider(model):
                 )
             strength, adapter, strength_model, offset, function = patch
             if (
-                type(adapter) is not LoRAAdapter
-                or strength_model != 1.0
+                strength_model != 1.0
                 or offset is not None
                 or function is not None
             ):
                 raise RuntimeError(
-                    "Anima XDNA currently supports only ordinary additive "
-                    f"LoRAAdapter block patches; unsupported patch on {model_key!r}"
+                    "Anima XDNA supports only additive block patches without "
+                    f"model scaling, offsets, or functions; unsupported patch on "
+                    f"{model_key!r}"
                 )
             if not isinstance(strength, (int, float)) or not math.isfinite(
                 float(strength)
             ):
                 raise RuntimeError(
                     f"LoRA strength for {model_key!r} must be finite"
+                )
+            base = entries[0][0]
+            if type(adapter) is tuple:
+                is_norm = model_key.endswith(
+                    (
+                        ".self_attn.q_norm.weight",
+                        ".self_attn.k_norm.weight",
+                        ".cross_attn.q_norm.weight",
+                        ".cross_attn.k_norm.weight",
+                    )
+                )
+                if (
+                    not is_norm
+                    or len(adapter) != 2
+                    or adapter[0] != "diff"
+                    or type(adapter[1]) is not tuple
+                    or len(adapter[1]) != 1
+                    or not isinstance(adapter[1][0], torch.Tensor)
+                ):
+                    raise RuntimeError(
+                        "Anima XDNA supports legacy diff patches only for "
+                        f"attention q/k norm weights; unsupported patch on {model_key!r}"
+                    )
+                diff = adapter[1][0]
+                if (
+                    tuple(diff.shape) != tuple(base.shape)
+                    or not bool(torch.isfinite(diff.float()).all())
+                ):
+                    raise RuntimeError(
+                        "Anima XDNA requires finite, exact-shape attention "
+                        f"norm diff weights on {model_key!r}"
+                    )
+                patch_count += 1
+                continue
+            if type(adapter) is not LoRAAdapter:
+                raise RuntimeError(
+                    "Anima XDNA currently supports only ordinary additive "
+                    "LoRAAdapter patches and exact attention norm diff patches; "
+                    f"unsupported patch on {model_key!r}"
                 )
             weights = adapter.weights
             if not isinstance(weights, tuple) or len(weights) != 6:
@@ -678,7 +717,6 @@ def _effective_lora_provider(model):
                     "Anima XDNA supports finite 2-D ordinary LoRA weights "
                     f"without mid/DoRA/reshape on {model_key!r}"
                 )
-            base = entries[0][0]
             if up.numel() == 0 or down.numel() == 0 or (
                 up.shape[0] * down.shape[1] != base.numel()
             ):

@@ -138,6 +138,12 @@ normalizes it to BF16, and fingerprints every byte.
 The cache build recomputes the fingerprint and atomically rejects patch
 mutation. Cache hits verify the exact effective descriptor and packed payload.
 Unsupported adapter or runtime patch types are rejected before XRT opens.
+Hybrid Turbo LoRAs may additionally use ComfyUI's legacy
+`("diff", (tensor,))` patch representation for the self/cross-attention Q/K
+norm weights. Only those four canonical norm weights per block are accepted;
+the tensor must have the exact base shape and finite values, and offsets,
+custom functions, padding, `set`, `model_as_lora`, and other block diffs remain
+rejected. Block-external patches continue through ComfyUI's normal CPU path.
 
 The stock `UNETLoader` control does not offer BF16. On the validated
 CPU-only ComfyUI setup, its default Anima dtype policy selects FP32 (the

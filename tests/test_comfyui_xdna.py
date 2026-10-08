@@ -130,14 +130,17 @@ class ComfyUIXDNAWrapperTests(unittest.TestCase):
 
         def calculate_weight(patches, weight, key):
             for strength, adapter, strength_model, offset, function in patches:
-                weight = adapter.calculate_weight(
-                    weight,
-                    key,
-                    strength,
-                    strength_model,
-                    offset,
-                    function,
-                )
+                if isinstance(adapter, tuple) and adapter[0] == "diff":
+                    weight = weight + strength * adapter[1][0].to(weight.dtype)
+                else:
+                    weight = adapter.calculate_weight(
+                        weight,
+                        key,
+                        strength,
+                        strength_model,
+                        offset,
+                        function,
+                    )
             return weight
 
         comfy_lora.calculate_weight = calculate_weight
@@ -526,6 +529,56 @@ class ComfyUIXDNAWrapperTests(unittest.TestCase):
         }
         with self.assertRaisesRegex(RuntimeError, "transformer patches"):
             _validate_patcher(patcher)
+
+    def test_supports_turbo_lora_attention_norm_diff(self):
+        patcher = FakePatcher()
+        parameters = fake_anima_parameters(torch.bfloat16)
+        parameters["blocks.0.self_attn.q_norm.weight"] = torch.nn.Parameter(
+            torch.ones(2, dtype=torch.bfloat16)
+        )
+        patcher.model.diffusion_model = FakeAnimaParameters(parameters)
+        key = "diffusion_model.blocks.0.self_attn.q_norm.weight"
+        patcher.patches[key] = [
+            (
+                0.5,
+                ("diff", (torch.tensor([0.5, -0.25]),)),
+                1.0,
+                None,
+                None,
+            )
+        ]
+
+        provider, patch_count, _, _ = _effective_lora_provider(patcher)
+        effective = provider("transformer_blocks.0.attn1.norm_q.weight")
+
+        self.assertEqual(patch_count, 1)
+        torch.testing.assert_close(
+            effective.float(),
+            torch.tensor([1.25, 0.875]),
+        )
+        torch.testing.assert_close(
+            parameters["blocks.0.self_attn.q_norm.weight"].float(),
+            torch.ones(2),
+        )
+
+    def test_rejects_unsafe_turbo_lora_diff_patches(self):
+        patcher = FakePatcher()
+        parameters = fake_anima_parameters(torch.bfloat16)
+        patcher.model.diffusion_model = FakeAnimaParameters(parameters)
+        projection = "diffusion_model.blocks.0.self_attn.q_proj.weight"
+        patcher.patches[projection] = [
+            (1.0, ("diff", (torch.zeros(1),)), 1.0, None, None)
+        ]
+        with self.assertRaisesRegex(RuntimeError, "only for attention q/k norm"):
+            _effective_lora_provider(patcher)
+
+        patcher.patches.clear()
+        norm = "diffusion_model.blocks.0.self_attn.q_norm.weight"
+        patcher.patches[norm] = [
+            (1.0, ("diff", (torch.tensor([float("nan")]),)), 1.0, None, None)
+        ]
+        with self.assertRaisesRegex(RuntimeError, "finite, exact-shape"):
+            _effective_lora_provider(patcher)
 
     def test_status_reports_not_attached(self):
         model, status = AnimaXDNARuntimeStatus().status(FakePatcher())

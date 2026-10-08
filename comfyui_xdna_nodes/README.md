@@ -119,11 +119,14 @@ The attach status reports block Parameter logical/unique-storage bytes and
 dtype counts after source identity matches. It warns when CPU block Parameters
 are FP32. XRT BO population is reported separately. ModelPatcher clones share
 the underlying module, so attach never deletes or replaces block Parameters.
-For ordinary additive `LoRAAdapter` patches, it uses ComfyUI's supported
-weight calculation path on CPU copies, validates all 560 effective BF16
-tensors, and builds or reuses a cache keyed by their exact values. LoHa, LoKr,
-OFT, DoRA, reshape/mid-weight LoRA, block bias patches, and runtime transformer
-patches stop before NPU dispatch rather than being silently ignored.
+For ordinary additive `LoRAAdapter` patches, and exact additive legacy `diff`
+patches limited to self/cross-attention Q/K norm weights, it uses ComfyUI's
+supported weight calculation path on CPU copies, validates all 560 effective
+BF16 tensors, and builds or reuses a cache keyed by their exact values. This
+covers hybrid Turbo LoRAs that combine matrix LoRA weights with norm deltas.
+LoHa, LoKr, OFT, DoRA, reshape/mid-weight LoRA, other block diff/bias patches,
+and runtime transformer patches stop before NPU dispatch rather than being
+silently ignored.
 Fresh-process measurements on the validated host found stock FP32 loading
 used about 7.12 GB more process PrivateUsage than BF16 loading for either
 checkpoint (46.5%); see the evidence for working-set and peak counters. A
