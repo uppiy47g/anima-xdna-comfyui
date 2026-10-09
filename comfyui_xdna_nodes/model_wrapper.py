@@ -1270,6 +1270,25 @@ class LoadAttachAnimaXDNAModel:
         runtime.diagnostics.attach_total_ms = (
             time.perf_counter() - attach_started
         ) * 1000
+        cache = runtime.diagnostics.cache or {}
+        cache_timings = cache.get("timings") or {}
+        print(
+            "[Anima XDNA] initial-load timings ms: "
+            f"source_model={runtime.diagnostics.source_loader_model_ms:.1f}, "
+            f"source_total={runtime.diagnostics.source_loader_total_ms:.1f}, "
+            f"attach_load={runtime.diagnostics.attach_model_load_ms:.1f}, "
+            f"snapshot={runtime.diagnostics.lora_snapshot_total_ms:.1f} "
+            f"(clone={runtime.diagnostics.lora_snapshot_clone_ms:.1f}, "
+            f"hash={runtime.diagnostics.lora_snapshot_hash_ms:.1f}, "
+            f"base_identity={runtime.diagnostics.lora_base_identity_ms:.1f}), "
+            f"cache={float(cache_timings.get('total_ms', 0.0)):.1f} "
+            f"(fingerprint={float(cache_timings.get('fingerprint_ms', 0.0)):.1f}, "
+            f"pack={float(cache_timings.get('pack_ms', 0.0)):.1f}, "
+            f"verify={float(cache_timings.get('verify_ms', 0.0)):.1f}), "
+            f"cold_setup={runtime.diagnostics.cold_setup_ms:.1f}, "
+            f"attach_total={runtime.diagnostics.attach_total_ms:.1f}, "
+            f"cache_hit={cache.get('hit')}, reason={cache.get('reason')}"
+        )
         attachment = RuntimeAttachment(runtime)
         patched.set_attachments(ATTACHMENT_KEY, attachment)
         try:

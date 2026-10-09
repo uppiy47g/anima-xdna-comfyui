@@ -346,6 +346,73 @@ class PackedWeightCacheTests(unittest.TestCase):
                 "snapshot-identity",
             )
 
+    def test_snapshot_hit_avoids_provisional_build_with_multiple_candidates(self):
+        config = _tiny_block_config()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkpoint = root / "base.safetensors"
+            base = _block_tensors(config)
+            save_file(
+                {
+                    f"transformer_blocks.0.{name}": tensor
+                    for name, tensor in base.items()
+                },
+                checkpoint,
+            )
+
+            def provider(delta, calls):
+                def get(key):
+                    calls[0] += 1
+                    return (
+                        base[key.removeprefix("transformer_blocks.0.")]
+                        + delta
+                    ).to(torch.bfloat16)
+
+                get.input_fingerprint = "shared-snapshot-identity"
+                return get
+
+            first_calls = [0]
+            first = PackedWeightCache(
+                checkpoint,
+                config,
+                0,
+                1,
+                root / "cache",
+                effective_tensor_provider=provider(1.0, first_calls),
+            )
+            first_status = first.open()
+            first.close()
+            second_calls = [0]
+            second = PackedWeightCache(
+                checkpoint,
+                config,
+                0,
+                1,
+                root / "cache",
+                effective_tensor_provider=provider(2.0, second_calls),
+            )
+            second_status = second.open()
+            second.close()
+            hit_calls = [0]
+            hit = PackedWeightCache(
+                checkpoint,
+                config,
+                0,
+                1,
+                root / "cache",
+                effective_tensor_provider=provider(1.0, hit_calls),
+            )
+            hit_status = hit.open()
+            hit.close()
+
+            self.assertFalse(first_status.hit)
+            self.assertFalse(second_status.hit)
+            self.assertNotEqual(first_status.key, second_status.key)
+            self.assertTrue(hit_status.hit)
+            self.assertEqual(hit_status.key, first_status.key)
+            self.assertEqual(hit_calls[0], len(base))
+            self.assertFalse(any((root / "cache").glob(".build-*")))
+
     def test_snapshot_provider_failure_removes_provisional_build(self):
         config = _tiny_block_config()
         with tempfile.TemporaryDirectory() as directory:

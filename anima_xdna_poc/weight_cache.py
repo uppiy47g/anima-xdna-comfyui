@@ -928,6 +928,11 @@ class PackedWeightCache:
                     key,
                     descriptor,
                 )
+        self._record_effective_input_fingerprint(
+            entry,
+            manifest,
+            effective_input_fingerprint,
+        )
         self.manifest = manifest
         self.status = self._status(
             manifest,
@@ -989,7 +994,7 @@ class PackedWeightCache:
                     candidates.append(manifest_path.parent)
             except (KeyError, OSError, ValueError, TypeError):
                 continue
-        return candidates[0] if len(candidates) == 1 else None
+        return candidates[0] if candidates else None
 
     @staticmethod
     def _record_effective_input_fingerprint(
