@@ -178,7 +178,11 @@ Base oracle limitation, not a passing Base chain gate.
 
 The first call additionally verifies the 3.96 GB packed cache and populates
 process-local XRT BOs, so cold and warm timings must not be compared as the
-same phase.
+same phase. Within one ComfyUI process, an unchanged payload that has already
+passed full SHA-256 verification reuses an identity-bound verification lease;
+model switching therefore skips the repeated 3.96 GB hash when returning to a
+previously verified cache. XRT BO population remains runtime-local and is not
+covered by this lease.
 
 Measured BF16 loader details, Windows process-memory methodology, the
 stock-FP32/BF16 memory pair, and the end-to-end image/latent comparison are

@@ -776,6 +776,185 @@ class PackedWeightCacheTests(unittest.TestCase):
             self.assertFalse(removed.exists())
             self.assertTrue(root.exists())
 
+    def test_process_local_verification_lease_reuses_a_after_b(self):
+        config = _tiny_block_config()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first_checkpoint = root / "a.safetensors"
+            second_checkpoint = root / "b.safetensors"
+            _save_blocks(first_checkpoint, config, fill=1.0)
+            _save_blocks(second_checkpoint, config, fill=2.0)
+            cache_root = root / "cache"
+
+            first = PackedWeightCache(
+                first_checkpoint, config, 0, 1, cache_root
+            )
+            first_status = first.open()
+            first.close()
+            second = PackedWeightCache(
+                second_checkpoint, config, 0, 1, cache_root
+            )
+            second.open()
+            second.close()
+            reopened = PackedWeightCache(
+                first_checkpoint, config, 0, 1, cache_root
+            )
+            reopened_status = reopened.open()
+            reopened.close()
+
+            self.assertFalse(first_status.hit)
+            self.assertTrue(reopened_status.hit)
+            self.assertTrue(
+                reopened_status.timings.verification_lease_hit
+            )
+            self.assertEqual(
+                reopened_status.timings.verification_lease_saved_bytes,
+                reopened_status.packed_bytes,
+            )
+
+    def test_active_verification_leases_share_mapping_and_release_for_rebuild(self):
+        config = _tiny_block_config()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkpoint = root / "model.safetensors"
+            _save_blocks(checkpoint, config)
+            cache_root = root / "cache"
+            first = PackedWeightCache(
+                checkpoint, config, 0, 1, cache_root
+            )
+            first.open()
+            second = PackedWeightCache(
+                checkpoint, config, 0, 1, cache_root
+            )
+            second_status = second.open()
+
+            self.assertTrue(second_status.timings.verification_lease_hit)
+            self.assertIs(first._mapped, second._mapped)
+            first.close()
+            self.assertGreater(
+                second.tensor("0:attn1.to_q.weight:k0").numel(),
+                0,
+            )
+            with self.assertRaisesRegex(
+                CacheIntegrityError,
+                "while it is leased",
+            ):
+                PackedWeightCache(
+                    checkpoint, config, 0, 1, cache_root
+                ).ensure(rebuild=True)
+            second.close()
+
+            rebuilt = PackedWeightCache(
+                checkpoint, config, 0, 1, cache_root
+            )
+            rebuilt_status = rebuilt.open(rebuild=True)
+            rebuilt.close()
+            self.assertFalse(rebuilt_status.hit)
+
+    def test_manifest_change_invalidates_process_local_verification(self):
+        config = _tiny_block_config()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkpoint = root / "model.safetensors"
+            _save_blocks(checkpoint, config)
+            cache_root = root / "cache"
+            first = PackedWeightCache(
+                checkpoint, config, 0, 1, cache_root
+            )
+            first_status = first.open()
+            first.close()
+            manifest_path = first_status.path / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["verification_test_marker"] = True
+            manifest_path.write_text(
+                json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+
+            reopened = PackedWeightCache(
+                checkpoint, config, 0, 1, cache_root
+            )
+            reopened_status = reopened.open()
+            reopened.close()
+            self.assertTrue(reopened_status.hit)
+            self.assertFalse(
+                reopened_status.timings.verification_lease_hit
+            )
+            self.assertEqual(
+                reopened_status.timings.verification_lease_saved_bytes,
+                0,
+            )
+
+    def test_payload_change_invalidates_process_local_verification(self):
+        config = _tiny_block_config()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkpoint = root / "model.safetensors"
+            _save_blocks(checkpoint, config)
+            cache_root = root / "cache"
+            first = PackedWeightCache(
+                checkpoint, config, 0, 1, cache_root
+            )
+            first_status = first.open()
+            first.close()
+            payload = first_status.path / "weights.bin"
+            with payload.open("r+b") as handle:
+                original = handle.read(1)
+                handle.seek(0)
+                handle.write(bytes([original[0] ^ 0xFF]))
+                handle.flush()
+                os.fsync(handle.fileno())
+
+            reopened = PackedWeightCache(
+                checkpoint, config, 0, 1, cache_root
+            )
+            with self.assertRaisesRegex(
+                CacheIntegrityError,
+                "SHA-256 mismatch",
+            ):
+                reopened.open()
+
+    def test_concurrent_verification_leases_share_one_mapping(self):
+        config = _tiny_block_config()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkpoint = root / "model.safetensors"
+            _save_blocks(checkpoint, config)
+            cache_root = root / "cache"
+            initial = PackedWeightCache(
+                checkpoint, config, 0, 1, cache_root
+            )
+            initial.open()
+            initial.close()
+            caches = []
+            errors = []
+            barrier = threading.Barrier(3, timeout=5)
+
+            def open_cache():
+                try:
+                    cache = PackedWeightCache(
+                        checkpoint, config, 0, 1, cache_root
+                    )
+                    cache.open()
+                    caches.append(cache)
+                    barrier.wait()
+                    barrier.wait()
+                    cache.close()
+                except Exception as error:
+                    errors.append(error)
+
+            threads = [threading.Thread(target=open_cache) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            barrier.wait()
+            self.assertEqual(errors, [])
+            self.assertEqual(len(caches), 2)
+            self.assertIs(caches[0]._mapped, caches[1]._mapped)
+            barrier.wait()
+            for thread in threads:
+                thread.join()
+            self.assertEqual(errors, [])
+
     def test_corrupt_payload_and_manifest_are_rejected(self):
         config = _tiny_block_config()
         with tempfile.TemporaryDirectory() as directory:
