@@ -1132,6 +1132,40 @@ class PackedWeightCacheTests(unittest.TestCase):
 
 
 class XDNAPocUnitTests(unittest.TestCase):
+    def test_activation_buffer_pool_reuses_only_released_buffers(self):
+        from anima_xdna_poc.xdna import _ActivationBufferPool
+
+        class Buffer:
+            def __init__(self, key):
+                self.key = key
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        created = []
+
+        def factory(key):
+            buffer = Buffer(key)
+            created.append(buffer)
+            return buffer
+
+        pool = _ActivationBufferPool(factory)
+        key = (((256, 512, 256), (256, 768, 512)), (256, 512), torch.bfloat16)
+        with pool.borrow(key) as (first, first_created):
+            with pool.borrow(key) as (second, second_created):
+                self.assertIsNot(first, second)
+                self.assertTrue(first_created)
+                self.assertTrue(second_created)
+        with pool.borrow(key) as (reused, reused_created):
+            self.assertIs(reused, first)
+            self.assertFalse(reused_created)
+        self.assertEqual(pool.allocations, 2)
+        self.assertEqual(pool.hits, 1)
+        pool.close()
+        self.assertTrue(all(buffer.closed for buffer in created))
+        self.assertEqual(pool._buffers, {})
+
     def test_resident_profile_counts_synced_output_bytes(self):
         import numpy as np
         from types import SimpleNamespace
@@ -1275,6 +1309,111 @@ class XDNAPocUnitTests(unittest.TestCase):
 
 
 class AnimaBlockUnitTests(unittest.TestCase):
+    def test_adaln_linear_pair_matches_host_path_and_reports_saved_transfers(self):
+        from anima_xdna_poc.block import _BlockExecution
+
+        config = _tiny_block_config()
+        tensors = _block_tensors(config)
+        generator = torch.Generator().manual_seed(72)
+        for name in ("norm1.linear_1.weight", "norm1.linear_2.weight"):
+            tensors[name] = torch.randn(
+                tensors[name].shape, generator=generator, dtype=torch.bfloat16
+            )
+        weights = AnimaBlockWeights("transformer_blocks.0.", tensors)
+        inputs = deterministic_block_inputs(config, 4, 3, seed=73)
+
+        def linear_runner(_, value, weight, __):
+            shape = value.shape
+            result = cpu_linear(
+                prepare_linear(value.reshape(-1, shape[-1]), weight)
+            )
+            return result.reshape(*shape[:-1], weight.shape[0])
+
+        def pair_runner(_, value, __, pair_weights):
+            intermediate = linear_runner("", value, pair_weights[0], None)
+            output = linear_runner("", intermediate, pair_weights[1], None)
+            intermediate_bytes = intermediate.numel() * intermediate.element_size()
+            return {
+                "output": output,
+                "dispatches": 1,
+                "h2d_bytes": value.numel() * value.element_size(),
+                "d2h_bytes": output.numel() * output.element_size(),
+                "allocation_count": 1,
+                "resident_hits": 2,
+                "weight_population_bytes": 0,
+                "activation_pool_allocations": 0,
+                "activation_pool_hits": 1,
+                "external_bound_edges": 1,
+                "avoided_h2d_bytes": intermediate_bytes,
+                "avoided_d2h_bytes": intermediate_bytes * 2,
+            }
+
+        legacy = _BlockExecution(config, weights, linear_runner, "host")
+        chained = _BlockExecution(
+            config,
+            weights,
+            linear_runner,
+            "xdna2",
+            linear_pair_runner=pair_runner,
+        )
+        expected = legacy.adaln(
+            "norm1",
+            inputs.hidden_states,
+            inputs.embedded_timestep,
+            inputs.temb,
+        )
+        actual = chained.adaln(
+            "norm1",
+            inputs.hidden_states,
+            inputs.embedded_timestep,
+            inputs.temb,
+        )
+        self.assertTrue(torch.equal(actual[0], expected[0]))
+        self.assertTrue(torch.equal(actual[1], expected[1]))
+        metric = next(
+            item for item in chained.metrics if item.name == "norm1.linear_pair"
+        )
+        self.assertEqual(metric.external_bound_edges, 1)
+        self.assertEqual(metric.activation_pool_hits, 1)
+        self.assertGreater(metric.avoided_h2d_bytes, 0)
+        self.assertEqual(metric.avoided_d2h_bytes, metric.avoided_h2d_bytes * 2)
+
+    def test_adaln_linear_pair_unsupported_layout_falls_back(self):
+        from anima_xdna_poc.block import _BlockExecution
+
+        config = _tiny_block_config()
+        weights = AnimaBlockWeights(
+            "transformer_blocks.0.", _block_tensors(config)
+        )
+        inputs = deterministic_block_inputs(config, 4, 3, seed=74)
+        calls = []
+
+        def linear_runner(name, value, weight, _):
+            calls.append(name)
+            shape = value.shape
+            result = cpu_linear(
+                prepare_linear(value.reshape(-1, shape[-1]), weight)
+            )
+            return result.reshape(*shape[:-1], weight.shape[0])
+
+        def unsupported(*_):
+            raise UnsupportedTensor("test fallback")
+
+        execution = _BlockExecution(
+            config,
+            weights,
+            linear_runner,
+            "xdna2",
+            linear_pair_runner=unsupported,
+        )
+        execution.adaln(
+            "norm1",
+            inputs.hidden_states,
+            inputs.embedded_timestep,
+            inputs.temb,
+        )
+        self.assertEqual(calls, ["norm1.linear_1", "norm1.linear_2"])
+
     def test_chain_fixture_capture_is_atomic_and_one_shot(self):
         from anima_xdna_poc.chain import AnimaXDNAChainRuntime
 

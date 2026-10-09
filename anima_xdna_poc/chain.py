@@ -72,6 +72,7 @@ class AnimaXDNAChainRuntime:
         cache_dir: Optional[Path] = None,
         rebuild_cache: bool = False,
         qkv_chaining: bool = True,
+        activation_chaining: bool = True,
         effective_tensor_provider: Optional[
             Callable[[str], torch.Tensor]
         ] = None,
@@ -85,6 +86,7 @@ class AnimaXDNAChainRuntime:
         self.cache_dir = cache_dir
         self.rebuild_cache = rebuild_cache
         self.qkv_chaining = qkv_chaining
+        self.activation_chaining = activation_chaining
         self.effective_tensor_provider = effective_tensor_provider
         self._weights: dict[int, AnimaBlockWeights] = {}
         self._session: Optional[ResidentXDNASession] = None
@@ -278,6 +280,7 @@ class AnimaXDNAChainRuntime:
                 packed_cache=self._packed_cache,
                 block_index=index,
                 qkv_chaining=self.qkv_chaining,
+                activation_chaining=self.activation_chaining,
             )
             wall_ms = (time.perf_counter() - started) * 1000
             hidden = result.output
@@ -341,6 +344,7 @@ class AnimaXDNAChainRuntime:
                 packed_cache=self._packed_cache,
                 block_index=index,
                 qkv_chaining=self.qkv_chaining,
+                activation_chaining=self.activation_chaining,
             )
             xdna_ms = (time.perf_counter() - started) * 1000
             cpu_hidden = cpu_result.output

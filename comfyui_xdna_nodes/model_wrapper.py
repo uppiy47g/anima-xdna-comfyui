@@ -68,6 +68,11 @@ class RuntimeDiagnostics:
     last_resident_hits: int = 0
     last_weight_population_ms: float = 0.0
     last_weight_population_bytes: int = 0
+    last_activation_pool_allocations: int = 0
+    last_activation_pool_hits: int = 0
+    last_external_bound_edges: int = 0
+    last_avoided_h2d_bytes: int = 0
+    last_avoided_d2h_bytes: int = 0
     last_error: Optional[str] = None
     cache: Optional[dict[str, Any]] = None
     source_schema: Optional[str] = None
@@ -549,6 +554,21 @@ class SharedRuntime:
             )
             self.diagnostics.last_weight_population_bytes = sum(
                 metric.weight_population_bytes for metric in metrics
+            )
+            self.diagnostics.last_activation_pool_allocations = sum(
+                metric.activation_pool_allocations for metric in metrics
+            )
+            self.diagnostics.last_activation_pool_hits = sum(
+                metric.activation_pool_hits for metric in metrics
+            )
+            self.diagnostics.last_external_bound_edges = sum(
+                metric.external_bound_edges for metric in metrics
+            )
+            self.diagnostics.last_avoided_h2d_bytes = sum(
+                metric.avoided_h2d_bytes for metric in metrics
+            )
+            self.diagnostics.last_avoided_d2h_bytes = sum(
+                metric.avoided_d2h_bytes for metric in metrics
             )
             self.diagnostics.cache = (
                 {
