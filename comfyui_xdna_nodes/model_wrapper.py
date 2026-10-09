@@ -65,10 +65,7 @@ class RuntimeDiagnostics:
     source_dtypes: Optional[list[str]] = None
     source_normalization_message: Optional[str] = None
     lora_patch_count: int = 0
-    lora_prepare_ms: float = 0.0
-    lora_base_tensor_calls: int = 0
     lora_cache_message: Optional[str] = None
-    cache_profile_message: Optional[str] = None
     model_schema: Optional[str] = None
     model_fingerprint: Optional[str] = None
     model_variant: Optional[str] = None
@@ -98,8 +95,6 @@ class SharedRuntime:
         lora_patch_count: int = 0,
         base_model_fingerprint: Optional[str] = None,
         base_model_schema: Optional[str] = None,
-        lora_prepare_ms: float = 0.0,
-        lora_base_tensor_calls: int = 0,
     ):
         self.checkpoint = Path(checkpoint)
         self.cache_dir = cache_dir
@@ -109,8 +104,6 @@ class SharedRuntime:
         self.lora_patch_count = lora_patch_count
         self.base_model_fingerprint = base_model_fingerprint
         self.base_model_schema = base_model_schema
-        self.lora_prepare_ms = lora_prepare_ms
-        self.lora_base_tensor_calls = lora_base_tensor_calls
         self._runtime: Optional[AnimaXDNAChainRuntime] = None
         self._refs = 1
         self._lock = threading.RLock()
@@ -193,10 +186,6 @@ class SharedRuntime:
                 source_execution_fingerprint
             )
             self.diagnostics.lora_patch_count = self.lora_patch_count
-            self.diagnostics.lora_prepare_ms = self.lora_prepare_ms
-            self.diagnostics.lora_base_tensor_calls = (
-                self.lora_base_tensor_calls
-            )
             self.diagnostics.qkv_chaining = self.qkv_chaining
             self.diagnostics.model_block_parameter_count = storage_profile[
                 "block_parameter_count"
@@ -230,29 +219,6 @@ class SharedRuntime:
                 if runtime.cache_status is not None
                 else None
             )
-            if runtime.cache_status is not None:
-                cache_timings = runtime.cache_status.timings
-                message = (
-                    "Initial-load profile: "
-                    f"LoRA base={self.lora_prepare_ms:.1f} ms/"
-                    f"{self.lora_base_tensor_calls} tensors; "
-                    f"source fingerprint={cache_timings.source_fingerprint_ms:.1f} ms; "
-                    f"effective fingerprint={cache_timings.effective_fingerprint_ms:.1f} ms; "
-                    f"base execution identity={cache_timings.base_execution_identity_ms:.1f} ms; "
-                    f"cache lookup={cache_timings.cache_lookup_ms:.1f} ms; "
-                    f"manifest read={cache_timings.manifest_read_ms:.1f} ms; "
-                    f"payload SHA verify={cache_timings.payload_verify_ms:.1f} ms; "
-                    f"materialize={cache_timings.tensor_materialize_ms:.1f} ms; "
-                    f"pack={cache_timings.tensor_pack_ms:.1f} ms; "
-                    f"write/hash={cache_timings.payload_write_hash_ms:.1f} ms; "
-                    f"manifest={cache_timings.manifest_write_ms:.1f} ms; "
-                    f"effective provider calls={cache_timings.effective_tensor_calls}; "
-                    f"cache total={cache_timings.total_ms:.1f} ms. "
-                    "XRT BO population is reported after the first denoising call "
-                    "as last_weight_population_ms."
-                )
-                self.diagnostics.cache_profile_message = message
-                print(f"[Anima XDNA] {message}")
             if execution_identity["source_dtypes"] != ["BF16"]:
                 action = (
                     "Reusing the verified"
@@ -1069,7 +1035,6 @@ class LoadAttachAnimaXDNAModel:
                 "ComfyUI model management is unavailable"
             ) from error
         comfy.model_management.load_models_gpu([model])
-        lora_started = time.perf_counter()
         (
             effective_tensor_provider,
             lora_patch_count,
@@ -1077,10 +1042,6 @@ class LoadAttachAnimaXDNAModel:
             base_model_schema,
         ) = (
             _effective_lora_provider(model)
-        )
-        lora_prepare_ms = (time.perf_counter() - lora_started) * 1000
-        lora_base_tensor_calls = (
-            len(canonical_keys()) if effective_tensor_provider is not None else 0
         )
         patched = model.clone()
         runtime = SharedRuntime(
@@ -1092,8 +1053,6 @@ class LoadAttachAnimaXDNAModel:
             lora_patch_count,
             base_model_fingerprint,
             base_model_schema,
-            lora_prepare_ms,
-            lora_base_tensor_calls,
         )
         try:
             runtime.prepare(model.model.diffusion_model)

@@ -59,17 +59,6 @@ class CacheTimings:
     disk_read_ms: float = 0.0
     verify_ms: float = 0.0
     total_ms: float = 0.0
-    source_fingerprint_ms: float = 0.0
-    effective_fingerprint_ms: float = 0.0
-    base_execution_identity_ms: float = 0.0
-    cache_lookup_ms: float = 0.0
-    tensor_materialize_ms: float = 0.0
-    tensor_pack_ms: float = 0.0
-    payload_write_hash_ms: float = 0.0
-    manifest_write_ms: float = 0.0
-    manifest_read_ms: float = 0.0
-    payload_verify_ms: float = 0.0
-    effective_tensor_calls: int = 0
 
 
 @dataclass(frozen=True)
@@ -267,10 +256,8 @@ def fingerprint_source(
     identity["block_fingerprint"] = canonical_block_fingerprint(tensors)
     canonical = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
     identity["fingerprint"] = hashlib.sha256(canonical).hexdigest()
-    elapsed = (time.perf_counter() - started) * 1000
     return identity, CacheTimings(
-        fingerprint_ms=elapsed,
-        source_fingerprint_ms=elapsed,
+        fingerprint_ms=(time.perf_counter() - started) * 1000
     )
 
 
@@ -564,13 +551,6 @@ class PackedWeightCache:
         self.status: Optional[CacheStatus] = None
         self._handle = None
         self._mapped = None
-        self._effective_tensor_calls = 0
-
-    def _effective_tensor(self, key: str) -> torch.Tensor:
-        if self.effective_tensor_provider is None:
-            raise RuntimeError("effective tensor provider is unavailable")
-        self._effective_tensor_calls += 1
-        return self.effective_tensor_provider(key)
 
     def identify(self) -> tuple[str, dict[str, Any], CacheTimings]:
         source, timings = fingerprint_source(self.checkpoint, self.blocks)
@@ -579,17 +559,12 @@ class PackedWeightCache:
         if self.effective_tensor_provider is not None:
             effective_started = time.perf_counter()
             effective_identity = fingerprint_effective_tensors(
-                self._effective_tensor,
+                self.effective_tensor_provider,
                 self.blocks,
             )
-            effective_ms = (time.perf_counter() - effective_started) * 1000
             timings = CacheTimings(
-                **{
-                    **asdict(timings),
-                    "fingerprint_ms": timings.fingerprint_ms + effective_ms,
-                    "effective_fingerprint_ms": effective_ms,
-                    "effective_tensor_calls": self._effective_tensor_calls,
-                }
+                fingerprint_ms=timings.fingerprint_ms
+                + (time.perf_counter() - effective_started) * 1000
             )
             adapter_fingerprints = (
                 effective_identity["block_fingerprint"],
@@ -605,21 +580,12 @@ class PackedWeightCache:
             )
         )
         if effective_identity is not None:
-            base_started = time.perf_counter()
             descriptor["base_execution_identity"] = (
                 fingerprint_execution_source(
                     self.checkpoint,
                     self.blocks,
                     source,
                 )
-            )
-            base_ms = (time.perf_counter() - base_started) * 1000
-            timings = CacheTimings(
-                **{
-                    **asdict(timings),
-                    "fingerprint_ms": timings.fingerprint_ms + base_ms,
-                    "base_execution_identity_ms": base_ms,
-                }
             )
             descriptor["effective_execution_identity"] = effective_identity
         return _descriptor_key(descriptor), descriptor, timings
@@ -647,11 +613,9 @@ class PackedWeightCache:
         entry: Path,
         key: str,
         descriptor: dict[str, Any],
-    ) -> tuple[dict[str, Any], float, float, float]:
+    ) -> tuple[dict[str, Any], float]:
         started = time.perf_counter()
-        manifest_started = time.perf_counter()
         manifest = PackedWeightCache._read_manifest(entry)
-        manifest_read_ms = (time.perf_counter() - manifest_started) * 1000
         if manifest.get("cache_key") != key:
             raise CacheIntegrityError("cache manifest key mismatch")
         if manifest.get("descriptor") != descriptor:
@@ -662,36 +626,26 @@ class PackedWeightCache:
             raise CacheIntegrityError(
                 f"cache payload size mismatch: expected {expected_size}"
             )
-        payload_started = time.perf_counter()
         digest = hashlib.sha256()
         with payload.open("rb") as handle:
             for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
                 digest.update(chunk)
         if digest.hexdigest() != manifest.get("payload_sha256"):
             raise CacheIntegrityError("cache payload SHA-256 mismatch")
-        payload_verify_ms = (time.perf_counter() - payload_started) * 1000
-        return (
-            manifest,
-            (time.perf_counter() - started) * 1000,
-            manifest_read_ms,
-            payload_verify_ms,
-        )
+        return manifest, (time.perf_counter() - started) * 1000
 
     def ensure(self, rebuild: bool = False) -> CacheStatus:
         total_started = time.perf_counter()
-        self._effective_tensor_calls = 0
         if not self.enabled:
             self.status = CacheStatus(
                 "", self.root, False, "disabled", 0, 0, 0, 0, CacheTimings()
             )
             return self.status
-        lookup_started = time.perf_counter()
         candidate = (
             None
             if rebuild or self.effective_tensor_provider is not None
             else self._candidate_entry()
         )
-        cache_lookup_ms = (time.perf_counter() - lookup_started) * 1000
         if candidate is not None:
             candidate_manifest = self._read_manifest(candidate)
             with ThreadPoolExecutor(max_workers=2) as executor:
@@ -703,12 +657,7 @@ class PackedWeightCache:
                     self.checkpoint,
                     candidate_manifest,
                 )
-                (
-                    verified_manifest,
-                    verify_ms,
-                    manifest_read_ms,
-                    payload_verify_ms,
-                ) = verify_future.result()
+                verified_manifest, verify_ms = verify_future.result()
                 source_valid, fingerprint_ms = source_future.result()
             if (
                 source_valid
@@ -722,14 +671,8 @@ class PackedWeightCache:
                     candidate_manifest,
                     True,
                     "verified hit",
-                    CacheTimings(
-                        fingerprint_ms=fingerprint_ms,
-                        source_fingerprint_ms=fingerprint_ms,
-                        cache_lookup_ms=cache_lookup_ms,
-                    ),
+                    CacheTimings(fingerprint_ms=fingerprint_ms),
                     verify_ms=verify_ms,
-                    manifest_read_ms=manifest_read_ms,
-                    payload_verify_ms=payload_verify_ms,
                     total_ms=(time.perf_counter() - total_started) * 1000,
                 )
                 return self.status
@@ -741,21 +684,9 @@ class PackedWeightCache:
             key, descriptor, timings = self.identify()
         else:
             key, descriptor, timings = self.identify()
-        timings = CacheTimings(
-            **{
-                **asdict(timings),
-                "cache_lookup_ms": cache_lookup_ms,
-                "effective_tensor_calls": self._effective_tensor_calls,
-            }
-        )
         entry = self.entry_path(key)
         if entry.exists() and not rebuild:
-            (
-                manifest,
-                verify_ms,
-                manifest_read_ms,
-                payload_verify_ms,
-            ) = self._verify_entry(entry, key, descriptor)
+            manifest, verify_ms = self._verify_entry(entry, key, descriptor)
             self.manifest = manifest
             self.status = self._status(
                 manifest,
@@ -763,20 +694,13 @@ class PackedWeightCache:
                 "verified hit",
                 timings,
                 verify_ms=verify_ms,
-                manifest_read_ms=manifest_read_ms,
-                payload_verify_ms=payload_verify_ms,
                 total_ms=(time.perf_counter() - total_started) * 1000,
             )
             return self.status
         lock = self.root / f"{key}.lock"
         with _EntryLock(lock):
             if entry.exists() and not rebuild:
-                (
-                    manifest,
-                    verify_ms,
-                    manifest_read_ms,
-                    payload_verify_ms,
-                ) = self._verify_entry(entry, key, descriptor)
+                manifest, verify_ms = self._verify_entry(entry, key, descriptor)
                 self.manifest = manifest
                 self.status = self._status(
                     manifest,
@@ -784,21 +708,19 @@ class PackedWeightCache:
                     "concurrent builder won",
                     timings,
                     verify_ms=verify_ms,
-                    manifest_read_ms=manifest_read_ms,
-                    payload_verify_ms=payload_verify_ms,
                     total_ms=(time.perf_counter() - total_started) * 1000,
                 )
                 return self.status
             if entry.exists():
                 shutil.rmtree(entry)
-            manifest, build_timings = self._build_atomic(entry, key, descriptor)
+            manifest, pack_ms = self._build_atomic(entry, key, descriptor)
         self.manifest = manifest
         self.status = self._status(
             manifest,
             False,
             "explicit rebuild" if rebuild else "cache miss",
             timings,
-            build_timings=build_timings,
+            pack_ms=pack_ms,
             total_ms=(time.perf_counter() - total_started) * 1000,
         )
         return self.status
@@ -851,31 +773,22 @@ class PackedWeightCache:
     @staticmethod
     def _verify_payload_only(
         entry: Path,
-    ) -> tuple[dict[str, Any], float, float, float]:
+    ) -> tuple[dict[str, Any], float]:
         started = time.perf_counter()
-        manifest_started = time.perf_counter()
         manifest = PackedWeightCache._read_manifest(entry)
-        manifest_read_ms = (time.perf_counter() - manifest_started) * 1000
         payload = entry / "weights.bin"
         expected_size = manifest.get("packed_bytes")
         if not payload.is_file() or payload.stat().st_size != expected_size:
             raise CacheIntegrityError(
                 f"cache payload size mismatch: expected {expected_size}"
             )
-        payload_started = time.perf_counter()
         digest = hashlib.sha256()
         with payload.open("rb") as handle:
             for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
                 digest.update(chunk)
         if digest.hexdigest() != manifest.get("payload_sha256"):
             raise CacheIntegrityError("cache payload SHA-256 mismatch")
-        payload_verify_ms = (time.perf_counter() - payload_started) * 1000
-        return (
-            manifest,
-            (time.perf_counter() - started) * 1000,
-            manifest_read_ms,
-            payload_verify_ms,
-        )
+        return manifest, (time.perf_counter() - started) * 1000
 
     def _status(
         self,
@@ -883,13 +796,10 @@ class PackedWeightCache:
         hit: bool,
         reason: str,
         timings: CacheTimings,
-        build_timings: Optional[CacheTimings] = None,
+        pack_ms: float = 0.0,
         verify_ms: float = 0.0,
-        manifest_read_ms: float = 0.0,
-        payload_verify_ms: float = 0.0,
         total_ms: float = 0.0,
     ) -> CacheStatus:
-        build_timings = build_timings or CacheTimings()
         return CacheStatus(
             manifest["cache_key"],
             self.entry_path(manifest["cache_key"]),
@@ -900,23 +810,11 @@ class PackedWeightCache:
             manifest["packed_bytes"],
             manifest["padding_bytes"],
             CacheTimings(
-                **{
-                    **asdict(timings),
-                    "pack_ms": build_timings.pack_ms,
-                    "verify_ms": verify_ms,
-                    "total_ms": total_ms,
-                    "tensor_materialize_ms": (
-                        build_timings.tensor_materialize_ms
-                    ),
-                    "tensor_pack_ms": build_timings.tensor_pack_ms,
-                    "payload_write_hash_ms": (
-                        build_timings.payload_write_hash_ms
-                    ),
-                    "manifest_write_ms": build_timings.manifest_write_ms,
-                    "manifest_read_ms": manifest_read_ms,
-                    "payload_verify_ms": payload_verify_ms,
-                    "effective_tensor_calls": self._effective_tensor_calls,
-                }
+                timings.fingerprint_ms,
+                pack_ms,
+                0.0,
+                verify_ms,
+                total_ms,
             ),
         )
 
@@ -925,12 +823,8 @@ class PackedWeightCache:
         entry: Path,
         key: str,
         descriptor: dict[str, Any],
-    ) -> tuple[dict[str, Any], CacheTimings]:
+    ) -> tuple[dict[str, Any], float]:
         started = time.perf_counter()
-        tensor_materialize_ms = 0.0
-        tensor_pack_ms = 0.0
-        payload_write_hash_ms = 0.0
-        manifest_write_ms = 0.0
         self.root.mkdir(parents=True, exist_ok=True)
         temporary = self.root / f".{key}.{uuid.uuid4().hex}.tmp"
         temporary.mkdir()
@@ -984,9 +878,8 @@ class PackedWeightCache:
                             canonical_key = prefix + name
                             source = tensor_sources[canonical_key]
                             source_key = source["source_key"]
-                            phase_started = time.perf_counter()
                             tensor = (
-                                self._effective_tensor(canonical_key)
+                                self.effective_tensor_provider(canonical_key)
                                 if self.effective_tensor_provider is not None
                                 else sources[source["shard"]].get_tensor(source_key)
                             )
@@ -1019,11 +912,7 @@ class PackedWeightCache:
                                         ).hexdigest(),
                                     }
                                 )
-                            tensor_materialize_ms += (
-                                time.perf_counter() - phase_started
-                            ) * 1000
                             for start in range(0, tensor.shape[1], 2048):
-                                phase_started = time.perf_counter()
                                 end = min(start + 2048, tensor.shape[1])
                                 packed_shape = _layout_shape(tensor.shape[0], end - start)
                                 packed = torch.zeros(
@@ -1033,16 +922,8 @@ class PackedWeightCache:
                                     normalized[:, start:end].T.contiguous()
                                 )
                                 raw = packed.view(torch.uint8).numpy().tobytes()
-                                tensor_pack_ms += (
-                                    time.perf_counter() - phase_started
-                                ) * 1000
-                                phase_started = time.perf_counter()
                                 payload.write(raw)
                                 payload_hash.update(raw)
-                                packed_digest = hashlib.sha256(raw).hexdigest()
-                                payload_write_hash_ms += (
-                                    time.perf_counter() - phase_started
-                                ) * 1000
                                 records.append(
                                     {
                                         "id": f"{block}:{name}:k{start}",
@@ -1055,7 +936,7 @@ class PackedWeightCache:
                                         "packed_shape": list(packed_shape),
                                         "offset": offset,
                                         "length": len(raw),
-                                        "sha256": packed_digest,
+                                        "sha256": hashlib.sha256(raw).hexdigest(),
                                     }
                                 )
                                 offset += len(raw)
@@ -1063,9 +944,8 @@ class PackedWeightCache:
                             canonical_key = prefix + name
                             source = tensor_sources[canonical_key]
                             source_key = source["source_key"]
-                            phase_started = time.perf_counter()
                             source_tensor = (
-                                self._effective_tensor(canonical_key)
+                                self.effective_tensor_provider(canonical_key)
                                 if self.effective_tensor_provider is not None
                                 else sources[source["shard"]].get_tensor(source_key)
                             )
@@ -1099,21 +979,9 @@ class PackedWeightCache:
                                         ).hexdigest(),
                                     }
                                 )
-                            tensor_materialize_ms += (
-                                time.perf_counter() - phase_started
-                            ) * 1000
-                            phase_started = time.perf_counter()
                             raw = tensor.view(torch.uint8).numpy().tobytes()
-                            tensor_pack_ms += (
-                                time.perf_counter() - phase_started
-                            ) * 1000
-                            phase_started = time.perf_counter()
                             payload.write(raw)
                             payload_hash.update(raw)
-                            packed_digest = hashlib.sha256(raw).hexdigest()
-                            payload_write_hash_ms += (
-                                time.perf_counter() - phase_started
-                            ) * 1000
                             records.append(
                                 {
                                     "id": f"{block}:{name}",
@@ -1126,16 +994,12 @@ class PackedWeightCache:
                                     "packed_shape": list(tensor.shape),
                                     "offset": offset,
                                     "length": len(raw),
-                                    "sha256": packed_digest,
+                                    "sha256": hashlib.sha256(raw).hexdigest(),
                                 }
                             )
                             offset += len(raw)
-                    phase_started = time.perf_counter()
                     payload.flush()
                     os.fsync(payload.fileno())
-                    payload_write_hash_ms += (
-                        time.perf_counter() - phase_started
-                    ) * 1000
             execution_fingerprint = (
                 source_identity["block_fingerprint"]
                 if execution_records is None
@@ -1174,7 +1038,6 @@ class PackedWeightCache:
                 "payload_sha256": payload_hash.hexdigest(),
                 "tensors": records,
             }
-            phase_started = time.perf_counter()
             manifest_temp = temporary / "manifest.json.tmp"
             manifest_temp.write_text(
                 json.dumps(manifest, indent=2, sort_keys=True) + "\n",
@@ -1182,17 +1045,7 @@ class PackedWeightCache:
             )
             os.replace(manifest_temp, temporary / "manifest.json")
             os.replace(temporary, entry)
-            manifest_write_ms += (
-                time.perf_counter() - phase_started
-            ) * 1000
-            return manifest, CacheTimings(
-                pack_ms=(time.perf_counter() - started) * 1000,
-                tensor_materialize_ms=tensor_materialize_ms,
-                tensor_pack_ms=tensor_pack_ms,
-                payload_write_hash_ms=payload_write_hash_ms,
-                manifest_write_ms=manifest_write_ms,
-                effective_tensor_calls=self._effective_tensor_calls,
-            )
+            return manifest, (time.perf_counter() - started) * 1000
         except BaseException:
             if temporary.exists():
                 shutil.rmtree(temporary)
@@ -1237,11 +1090,11 @@ class PackedWeightCache:
                 **asdict(status),
                 "path": status.path,
                 "timings": CacheTimings(
-                    **{
-                        **asdict(status.timings),
-                        "disk_read_ms": elapsed,
-                        "total_ms": status.timings.total_ms + elapsed,
-                    }
+                    status.timings.fingerprint_ms,
+                    status.timings.pack_ms,
+                    elapsed,
+                    status.timings.verify_ms,
+                    status.timings.total_ms + elapsed,
                 ),
             }
         )
