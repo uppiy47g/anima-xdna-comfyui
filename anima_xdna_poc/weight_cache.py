@@ -78,6 +78,137 @@ class CacheIntegrityError(UnsupportedTensor):
     """A named cache entry exists but failed manifest or payload verification."""
 
 
+class _ProvisionalEffectiveBuild:
+    def __init__(
+        self,
+        root: Path,
+        config: AnimaBlockConfig,
+        source_identity: dict[str, Any],
+    ):
+        root.mkdir(parents=True, exist_ok=True)
+        self.path = root / f".build-{uuid.uuid4().hex}"
+        self.path.mkdir()
+        self.started = time.perf_counter()
+        self.payload = (self.path / "weights.bin").open("wb")
+        self.config = config
+        self.sources = {
+            tensor["key"]: tensor for tensor in source_identity["tensors"]
+        }
+        self.records: list[dict[str, Any]] = []
+        self.logical_bytes = 0
+        self.offset = 0
+        self.payload_hash = hashlib.sha256()
+        self.closed = False
+        self.dimensions = {
+            "hidden": config.hidden_size,
+            "head": config.head_dim,
+            "context": config.context_dim,
+            "adaln": config.adaln_dim,
+            "modulation": 3 * config.hidden_size,
+            "mlp": config.mlp_dim,
+        }
+
+    def add(self, canonical_key: str, tensor: torch.Tensor) -> torch.Tensor:
+        source = self.sources[canonical_key]
+        source_key = source["source_key"]
+        canonical_name = canonical_key.split(".", 2)[2]
+        if canonical_name in LINEAR_SHAPES:
+            out_name, in_name = LINEAR_SHAPES[canonical_name]
+            expected = (self.dimensions[out_name], self.dimensions[in_name])
+        elif canonical_name in NORM_SHAPES:
+            expected = (self.dimensions[NORM_SHAPES[canonical_name]],)
+        else:
+            raise UnsupportedTensor(
+                f"unsupported effective tensor {canonical_key!r}"
+            )
+        if tuple(tensor.shape) != expected:
+            raise UnsupportedTensor(
+                f"{canonical_key!r} has shape {tuple(tensor.shape)}, "
+                f"expected {expected}"
+            )
+        if tensor.dtype not in (
+            torch.bfloat16,
+            torch.float16,
+            torch.float32,
+        ):
+            raise UnsupportedTensor(
+                f"{canonical_key!r} has unsupported dtype {tensor.dtype}"
+            )
+        normalized = tensor.detach().to(torch.bfloat16).contiguous()
+        self.logical_bytes += normalized.numel() * normalized.element_size()
+        block = int(canonical_key.split(".", 2)[1])
+        if canonical_name in LINEAR_SHAPES:
+            for start in range(0, normalized.shape[1], 2048):
+                end = min(start + 2048, normalized.shape[1])
+                packed_shape = _layout_shape(normalized.shape[0], end - start)
+                packed = torch.zeros(packed_shape, dtype=torch.bfloat16)
+                packed[: end - start, : normalized.shape[0]] = (
+                    normalized[:, start:end].T.contiguous()
+                )
+                self._write(
+                    f"{block}:{canonical_name}:k{start}",
+                    canonical_key,
+                    source_key,
+                    tensor,
+                    [end - start, normalized.shape[0]],
+                    packed,
+                )
+        else:
+            self._write(
+                f"{block}:{canonical_name}",
+                canonical_key,
+                source_key,
+                tensor,
+                list(normalized.shape),
+                normalized,
+            )
+        return tensor
+
+    def _write(
+        self,
+        identifier: str,
+        canonical_key: str,
+        source_key: str,
+        source_tensor: torch.Tensor,
+        logical_shape: list[int],
+        packed: torch.Tensor,
+    ) -> None:
+        raw = packed.view(torch.uint8).numpy().tobytes()
+        self.payload.write(raw)
+        self.payload_hash.update(raw)
+        self.records.append(
+            {
+                "id": identifier,
+                "canonical_key": canonical_key,
+                "source_key": source_key,
+                "source_dtype": str(source_tensor.dtype).removeprefix("torch."),
+                "source_shape": list(source_tensor.shape),
+                "logical_shape": logical_shape,
+                "packed_dtype": "bfloat16",
+                "packed_shape": list(packed.shape),
+                "offset": self.offset,
+                "length": len(raw),
+                "sha256": hashlib.sha256(raw).hexdigest(),
+            }
+        )
+        self.offset += len(raw)
+
+    def finish(self) -> None:
+        if self.closed:
+            return
+        self.payload.flush()
+        os.fsync(self.payload.fileno())
+        self.payload.close()
+        self.closed = True
+
+    def cleanup(self) -> None:
+        if not self.closed:
+            self.payload.close()
+            self.closed = True
+        if self.path.exists():
+            shutil.rmtree(self.path)
+
+
 def _package_version(name: str) -> str:
     try:
         return importlib.metadata.version(name)
@@ -553,15 +684,50 @@ class PackedWeightCache:
         self._mapped = None
 
     def identify(self) -> tuple[str, dict[str, Any], CacheTimings]:
+        key, descriptor, timings, provisional = self._identify(False)
+        if provisional is not None:
+            provisional.cleanup()
+        return key, descriptor, timings
+
+    def _identify(
+        self,
+        build_provisional: bool,
+    ) -> tuple[
+        str,
+        dict[str, Any],
+        CacheTimings,
+        Optional[_ProvisionalEffectiveBuild],
+    ]:
         source, timings = fingerprint_source(self.checkpoint, self.blocks)
         effective_identity = None
         adapter_fingerprints = ()
+        provisional = None
         if self.effective_tensor_provider is not None:
+            if build_provisional:
+                provisional = _ProvisionalEffectiveBuild(
+                    self.root,
+                    self.config,
+                    source,
+                )
+
+            def effective_provider(key: str) -> torch.Tensor:
+                tensor = self.effective_tensor_provider(key)
+                if provisional is not None:
+                    provisional.add(key, tensor)
+                return tensor
+
             effective_started = time.perf_counter()
-            effective_identity = fingerprint_effective_tensors(
-                self.effective_tensor_provider,
-                self.blocks,
-            )
+            try:
+                effective_identity = fingerprint_effective_tensors(
+                    effective_provider,
+                    self.blocks,
+                )
+                if provisional is not None:
+                    provisional.finish()
+            except BaseException:
+                if provisional is not None:
+                    provisional.cleanup()
+                raise
             timings = CacheTimings(
                 fingerprint_ms=timings.fingerprint_ms
                 + (time.perf_counter() - effective_started) * 1000
@@ -588,7 +754,7 @@ class PackedWeightCache:
                 )
             )
             descriptor["effective_execution_identity"] = effective_identity
-        return _descriptor_key(descriptor), descriptor, timings
+        return _descriptor_key(descriptor), descriptor, timings, provisional
 
     @property
     def execution_identity(self) -> Optional[dict[str, Any]]:
@@ -641,11 +807,24 @@ class PackedWeightCache:
                 "", self.root, False, "disabled", 0, 0, 0, 0, CacheTimings()
             )
             return self.status
-        candidate = (
-            None
-            if rebuild or self.effective_tensor_provider is not None
-            else self._candidate_entry()
+        effective_input_fingerprint = getattr(
+            self.effective_tensor_provider,
+            "input_fingerprint",
+            None,
         )
+        effective_candidate = (
+            self._effective_candidate_entry(effective_input_fingerprint)
+            if not rebuild
+            and self.effective_tensor_provider is not None
+            and effective_input_fingerprint is not None
+            else None
+        )
+        candidate = (
+            self._candidate_entry()
+            if not rebuild and self.effective_tensor_provider is None
+            else None
+        )
+        provisional = None
         if candidate is not None:
             candidate_manifest = self._read_manifest(candidate)
             with ThreadPoolExecutor(max_workers=2) as executor:
@@ -681,12 +860,26 @@ class PackedWeightCache:
                 and candidate_manifest.get("cache_key") != candidate.name
             ):
                 raise CacheIntegrityError("cache manifest key mismatch")
-            key, descriptor, timings = self.identify()
+            key, descriptor, timings, provisional = self._identify(
+                self.effective_tensor_provider is not None
+                and effective_input_fingerprint is not None
+            )
         else:
-            key, descriptor, timings = self.identify()
+            key, descriptor, timings, provisional = self._identify(
+                self.effective_tensor_provider is not None
+                and effective_input_fingerprint is not None
+                and effective_candidate is None
+            )
         entry = self.entry_path(key)
         if entry.exists() and not rebuild:
             manifest, verify_ms = self._verify_entry(entry, key, descriptor)
+            if provisional is not None:
+                provisional.cleanup()
+            self._record_effective_input_fingerprint(
+                entry,
+                manifest,
+                effective_input_fingerprint,
+            )
             self.manifest = manifest
             self.status = self._status(
                 manifest,
@@ -701,6 +894,13 @@ class PackedWeightCache:
         with _EntryLock(lock):
             if entry.exists() and not rebuild:
                 manifest, verify_ms = self._verify_entry(entry, key, descriptor)
+                if provisional is not None:
+                    provisional.cleanup()
+                self._record_effective_input_fingerprint(
+                    entry,
+                    manifest,
+                    effective_input_fingerprint,
+                )
                 self.manifest = manifest
                 self.status = self._status(
                     manifest,
@@ -713,7 +913,21 @@ class PackedWeightCache:
                 return self.status
             if entry.exists():
                 shutil.rmtree(entry)
-            manifest, pack_ms = self._build_atomic(entry, key, descriptor)
+            if provisional is not None:
+                manifest, pack_ms = self._finalize_provisional(
+                    provisional,
+                    entry,
+                    key,
+                    descriptor,
+                    effective_input_fingerprint,
+                )
+                provisional = None
+            else:
+                manifest, pack_ms = self._build_atomic(
+                    entry,
+                    key,
+                    descriptor,
+                )
         self.manifest = manifest
         self.status = self._status(
             manifest,
@@ -724,6 +938,78 @@ class PackedWeightCache:
             total_ms=(time.perf_counter() - total_started) * 1000,
         )
         return self.status
+
+    def _effective_candidate_entry(
+        self,
+        effective_input_fingerprint: str,
+    ) -> Optional[Path]:
+        if not self.root.is_dir():
+            return None
+        source_files, _ = _source_files(self.checkpoint)
+        current_files = []
+        for source_file in source_files:
+            source_name = _source_name(self.checkpoint, source_file)
+            header_bytes, _, _ = _read_header(source_file)
+            current_files.append(
+                {
+                    "name": source_name,
+                    "size": source_file.stat().st_size,
+                    "header_sha256": hashlib.sha256(header_bytes).hexdigest(),
+                }
+            )
+        current_index = (
+            {
+                "name": self.checkpoint.name,
+                "sha256": hashlib.sha256(
+                    self.checkpoint.read_bytes()
+                ).hexdigest(),
+            }
+            if self.checkpoint.suffix.lower() == ".json"
+            else None
+        )
+        architecture = json.loads(json.dumps(asdict(self.config)))
+        tools = tool_identity()
+        candidates = []
+        for manifest_path in self.root.glob("*/manifest.json"):
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                descriptor = manifest["descriptor"]
+                source_identity = descriptor["source_identity"]
+                if (
+                    manifest.get("effective_input_fingerprint")
+                    == effective_input_fingerprint
+                    and descriptor["architecture"] == architecture
+                    and descriptor["block_range"]
+                    == [self.blocks.start, self.blocks.stop]
+                    and descriptor["tools"] == tools
+                    and descriptor["layout"]["version"] == LAYOUT_VERSION
+                    and source_identity["files"] == current_files
+                    and source_identity.get("index") == current_index
+                ):
+                    candidates.append(manifest_path.parent)
+            except (KeyError, OSError, ValueError, TypeError):
+                continue
+        return candidates[0] if len(candidates) == 1 else None
+
+    @staticmethod
+    def _record_effective_input_fingerprint(
+        entry: Path,
+        manifest: dict[str, Any],
+        effective_input_fingerprint: Optional[str],
+    ) -> None:
+        if (
+            effective_input_fingerprint is None
+            or manifest.get("effective_input_fingerprint")
+            == effective_input_fingerprint
+        ):
+            return
+        manifest["effective_input_fingerprint"] = effective_input_fingerprint
+        temporary = entry / f".manifest.{uuid.uuid4().hex}.tmp"
+        temporary.write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary, entry / "manifest.json")
 
     def _candidate_entry(self) -> Optional[Path]:
         if not self.root.is_dir():
@@ -817,6 +1103,62 @@ class PackedWeightCache:
                 total_ms,
             ),
         )
+
+    def _finalize_provisional(
+        self,
+        provisional: _ProvisionalEffectiveBuild,
+        entry: Path,
+        key: str,
+        descriptor: dict[str, Any],
+        effective_input_fingerprint: Optional[str],
+    ) -> tuple[dict[str, Any], float]:
+        try:
+            effective_identity = descriptor["effective_execution_identity"]
+            manifest = {
+                "cache_key": key,
+                "descriptor": descriptor,
+                "execution_identity": {
+                    "normalization": "BF16",
+                    "source_dtypes": ["BF16"],
+                    "block_fingerprint": effective_identity[
+                        "block_fingerprint"
+                    ],
+                },
+                "source_guard": _source_guard(self.checkpoint),
+                "created_at": time.strftime(
+                    "%Y-%m-%dT%H:%M:%SZ",
+                    time.gmtime(),
+                ),
+                "tensor_count": len(provisional.records),
+                "logical_source_bytes": provisional.logical_bytes,
+                "packed_bytes": provisional.offset,
+                "padding_bytes": (
+                    provisional.offset - provisional.logical_bytes
+                ),
+                "payload_sha256": provisional.payload_hash.hexdigest(),
+                "tensors": provisional.records,
+            }
+            if effective_input_fingerprint is not None:
+                manifest["effective_input_fingerprint"] = (
+                    effective_input_fingerprint
+                )
+            manifest_temp = provisional.path / "manifest.json.tmp"
+            manifest_temp.write_text(
+                json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            os.replace(
+                manifest_temp,
+                provisional.path / "manifest.json",
+            )
+            os.replace(provisional.path, entry)
+            return (
+                manifest,
+                (time.perf_counter() - provisional.started) * 1000,
+            )
+        except BaseException:
+            provisional.cleanup()
+            raise
 
     def _build_atomic(
         self,

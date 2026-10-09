@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import asdict, dataclass
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -619,6 +620,7 @@ def _effective_lora_provider(model):
         )
 
     entries_by_canonical = {}
+    snapshot_records = []
     patch_count = 0
     for canonical_key in canonical_keys():
         model_key = canonical_to_model[canonical_key]
@@ -627,7 +629,8 @@ def _effective_lora_provider(model):
             raise RuntimeError(
                 f"invalid ComfyUI patch entries for {model_key!r}"
             )
-        for patch in entries[1:]:
+        snapshot_patches = []
+        for patch_index, patch in enumerate(entries[1:]):
             if not isinstance(patch, tuple) or len(patch) != 5:
                 raise RuntimeError(
                     f"unsupported ComfyUI patch structure for {model_key!r}"
@@ -681,6 +684,31 @@ def _effective_lora_provider(model):
                         f"norm diff weights on {model_key!r}"
                     )
                 patch_count += 1
+                snapshot_diff = diff.detach().to(device="cpu").clone()
+                snapshot_patches.append(
+                    (
+                        float(strength),
+                        ("diff", (snapshot_diff,)),
+                        1.0,
+                        None,
+                        None,
+                    )
+                )
+                snapshot_records.append(
+                    {
+                        "key": canonical_key,
+                        "index": patch_index,
+                        "type": "diff",
+                        "strength": float(strength),
+                        "shape": list(snapshot_diff.shape),
+                        "dtype": str(snapshot_diff.dtype),
+                        "sha256": hashlib.sha256(
+                            snapshot_diff.contiguous()
+                            .view(torch.uint8)
+                            .numpy()
+                        ).hexdigest(),
+                    }
+                )
                 continue
             if type(adapter) is not LoRAAdapter:
                 raise RuntimeError(
@@ -724,7 +752,49 @@ def _effective_lora_provider(model):
                     f"LoRA rank/shape does not match {model_key!r}"
                 )
             patch_count += 1
-        entries_by_canonical[canonical_key] = (model_key, entries)
+            snapshot_weights = tuple(
+                value.detach().to(device="cpu").clone()
+                if isinstance(value, torch.Tensor)
+                else value
+                for value in weights
+            )
+            snapshot_adapter = LoRAAdapter(
+                set(adapter.loaded_keys),
+                snapshot_weights,
+            )
+            snapshot_patches.append(
+                (
+                    float(strength),
+                    snapshot_adapter,
+                    1.0,
+                    None,
+                    None,
+                )
+            )
+            up_snapshot, down_snapshot = snapshot_weights[:2]
+            snapshot_records.append(
+                {
+                    "key": canonical_key,
+                    "index": patch_index,
+                    "type": "lora",
+                    "strength": float(strength),
+                    "alpha": alpha,
+                    "up_shape": list(up_snapshot.shape),
+                    "up_dtype": str(up_snapshot.dtype),
+                    "up_sha256": hashlib.sha256(
+                        up_snapshot.contiguous().view(torch.uint8).numpy()
+                    ).hexdigest(),
+                    "down_shape": list(down_snapshot.shape),
+                    "down_dtype": str(down_snapshot.dtype),
+                    "down_sha256": hashlib.sha256(
+                        down_snapshot.contiguous().view(torch.uint8).numpy()
+                    ).hexdigest(),
+                }
+            )
+        entries_by_canonical[canonical_key] = (
+            model_key,
+            [entries[0], *snapshot_patches],
+        )
 
     cpu = torch.device("cpu")
 
@@ -770,6 +840,19 @@ def _effective_lora_provider(model):
                 f"effective LoRA tensor contains non-finite values: {model_key!r}"
             )
         return tensor
+
+    snapshot_payload = json.dumps(
+        snapshot_records,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    provider.input_fingerprint = hashlib.sha256(snapshot_payload).hexdigest()
+    provider.snapshot_tensor_count = sum(
+        1
+        for record in snapshot_records
+        for name in record
+        if name in ("sha256", "up_sha256", "down_sha256")
+    )
 
     return (
         provider,

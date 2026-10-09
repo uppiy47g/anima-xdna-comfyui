@@ -505,10 +505,20 @@ class ComfyUIXDNAWrapperTests(unittest.TestCase):
             _effective_lora_provider(patcher)
         )
         effective = provider("transformer_blocks.0.attn1.to_q.weight")
+        snapshot_fingerprint = provider.input_fingerprint
+        first.weights[0].fill_(100.0)
+        first.weights[1].fill_(100.0)
+        second.weights[0].fill_(100.0)
+        second.weights[1].fill_(100.0)
+        effective_after_mutation = provider(
+            "transformer_blocks.0.attn1.to_q.weight"
+        )
         self.assertEqual(patch_count, 2)
         self.assertIsInstance(base_fingerprint, str)
         self.assertEqual(base_schema, "comfyui-model-wrapper")
         self.assertEqual(effective.item(), 9.0)
+        self.assertEqual(effective_after_mutation.item(), 9.0)
+        self.assertEqual(provider.input_fingerprint, snapshot_fingerprint)
         self.assertEqual(
             parameters["blocks.0.self_attn.q_proj.weight"].item(),
             1.0,
@@ -538,10 +548,11 @@ class ComfyUIXDNAWrapperTests(unittest.TestCase):
         )
         patcher.model.diffusion_model = FakeAnimaParameters(parameters)
         key = "diffusion_model.blocks.0.self_attn.q_norm.weight"
+        diff = torch.tensor([0.5, -0.25])
         patcher.patches[key] = [
             (
                 0.5,
-                ("diff", (torch.tensor([0.5, -0.25]),)),
+                ("diff", (diff,)),
                 1.0,
                 None,
                 None,
@@ -550,12 +561,15 @@ class ComfyUIXDNAWrapperTests(unittest.TestCase):
 
         provider, patch_count, _, _ = _effective_lora_provider(patcher)
         effective = provider("transformer_blocks.0.attn1.norm_q.weight")
+        diff.zero_()
+        snapshotted = provider("transformer_blocks.0.attn1.norm_q.weight")
 
         self.assertEqual(patch_count, 1)
         torch.testing.assert_close(
             effective.float(),
             torch.tensor([1.25, 0.875]),
         )
+        torch.testing.assert_close(snapshotted.float(), effective.float())
         torch.testing.assert_close(
             parameters["blocks.0.self_attn.q_norm.weight"].float(),
             torch.ones(2),

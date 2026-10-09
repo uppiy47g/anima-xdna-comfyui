@@ -208,6 +208,181 @@ class PackedWeightCacheTests(unittest.TestCase):
             ):
                 cache.open()
 
+    def test_snapshot_provider_builds_effective_cache_in_one_pass(self):
+        config = _tiny_block_config()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkpoint = root / "base.safetensors"
+            base = _block_tensors(config)
+            save_file(
+                {
+                    f"transformer_blocks.0.{name}": tensor
+                    for name, tensor in base.items()
+                },
+                checkpoint,
+            )
+            calls = {"miss": 0, "hit": 0, "legacy": 0}
+
+            def provider(label):
+                def get(key):
+                    calls[label] += 1
+                    return (
+                        base[key.removeprefix("transformer_blocks.0.")]
+                        + 1.0
+                    ).to(torch.bfloat16)
+
+                get.input_fingerprint = "snapshot-identity"
+                return get
+
+            first = PackedWeightCache(
+                checkpoint,
+                config,
+                0,
+                1,
+                root / "cache",
+                effective_tensor_provider=provider("miss"),
+            )
+            first_status = first.open()
+            first.close()
+            reused = PackedWeightCache(
+                checkpoint,
+                config,
+                0,
+                1,
+                root / "cache",
+                effective_tensor_provider=provider("hit"),
+            )
+            reused_status = reused.open()
+            reused.close()
+            legacy_provider = provider("legacy")
+            del legacy_provider.input_fingerprint
+            legacy = PackedWeightCache(
+                checkpoint,
+                config,
+                0,
+                1,
+                root / "legacy-cache",
+                effective_tensor_provider=legacy_provider,
+            )
+            legacy_status = legacy.open()
+            legacy.close()
+
+            self.assertFalse(first_status.hit)
+            self.assertTrue(reused_status.hit)
+            self.assertEqual(first_status.key, reused_status.key)
+            self.assertEqual(first_status.key, legacy_status.key)
+            self.assertEqual(
+                (first_status.path / "weights.bin").read_bytes(),
+                (legacy_status.path / "weights.bin").read_bytes(),
+            )
+            self.assertEqual(calls["miss"], len(base))
+            self.assertEqual(calls["hit"], len(base))
+            self.assertEqual(calls["legacy"], 2 * len(base))
+            self.assertFalse(
+                any(
+                    path.name.startswith(".build-")
+                    for path in (root / "cache").iterdir()
+                )
+            )
+
+    def test_snapshot_provider_reuses_legacy_effective_cache_key(self):
+        config = _tiny_block_config()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkpoint = root / "base.safetensors"
+            base = _block_tensors(config)
+            save_file(
+                {
+                    f"transformer_blocks.0.{name}": tensor
+                    for name, tensor in base.items()
+                },
+                checkpoint,
+            )
+
+            def legacy(key):
+                return (
+                    base[key.removeprefix("transformer_blocks.0.")] + 1.0
+                ).to(torch.bfloat16)
+
+            old = PackedWeightCache(
+                checkpoint,
+                config,
+                0,
+                1,
+                root / "cache",
+                effective_tensor_provider=legacy,
+            )
+            old_status = old.open()
+            old.close()
+            calls = 0
+
+            def snapshot(key):
+                nonlocal calls
+                calls += 1
+                return legacy(key)
+
+            snapshot.input_fingerprint = "snapshot-identity"
+            current = PackedWeightCache(
+                checkpoint,
+                config,
+                0,
+                1,
+                root / "cache",
+                effective_tensor_provider=snapshot,
+            )
+            current_status = current.open()
+            current.close()
+
+            self.assertTrue(current_status.hit)
+            self.assertEqual(old_status.key, current_status.key)
+            self.assertEqual(calls, len(base))
+            manifest = json.loads(
+                (current_status.path / "manifest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(
+                manifest["effective_input_fingerprint"],
+                "snapshot-identity",
+            )
+
+    def test_snapshot_provider_failure_removes_provisional_build(self):
+        config = _tiny_block_config()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkpoint = root / "base.safetensors"
+            base = _block_tensors(config)
+            save_file(
+                {
+                    f"transformer_blocks.0.{name}": tensor
+                    for name, tensor in base.items()
+                },
+                checkpoint,
+            )
+            calls = 0
+
+            def provider(key):
+                nonlocal calls
+                calls += 1
+                if calls == 3:
+                    raise RuntimeError("snapshot failure")
+                return base[key.removeprefix("transformer_blocks.0.")]
+
+            provider.input_fingerprint = "failing-snapshot"
+            cache = PackedWeightCache(
+                checkpoint,
+                config,
+                0,
+                1,
+                root / "cache",
+                effective_tensor_provider=provider,
+            )
+            with self.assertRaisesRegex(RuntimeError, "snapshot failure"):
+                cache.open()
+            self.assertFalse(
+                any((root / "cache").glob(".build-*"))
+            )
+
     def test_effective_weight_cache_normalizes_f16_base_metadata(self):
         config = _tiny_block_config()
         with tempfile.TemporaryDirectory() as directory:
@@ -607,6 +782,54 @@ class PackedWeightCacheTests(unittest.TestCase):
             self.assertEqual(errors, [])
             self.assertEqual(sum(status.hit for status in results), 1)
             self.assertEqual(len({status.key for status in results}), 1)
+
+    def test_concurrent_snapshot_build_has_one_atomic_winner(self):
+        config = _tiny_block_config()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkpoint = root / "model.safetensors"
+            base = _block_tensors(config)
+            save_file(
+                {
+                    f"transformer_blocks.0.{name}": tensor
+                    for name, tensor in base.items()
+                },
+                checkpoint,
+            )
+            results = []
+            errors = []
+
+            def build():
+                try:
+                    def provider(key):
+                        return (
+                            base[key.removeprefix("transformer_blocks.0.")]
+                            + 1.0
+                        ).to(torch.bfloat16)
+
+                    provider.input_fingerprint = "concurrent-snapshot"
+                    results.append(
+                        PackedWeightCache(
+                            checkpoint,
+                            config,
+                            0,
+                            1,
+                            root / "cache",
+                            effective_tensor_provider=provider,
+                        ).ensure()
+                    )
+                except Exception as error:
+                    errors.append(error)
+
+            threads = [threading.Thread(target=build) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+            self.assertEqual(errors, [])
+            self.assertEqual(sum(status.hit for status in results), 1)
+            self.assertEqual(len({status.key for status in results}), 1)
+            self.assertFalse(any((root / "cache").glob(".build-*")))
 
     def test_disabled_mode_creates_nothing(self):
         config = _tiny_block_config()
