@@ -91,6 +91,13 @@ starting ComfyUI. The packed cache defaults to
 4. Connect the returned MODEL to the normal sampler.
 5. Use **Anima XDNA Runtime Status** to inspect cache state, first/warm timing,
    dispatches, transfers, BO population, allocations, and resident reuse.
+
+The attach output and runtime status include an aggregate initial-load profile:
+source, base, and effective-weight fingerprints; cache lookup and payload
+verification; tensor materialization, packing, payload write/hash, manifest
+write, and effective-provider call count. After the first denoising call,
+`last_weight_population_ms` reports process-local XRT BO population. The
+profile does not log model tensors or per-tensor private paths.
 6. Use **Unload Anima XDNA Runtime** before switching checkpoints when an
    immediate release is required. Garbage collection also releases the
    attachment.
