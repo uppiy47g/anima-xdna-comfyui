@@ -42,6 +42,16 @@ class RuntimeDiagnostics:
     chain_runs: int = 0
     resident_reuses: int = 0
     cold_setup_ms: float = 0.0
+    source_loader_total_ms: float = 0.0
+    source_loader_model_ms: float = 0.0
+    attach_total_ms: float = 0.0
+    attach_model_load_ms: float = 0.0
+    lora_snapshot_total_ms: float = 0.0
+    lora_snapshot_clone_ms: float = 0.0
+    lora_snapshot_hash_ms: float = 0.0
+    lora_base_identity_ms: float = 0.0
+    lora_snapshot_bytes: int = 0
+    lora_snapshot_tensor_count: int = 0
     identity_check_ms: float = 0.0
     first_call_total_ms: float = 0.0
     first_chain_ms: float = 0.0
@@ -96,6 +106,9 @@ class SharedRuntime:
         lora_patch_count: int = 0,
         base_model_fingerprint: Optional[str] = None,
         base_model_schema: Optional[str] = None,
+        attach_model_load_ms: float = 0.0,
+        source_loader_total_ms: float = 0.0,
+        source_loader_model_ms: float = 0.0,
     ):
         self.checkpoint = Path(checkpoint)
         self.cache_dir = cache_dir
@@ -109,6 +122,40 @@ class SharedRuntime:
         self._refs = 1
         self._lock = threading.RLock()
         self.diagnostics = RuntimeDiagnostics()
+        self.diagnostics.attach_model_load_ms = attach_model_load_ms
+        self.diagnostics.source_loader_total_ms = source_loader_total_ms
+        self.diagnostics.source_loader_model_ms = source_loader_model_ms
+        if effective_tensor_provider is not None:
+            self.diagnostics.lora_snapshot_total_ms = getattr(
+                effective_tensor_provider,
+                "snapshot_total_ms",
+                0.0,
+            )
+            self.diagnostics.lora_snapshot_clone_ms = getattr(
+                effective_tensor_provider,
+                "snapshot_clone_ms",
+                0.0,
+            )
+            self.diagnostics.lora_snapshot_hash_ms = getattr(
+                effective_tensor_provider,
+                "snapshot_hash_ms",
+                0.0,
+            )
+            self.diagnostics.lora_base_identity_ms = getattr(
+                effective_tensor_provider,
+                "base_identity_ms",
+                0.0,
+            )
+            self.diagnostics.lora_snapshot_bytes = getattr(
+                effective_tensor_provider,
+                "snapshot_bytes",
+                0,
+            )
+            self.diagnostics.lora_snapshot_tensor_count = getattr(
+                effective_tensor_provider,
+                "snapshot_tensor_count",
+                0,
+            )
 
     def prepare(self, diffusion_model) -> None:
         with self._lock:
@@ -126,6 +173,7 @@ class SharedRuntime:
             )
             try:
                 runtime.prepare_weight_cache()
+                self.effective_tensor_provider = None
                 identity = runtime.source_identity
                 if identity is None:
                     raise RuntimeError("packed cache did not expose source identity")
@@ -167,6 +215,8 @@ class SharedRuntime:
                 model_fingerprint = execution_identity["block_fingerprint"]
                 storage_profile = _model_storage_profile(diffusion_model)
             except BaseException:
+                self.effective_tensor_provider = None
+                runtime.effective_tensor_provider = None
                 runtime.close()
                 raise
             self._runtime = runtime
@@ -582,6 +632,10 @@ def _validate_patcher(model):
 
 
 def _effective_lora_provider(model):
+    snapshot_started = time.perf_counter()
+    snapshot_clone_ms = 0.0
+    snapshot_hash_ms = 0.0
+    snapshot_bytes = 0
     patches = getattr(model, "patches", {})
     block_patch_keys = {
         key
@@ -684,7 +738,21 @@ def _effective_lora_provider(model):
                         f"norm diff weights on {model_key!r}"
                     )
                 patch_count += 1
+                clone_started = time.perf_counter()
                 snapshot_diff = diff.detach().to(device="cpu").clone()
+                snapshot_clone_ms += (
+                    time.perf_counter() - clone_started
+                ) * 1000
+                snapshot_bytes += (
+                    snapshot_diff.numel() * snapshot_diff.element_size()
+                )
+                hash_started = time.perf_counter()
+                snapshot_sha256 = hashlib.sha256(
+                    snapshot_diff.contiguous().view(torch.uint8).numpy()
+                ).hexdigest()
+                snapshot_hash_ms += (
+                    time.perf_counter() - hash_started
+                ) * 1000
                 snapshot_patches.append(
                     (
                         float(strength),
@@ -702,11 +770,7 @@ def _effective_lora_provider(model):
                         "strength": float(strength),
                         "shape": list(snapshot_diff.shape),
                         "dtype": str(snapshot_diff.dtype),
-                        "sha256": hashlib.sha256(
-                            snapshot_diff.contiguous()
-                            .view(torch.uint8)
-                            .numpy()
-                        ).hexdigest(),
+                        "sha256": snapshot_sha256,
                     }
                 )
                 continue
@@ -752,12 +816,21 @@ def _effective_lora_provider(model):
                     f"LoRA rank/shape does not match {model_key!r}"
                 )
             patch_count += 1
-            snapshot_weights = tuple(
-                value.detach().to(device="cpu").clone()
-                if isinstance(value, torch.Tensor)
-                else value
-                for value in weights
-            )
+            snapshot_values = []
+            for value in weights:
+                if not isinstance(value, torch.Tensor):
+                    snapshot_values.append(value)
+                    continue
+                clone_started = time.perf_counter()
+                snapshot_value = value.detach().to(device="cpu").clone()
+                snapshot_clone_ms += (
+                    time.perf_counter() - clone_started
+                ) * 1000
+                snapshot_bytes += (
+                    snapshot_value.numel() * snapshot_value.element_size()
+                )
+                snapshot_values.append(snapshot_value)
+            snapshot_weights = tuple(snapshot_values)
             snapshot_adapter = LoRAAdapter(
                 set(adapter.loaded_keys),
                 snapshot_weights,
@@ -772,6 +845,16 @@ def _effective_lora_provider(model):
                 )
             )
             up_snapshot, down_snapshot = snapshot_weights[:2]
+            hash_started = time.perf_counter()
+            up_sha256 = hashlib.sha256(
+                up_snapshot.contiguous().view(torch.uint8).numpy()
+            ).hexdigest()
+            down_sha256 = hashlib.sha256(
+                down_snapshot.contiguous().view(torch.uint8).numpy()
+            ).hexdigest()
+            snapshot_hash_ms += (
+                time.perf_counter() - hash_started
+            ) * 1000
             snapshot_records.append(
                 {
                     "key": canonical_key,
@@ -781,14 +864,10 @@ def _effective_lora_provider(model):
                     "alpha": alpha,
                     "up_shape": list(up_snapshot.shape),
                     "up_dtype": str(up_snapshot.dtype),
-                    "up_sha256": hashlib.sha256(
-                        up_snapshot.contiguous().view(torch.uint8).numpy()
-                    ).hexdigest(),
+                    "up_sha256": up_sha256,
                     "down_shape": list(down_snapshot.shape),
                     "down_dtype": str(down_snapshot.dtype),
-                    "down_sha256": hashlib.sha256(
-                        down_snapshot.contiguous().view(torch.uint8).numpy()
-                    ).hexdigest(),
+                    "down_sha256": down_sha256,
                 }
             )
         entries_by_canonical[canonical_key] = (
@@ -806,10 +885,14 @@ def _effective_lora_provider(model):
         )
         return convert(tensor, inplace=True).detach().contiguous()
 
+    base_identity_started = time.perf_counter()
     base_identity = fingerprint_effective_tensors(
         base_provider,
         range(28),
     )
+    base_identity_ms = (
+        time.perf_counter() - base_identity_started
+    ) * 1000
 
     def provider(canonical_key: str) -> torch.Tensor:
         model_key, entries = entries_by_canonical[canonical_key]
@@ -853,6 +936,13 @@ def _effective_lora_provider(model):
         for name in record
         if name in ("sha256", "up_sha256", "down_sha256")
     )
+    provider.snapshot_total_ms = (
+        time.perf_counter() - snapshot_started
+    ) * 1000
+    provider.snapshot_clone_ms = snapshot_clone_ms
+    provider.snapshot_hash_ms = snapshot_hash_ms
+    provider.base_identity_ms = base_identity_ms
+    provider.snapshot_bytes = snapshot_bytes
 
     return (
         provider,
@@ -938,6 +1028,8 @@ class ModelSourceProvenance:
     selector: str
     path: str
     identity_token: str
+    loader_total_ms: float = 0.0
+    loader_model_ms: float = 0.0
 
     def on_model_patcher_clone(self):
         return self
@@ -1019,12 +1111,17 @@ class LoadAnimaBF16:
         import comfy.sd
         import folder_paths
 
+        loader_started = time.perf_counter()
         category, name = _anima_model_selector(unet_name)
         path = folder_paths.get_full_path_or_raise(category, name)
+        model_load_started = time.perf_counter()
         model = comfy.sd.load_diffusion_model(
             path,
             model_options={"dtype": torch.bfloat16},
         )
+        loader_model_ms = (
+            time.perf_counter() - model_load_started
+        ) * 1000
         diffusion_model = model.model.diffusion_model
         if type(diffusion_model).__name__ != "Anima":
             raise RuntimeError(
@@ -1051,6 +1148,10 @@ class LoadAnimaBF16:
                 selector=unet_name,
                 path=str(resolved),
                 identity_token=_file_identity_token(resolved),
+                loader_total_ms=(
+                    time.perf_counter() - loader_started
+                ) * 1000,
+                loader_model_ms=loader_model_ms,
             ),
         )
         return (model,)
@@ -1107,6 +1208,7 @@ class LoadAttachAnimaXDNAModel:
     def attach(
         self, model, checkpoint, rebuild_cache, cache_dir="", qkv_chaining=True
     ):
+        attach_started = time.perf_counter()
         _validate_patcher(model)
         path = _resolve_attach_checkpoint(model, checkpoint)
         if not path.is_file():
@@ -1117,7 +1219,27 @@ class LoadAttachAnimaXDNAModel:
             raise RuntimeError(
                 "ComfyUI model management is unavailable"
             ) from error
+        model_load_started = time.perf_counter()
         comfy.model_management.load_models_gpu([model])
+        attach_model_load_ms = (
+            time.perf_counter() - model_load_started
+        ) * 1000
+        get_attachment = getattr(model, "get_attachment", None)
+        provenance = (
+            get_attachment(SOURCE_PROVENANCE_KEY)
+            if callable(get_attachment)
+            else None
+        )
+        source_loader_total_ms = (
+            provenance.loader_total_ms
+            if isinstance(provenance, ModelSourceProvenance)
+            else 0.0
+        )
+        source_loader_model_ms = (
+            provenance.loader_model_ms
+            if isinstance(provenance, ModelSourceProvenance)
+            else 0.0
+        )
         (
             effective_tensor_provider,
             lora_patch_count,
@@ -1136,12 +1258,18 @@ class LoadAttachAnimaXDNAModel:
             lora_patch_count,
             base_model_fingerprint,
             base_model_schema,
+            attach_model_load_ms,
+            source_loader_total_ms,
+            source_loader_model_ms,
         )
         try:
             runtime.prepare(model.model.diffusion_model)
         except Exception:
             runtime.close()
             raise
+        runtime.diagnostics.attach_total_ms = (
+            time.perf_counter() - attach_started
+        ) * 1000
         attachment = RuntimeAttachment(runtime)
         patched.set_attachments(ATTACHMENT_KEY, attachment)
         try:
