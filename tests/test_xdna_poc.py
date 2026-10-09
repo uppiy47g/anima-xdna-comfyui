@@ -123,11 +123,17 @@ class PackedWeightCacheTests(unittest.TestCase):
                 checkpoint,
             )
 
-            def provider(offset):
-                return lambda key: (
-                    base[key.removeprefix("transformer_blocks.0.")]
-                    + offset
-                ).to(torch.bfloat16)
+            calls = {"first": 0, "reused": 0, "changed": 0}
+
+            def provider(offset, name):
+                def provide(key):
+                    calls[name] += 1
+                    return (
+                        base[key.removeprefix("transformer_blocks.0.")]
+                        + offset
+                    ).to(torch.bfloat16)
+
+                return provide
 
             first = PackedWeightCache(
                 checkpoint,
@@ -135,7 +141,7 @@ class PackedWeightCacheTests(unittest.TestCase):
                 0,
                 1,
                 root / "cache",
-                effective_tensor_provider=provider(1.0),
+                effective_tensor_provider=provider(1.0, "first"),
             )
             first_status = first.open()
             first_identity = first.execution_identity
@@ -146,7 +152,7 @@ class PackedWeightCacheTests(unittest.TestCase):
                 0,
                 1,
                 root / "cache",
-                effective_tensor_provider=provider(1.0),
+                effective_tensor_provider=provider(1.0, "reused"),
             )
             reused_status = reused.open()
             reused.close()
@@ -156,17 +162,40 @@ class PackedWeightCacheTests(unittest.TestCase):
                 0,
                 1,
                 root / "cache",
-                effective_tensor_provider=provider(2.0),
+                effective_tensor_provider=provider(2.0, "changed"),
             )
             changed_status = changed.open()
             changed.close()
         self.assertFalse(first_status.hit)
         self.assertTrue(reused_status.hit)
+        self.assertEqual(calls["first"], 2 * len(base))
+        self.assertEqual(calls["reused"], len(base))
+        self.assertEqual(calls["changed"], 2 * len(base))
+        self.assertEqual(
+            first_status.timings.effective_tensor_calls,
+            2 * len(base),
+        )
+        self.assertEqual(
+            reused_status.timings.effective_tensor_calls,
+            len(base),
+        )
+        self.assertGreater(first_status.timings.source_fingerprint_ms, 0)
+        self.assertGreater(first_status.timings.effective_fingerprint_ms, 0)
+        self.assertGreater(first_status.timings.base_execution_identity_ms, 0)
+        self.assertGreater(first_status.timings.tensor_materialize_ms, 0)
+        self.assertGreater(first_status.timings.tensor_pack_ms, 0)
+        self.assertGreater(first_status.timings.payload_write_hash_ms, 0)
+        self.assertGreater(first_status.timings.manifest_write_ms, 0)
+        self.assertGreater(reused_status.timings.verify_ms, 0)
+        self.assertGreater(reused_status.timings.manifest_read_ms, 0)
+        self.assertGreater(reused_status.timings.payload_verify_ms, 0)
+        self.assertEqual(reused_status.timings.tensor_materialize_ms, 0)
+        self.assertEqual(reused_status.timings.tensor_pack_ms, 0)
         self.assertEqual(first_status.key, reused_status.key)
         self.assertNotEqual(first_status.key, changed_status.key)
         self.assertNotEqual(
             first_identity["block_fingerprint"],
-            fingerprint_effective_tensors(provider(2.0), range(1))[
+            fingerprint_effective_tensors(provider(2.0, "changed"), range(1))[
                 "block_fingerprint"
             ],
         )
