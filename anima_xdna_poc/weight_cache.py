@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import shutil
 import struct
+import threading
 import time
 from typing import Any, Callable, Iterator, Optional
 import uuid
@@ -59,6 +60,9 @@ class CacheTimings:
     disk_read_ms: float = 0.0
     verify_ms: float = 0.0
     total_ms: float = 0.0
+    verification_lease_hit: bool = False
+    verification_lease_saved_bytes: int = 0
+    verification_lease_lookup_ms: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -76,6 +80,369 @@ class CacheStatus:
 
 class CacheIntegrityError(UnsupportedTensor):
     """A named cache entry exists but failed manifest or payload verification."""
+
+
+@dataclass(frozen=True)
+class _VerifiedPayloadIdentity:
+    entry_path: str
+    cache_key: str
+    manifest_size: int
+    manifest_mtime_ns: int
+    manifest_file_id: int
+    payload_size: int
+    payload_mtime_ns: int
+    payload_file_id: int
+    payload_sha256: str
+
+
+class _VerifiedPayloadRecord:
+    def __init__(self, identity: _VerifiedPayloadIdentity):
+        self.identity = identity
+        self.handle = None
+        self.mapped = None
+        self.references = 0
+
+    def open(self) -> None:
+        if self.mapped is not None:
+            return
+        payload = Path(self.identity.entry_path) / "weights.bin"
+        self.handle = payload.open("rb")
+        self.mapped = mmap.mmap(
+            self.handle.fileno(),
+            0,
+            access=mmap.ACCESS_READ,
+        )
+
+    def close_mapping(self) -> None:
+        if self.mapped is not None:
+            self.mapped.close()
+            self.mapped = None
+        if self.handle is not None:
+            self.handle.close()
+            self.handle = None
+
+
+class _VerifiedPayloadLease:
+    def __init__(
+        self,
+        registry: "_VerifiedPayloadRegistry",
+        record: _VerifiedPayloadRecord,
+    ):
+        self._registry = registry
+        self._record = record
+        self._released = False
+
+    @property
+    def mapped(self):
+        return self._record.mapped
+
+    def release(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        self._registry.release(self._record)
+
+
+class _VerifiedPayloadRegistry:
+    def __init__(self):
+        self._lock = threading.RLock()
+        self._records: dict[
+            _VerifiedPayloadIdentity,
+            _VerifiedPayloadRecord,
+        ] = {}
+
+    def _discard_stale_locked(
+        self,
+        identity: _VerifiedPayloadIdentity,
+    ) -> None:
+        stale = [
+            candidate
+            for candidate, record in self._records.items()
+            if candidate.entry_path == identity.entry_path
+            and candidate != identity
+            and record.references == 0
+        ]
+        for candidate in stale:
+            record = self._records.pop(candidate)
+            record.close_mapping()
+
+    def is_verified(self, identity: _VerifiedPayloadIdentity) -> bool:
+        with self._lock:
+            self._discard_stale_locked(identity)
+            return identity in self._records
+
+    def mark_verified(self, identity: _VerifiedPayloadIdentity) -> None:
+        with self._lock:
+            self._discard_stale_locked(identity)
+            self._records.setdefault(
+                identity,
+                _VerifiedPayloadRecord(identity),
+            )
+
+    def acquire(
+        self,
+        identity: _VerifiedPayloadIdentity,
+    ) -> _VerifiedPayloadLease:
+        with self._lock:
+            self._discard_stale_locked(identity)
+            record = self._records.get(identity)
+            if record is None:
+                raise CacheIntegrityError(
+                    "packed payload was not verified in this process"
+                )
+            entry = Path(identity.entry_path)
+            try:
+                manifest = json.loads(
+                    (entry / "manifest.json").read_text(encoding="utf-8")
+                )
+            except (OSError, ValueError, TypeError) as error:
+                raise CacheIntegrityError(
+                    "cannot read cache manifest during lease acquisition"
+                ) from error
+            if _verified_payload_identity(
+                entry,
+                identity.cache_key,
+                manifest,
+            ) != identity:
+                raise CacheIntegrityError(
+                    "cache payload or manifest changed before lease acquisition"
+                )
+            opened_here = record.mapped is None
+            record.open()
+            if _verified_payload_identity(
+                entry,
+                identity.cache_key,
+                manifest,
+            ) != identity:
+                if opened_here:
+                    record.close_mapping()
+                raise CacheIntegrityError(
+                    "cache payload or manifest changed during lease acquisition"
+                )
+            record.references += 1
+            return _VerifiedPayloadLease(self, record)
+
+    def release(self, record: _VerifiedPayloadRecord) -> None:
+        with self._lock:
+            if record.references <= 0:
+                return
+            record.references -= 1
+            if record.references == 0:
+                record.close_mapping()
+
+    def invalidate(self, entry: Path) -> None:
+        entry_path = str(entry.resolve())
+        with self._lock:
+            matching = [
+                (identity, record)
+                for identity, record in self._records.items()
+                if identity.entry_path == entry_path
+            ]
+            if any(record.references for _, record in matching):
+                raise CacheIntegrityError(
+                    "cannot replace a packed cache entry while it is leased"
+                )
+            for identity, record in matching:
+                self._records.pop(identity)
+                record.close_mapping()
+
+
+_VERIFIED_PAYLOADS = _VerifiedPayloadRegistry()
+
+
+def _verified_payload_identity(
+    entry: Path,
+    key: str,
+    manifest: dict[str, Any],
+) -> _VerifiedPayloadIdentity:
+    manifest_path = entry / "manifest.json"
+    payload_path = entry / "weights.bin"
+    manifest_stat = manifest_path.stat()
+    payload_stat = payload_path.stat()
+    return _VerifiedPayloadIdentity(
+        str(entry.resolve()),
+        key,
+        manifest_stat.st_size,
+        manifest_stat.st_mtime_ns,
+        manifest_stat.st_ino,
+        payload_stat.st_size,
+        payload_stat.st_mtime_ns,
+        payload_stat.st_ino,
+        manifest["payload_sha256"],
+    )
+
+
+def _verify_payload(
+    entry: Path,
+    key: str,
+    manifest: dict[str, Any],
+) -> tuple[float, bool, int, float]:
+    started = time.perf_counter()
+    payload = entry / "weights.bin"
+    expected_size = manifest.get("packed_bytes")
+    if not payload.is_file() or payload.stat().st_size != expected_size:
+        raise CacheIntegrityError(
+            f"cache payload size mismatch: expected {expected_size}"
+        )
+    identity = _verified_payload_identity(entry, key, manifest)
+    lookup_started = time.perf_counter()
+    memoized = _VERIFIED_PAYLOADS.is_verified(identity)
+    lookup_ms = (time.perf_counter() - lookup_started) * 1000
+    if memoized:
+        return (
+            (time.perf_counter() - started) * 1000,
+            True,
+            expected_size,
+            lookup_ms,
+        )
+    digest = hashlib.sha256()
+    with payload.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+            digest.update(chunk)
+    if digest.hexdigest() != manifest.get("payload_sha256"):
+        raise CacheIntegrityError("cache payload SHA-256 mismatch")
+    if _verified_payload_identity(entry, key, manifest) != identity:
+        raise CacheIntegrityError(
+            "cache payload or manifest changed while being verified"
+        )
+    _VERIFIED_PAYLOADS.mark_verified(identity)
+    return (
+        (time.perf_counter() - started) * 1000,
+        False,
+        0,
+        lookup_ms,
+    )
+
+
+class _ProvisionalEffectiveBuild:
+    def __init__(
+        self,
+        root: Path,
+        config: AnimaBlockConfig,
+        source_identity: dict[str, Any],
+    ):
+        root.mkdir(parents=True, exist_ok=True)
+        self.path = root / f".build-{uuid.uuid4().hex}"
+        self.path.mkdir()
+        self.started = time.perf_counter()
+        self.payload = (self.path / "weights.bin").open("wb")
+        self.config = config
+        self.sources = {
+            tensor["key"]: tensor for tensor in source_identity["tensors"]
+        }
+        self.records: list[dict[str, Any]] = []
+        self.logical_bytes = 0
+        self.offset = 0
+        self.payload_hash = hashlib.sha256()
+        self.closed = False
+        self.dimensions = {
+            "hidden": config.hidden_size,
+            "head": config.head_dim,
+            "context": config.context_dim,
+            "adaln": config.adaln_dim,
+            "modulation": 3 * config.hidden_size,
+            "mlp": config.mlp_dim,
+        }
+
+    def add(self, canonical_key: str, tensor: torch.Tensor) -> torch.Tensor:
+        source = self.sources[canonical_key]
+        source_key = source["source_key"]
+        canonical_name = canonical_key.split(".", 2)[2]
+        if canonical_name in LINEAR_SHAPES:
+            out_name, in_name = LINEAR_SHAPES[canonical_name]
+            expected = (self.dimensions[out_name], self.dimensions[in_name])
+        elif canonical_name in NORM_SHAPES:
+            expected = (self.dimensions[NORM_SHAPES[canonical_name]],)
+        else:
+            raise UnsupportedTensor(
+                f"unsupported effective tensor {canonical_key!r}"
+            )
+        if tuple(tensor.shape) != expected:
+            raise UnsupportedTensor(
+                f"{canonical_key!r} has shape {tuple(tensor.shape)}, "
+                f"expected {expected}"
+            )
+        if tensor.dtype not in (
+            torch.bfloat16,
+            torch.float16,
+            torch.float32,
+        ):
+            raise UnsupportedTensor(
+                f"{canonical_key!r} has unsupported dtype {tensor.dtype}"
+            )
+        normalized = tensor.detach().to(torch.bfloat16).contiguous()
+        self.logical_bytes += normalized.numel() * normalized.element_size()
+        block = int(canonical_key.split(".", 2)[1])
+        if canonical_name in LINEAR_SHAPES:
+            for start in range(0, normalized.shape[1], 2048):
+                end = min(start + 2048, normalized.shape[1])
+                packed_shape = _layout_shape(normalized.shape[0], end - start)
+                packed = torch.zeros(packed_shape, dtype=torch.bfloat16)
+                packed[: end - start, : normalized.shape[0]] = (
+                    normalized[:, start:end].T.contiguous()
+                )
+                self._write(
+                    f"{block}:{canonical_name}:k{start}",
+                    canonical_key,
+                    source_key,
+                    tensor,
+                    [end - start, normalized.shape[0]],
+                    packed,
+                )
+        else:
+            self._write(
+                f"{block}:{canonical_name}",
+                canonical_key,
+                source_key,
+                tensor,
+                list(normalized.shape),
+                normalized,
+            )
+        return tensor
+
+    def _write(
+        self,
+        identifier: str,
+        canonical_key: str,
+        source_key: str,
+        source_tensor: torch.Tensor,
+        logical_shape: list[int],
+        packed: torch.Tensor,
+    ) -> None:
+        raw = packed.view(torch.uint8).numpy().tobytes()
+        self.payload.write(raw)
+        self.payload_hash.update(raw)
+        self.records.append(
+            {
+                "id": identifier,
+                "canonical_key": canonical_key,
+                "source_key": source_key,
+                "source_dtype": str(source_tensor.dtype).removeprefix("torch."),
+                "source_shape": list(source_tensor.shape),
+                "logical_shape": logical_shape,
+                "packed_dtype": "bfloat16",
+                "packed_shape": list(packed.shape),
+                "offset": self.offset,
+                "length": len(raw),
+                "sha256": hashlib.sha256(raw).hexdigest(),
+            }
+        )
+        self.offset += len(raw)
+
+    def finish(self) -> None:
+        if self.closed:
+            return
+        self.payload.flush()
+        os.fsync(self.payload.fileno())
+        self.payload.close()
+        self.closed = True
+
+    def cleanup(self) -> None:
+        if not self.closed:
+            self.payload.close()
+            self.closed = True
+        if self.path.exists():
+            shutil.rmtree(self.path)
 
 
 def _package_version(name: str) -> str:
@@ -549,19 +916,54 @@ class PackedWeightCache:
         self.effective_tensor_provider = effective_tensor_provider
         self.manifest: Optional[dict[str, Any]] = None
         self.status: Optional[CacheStatus] = None
-        self._handle = None
+        self._lease: Optional[_VerifiedPayloadLease] = None
         self._mapped = None
 
     def identify(self) -> tuple[str, dict[str, Any], CacheTimings]:
+        key, descriptor, timings, provisional = self._identify(False)
+        if provisional is not None:
+            provisional.cleanup()
+        return key, descriptor, timings
+
+    def _identify(
+        self,
+        build_provisional: bool,
+    ) -> tuple[
+        str,
+        dict[str, Any],
+        CacheTimings,
+        Optional[_ProvisionalEffectiveBuild],
+    ]:
         source, timings = fingerprint_source(self.checkpoint, self.blocks)
         effective_identity = None
         adapter_fingerprints = ()
+        provisional = None
         if self.effective_tensor_provider is not None:
+            if build_provisional:
+                provisional = _ProvisionalEffectiveBuild(
+                    self.root,
+                    self.config,
+                    source,
+                )
+
+            def effective_provider(key: str) -> torch.Tensor:
+                tensor = self.effective_tensor_provider(key)
+                if provisional is not None:
+                    provisional.add(key, tensor)
+                return tensor
+
             effective_started = time.perf_counter()
-            effective_identity = fingerprint_effective_tensors(
-                self.effective_tensor_provider,
-                self.blocks,
-            )
+            try:
+                effective_identity = fingerprint_effective_tensors(
+                    effective_provider,
+                    self.blocks,
+                )
+                if provisional is not None:
+                    provisional.finish()
+            except BaseException:
+                if provisional is not None:
+                    provisional.cleanup()
+                raise
             timings = CacheTimings(
                 fingerprint_ms=timings.fingerprint_ms
                 + (time.perf_counter() - effective_started) * 1000
@@ -588,7 +990,7 @@ class PackedWeightCache:
                 )
             )
             descriptor["effective_execution_identity"] = effective_identity
-        return _descriptor_key(descriptor), descriptor, timings
+        return _descriptor_key(descriptor), descriptor, timings, provisional
 
     @property
     def execution_identity(self) -> Optional[dict[str, Any]]:
@@ -608,44 +1010,58 @@ class PackedWeightCache:
                 f"cannot read cache manifest {entry}: {error}"
             ) from error
 
-    @staticmethod
     def _verify_entry(
+        self,
         entry: Path,
         key: str,
         descriptor: dict[str, Any],
-    ) -> tuple[dict[str, Any], float]:
+    ) -> tuple[dict[str, Any], float, bool, int, float]:
         started = time.perf_counter()
-        manifest = PackedWeightCache._read_manifest(entry)
+        manifest = self._read_manifest(entry)
         if manifest.get("cache_key") != key:
             raise CacheIntegrityError("cache manifest key mismatch")
         if manifest.get("descriptor") != descriptor:
             raise CacheIntegrityError("cache manifest descriptor mismatch")
-        payload = entry / "weights.bin"
-        expected_size = manifest.get("packed_bytes")
-        if not payload.is_file() or payload.stat().st_size != expected_size:
-            raise CacheIntegrityError(
-                f"cache payload size mismatch: expected {expected_size}"
-            )
-        digest = hashlib.sha256()
-        with payload.open("rb") as handle:
-            for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
-                digest.update(chunk)
-        if digest.hexdigest() != manifest.get("payload_sha256"):
-            raise CacheIntegrityError("cache payload SHA-256 mismatch")
-        return manifest, (time.perf_counter() - started) * 1000
+        _, lease_hit, saved_bytes, lookup_ms = _verify_payload(
+            entry,
+            key,
+            manifest,
+        )
+        return (
+            manifest,
+            (time.perf_counter() - started) * 1000,
+            lease_hit,
+            saved_bytes,
+            lookup_ms,
+        )
 
     def ensure(self, rebuild: bool = False) -> CacheStatus:
         total_started = time.perf_counter()
+        if rebuild:
+            self.close()
         if not self.enabled:
             self.status = CacheStatus(
                 "", self.root, False, "disabled", 0, 0, 0, 0, CacheTimings()
             )
             return self.status
-        candidate = (
-            None
-            if rebuild or self.effective_tensor_provider is not None
-            else self._candidate_entry()
+        effective_input_fingerprint = getattr(
+            self.effective_tensor_provider,
+            "input_fingerprint",
+            None,
         )
+        effective_candidate = (
+            self._effective_candidate_entry(effective_input_fingerprint)
+            if not rebuild
+            and self.effective_tensor_provider is not None
+            and effective_input_fingerprint is not None
+            else None
+        )
+        candidate = (
+            self._candidate_entry()
+            if not rebuild and self.effective_tensor_provider is None
+            else None
+        )
+        provisional = None
         if candidate is not None:
             candidate_manifest = self._read_manifest(candidate)
             with ThreadPoolExecutor(max_workers=2) as executor:
@@ -657,7 +1073,13 @@ class PackedWeightCache:
                     self.checkpoint,
                     candidate_manifest,
                 )
-                verified_manifest, verify_ms = verify_future.result()
+                (
+                    verified_manifest,
+                    verify_ms,
+                    lease_hit,
+                    saved_bytes,
+                    lookup_ms,
+                ) = verify_future.result()
                 source_valid, fingerprint_ms = source_future.result()
             if (
                 source_valid
@@ -673,6 +1095,9 @@ class PackedWeightCache:
                     "verified hit",
                     CacheTimings(fingerprint_ms=fingerprint_ms),
                     verify_ms=verify_ms,
+                    verification_lease_hit=lease_hit,
+                    verification_lease_saved_bytes=saved_bytes,
+                    verification_lease_lookup_ms=lookup_ms,
                     total_ms=(time.perf_counter() - total_started) * 1000,
                 )
                 return self.status
@@ -681,12 +1106,32 @@ class PackedWeightCache:
                 and candidate_manifest.get("cache_key") != candidate.name
             ):
                 raise CacheIntegrityError("cache manifest key mismatch")
-            key, descriptor, timings = self.identify()
+            key, descriptor, timings, provisional = self._identify(
+                self.effective_tensor_provider is not None
+                and effective_input_fingerprint is not None
+            )
         else:
-            key, descriptor, timings = self.identify()
+            key, descriptor, timings, provisional = self._identify(
+                self.effective_tensor_provider is not None
+                and effective_input_fingerprint is not None
+                and effective_candidate is None
+            )
         entry = self.entry_path(key)
         if entry.exists() and not rebuild:
-            manifest, verify_ms = self._verify_entry(entry, key, descriptor)
+            (
+                manifest,
+                verify_ms,
+                lease_hit,
+                saved_bytes,
+                lookup_ms,
+            ) = self._verify_entry(entry, key, descriptor)
+            if provisional is not None:
+                provisional.cleanup()
+            self._record_effective_input_fingerprint(
+                entry,
+                manifest,
+                effective_input_fingerprint,
+            )
             self.manifest = manifest
             self.status = self._status(
                 manifest,
@@ -694,13 +1139,29 @@ class PackedWeightCache:
                 "verified hit",
                 timings,
                 verify_ms=verify_ms,
+                verification_lease_hit=lease_hit,
+                verification_lease_saved_bytes=saved_bytes,
+                verification_lease_lookup_ms=lookup_ms,
                 total_ms=(time.perf_counter() - total_started) * 1000,
             )
             return self.status
         lock = self.root / f"{key}.lock"
         with _EntryLock(lock):
             if entry.exists() and not rebuild:
-                manifest, verify_ms = self._verify_entry(entry, key, descriptor)
+                (
+                    manifest,
+                    verify_ms,
+                    lease_hit,
+                    saved_bytes,
+                    lookup_ms,
+                ) = self._verify_entry(entry, key, descriptor)
+                if provisional is not None:
+                    provisional.cleanup()
+                self._record_effective_input_fingerprint(
+                    entry,
+                    manifest,
+                    effective_input_fingerprint,
+                )
                 self.manifest = manifest
                 self.status = self._status(
                     manifest,
@@ -708,12 +1169,35 @@ class PackedWeightCache:
                     "concurrent builder won",
                     timings,
                     verify_ms=verify_ms,
+                    verification_lease_hit=lease_hit,
+                    verification_lease_saved_bytes=saved_bytes,
+                    verification_lease_lookup_ms=lookup_ms,
                     total_ms=(time.perf_counter() - total_started) * 1000,
                 )
                 return self.status
             if entry.exists():
+                _VERIFIED_PAYLOADS.invalidate(entry)
                 shutil.rmtree(entry)
-            manifest, pack_ms = self._build_atomic(entry, key, descriptor)
+            if provisional is not None:
+                manifest, pack_ms = self._finalize_provisional(
+                    provisional,
+                    entry,
+                    key,
+                    descriptor,
+                    effective_input_fingerprint,
+                )
+                provisional = None
+            else:
+                manifest, pack_ms = self._build_atomic(
+                    entry,
+                    key,
+                    descriptor,
+                )
+        self._record_effective_input_fingerprint(
+            entry,
+            manifest,
+            effective_input_fingerprint,
+        )
         self.manifest = manifest
         self.status = self._status(
             manifest,
@@ -724,6 +1208,78 @@ class PackedWeightCache:
             total_ms=(time.perf_counter() - total_started) * 1000,
         )
         return self.status
+
+    def _effective_candidate_entry(
+        self,
+        effective_input_fingerprint: str,
+    ) -> Optional[Path]:
+        if not self.root.is_dir():
+            return None
+        source_files, _ = _source_files(self.checkpoint)
+        current_files = []
+        for source_file in source_files:
+            source_name = _source_name(self.checkpoint, source_file)
+            header_bytes, _, _ = _read_header(source_file)
+            current_files.append(
+                {
+                    "name": source_name,
+                    "size": source_file.stat().st_size,
+                    "header_sha256": hashlib.sha256(header_bytes).hexdigest(),
+                }
+            )
+        current_index = (
+            {
+                "name": self.checkpoint.name,
+                "sha256": hashlib.sha256(
+                    self.checkpoint.read_bytes()
+                ).hexdigest(),
+            }
+            if self.checkpoint.suffix.lower() == ".json"
+            else None
+        )
+        architecture = json.loads(json.dumps(asdict(self.config)))
+        tools = tool_identity()
+        candidates = []
+        for manifest_path in self.root.glob("*/manifest.json"):
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                descriptor = manifest["descriptor"]
+                source_identity = descriptor["source_identity"]
+                if (
+                    manifest.get("effective_input_fingerprint")
+                    == effective_input_fingerprint
+                    and descriptor["architecture"] == architecture
+                    and descriptor["block_range"]
+                    == [self.blocks.start, self.blocks.stop]
+                    and descriptor["tools"] == tools
+                    and descriptor["layout"]["version"] == LAYOUT_VERSION
+                    and source_identity["files"] == current_files
+                    and source_identity.get("index") == current_index
+                ):
+                    candidates.append(manifest_path.parent)
+            except (KeyError, OSError, ValueError, TypeError):
+                continue
+        return candidates[0] if candidates else None
+
+    @staticmethod
+    def _record_effective_input_fingerprint(
+        entry: Path,
+        manifest: dict[str, Any],
+        effective_input_fingerprint: Optional[str],
+    ) -> None:
+        if (
+            effective_input_fingerprint is None
+            or manifest.get("effective_input_fingerprint")
+            == effective_input_fingerprint
+        ):
+            return
+        manifest["effective_input_fingerprint"] = effective_input_fingerprint
+        temporary = entry / f".manifest.{uuid.uuid4().hex}.tmp"
+        temporary.write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary, entry / "manifest.json")
 
     def _candidate_entry(self) -> Optional[Path]:
         if not self.root.is_dir():
@@ -773,22 +1329,21 @@ class PackedWeightCache:
     @staticmethod
     def _verify_payload_only(
         entry: Path,
-    ) -> tuple[dict[str, Any], float]:
+    ) -> tuple[dict[str, Any], float, bool, int, float]:
         started = time.perf_counter()
         manifest = PackedWeightCache._read_manifest(entry)
-        payload = entry / "weights.bin"
-        expected_size = manifest.get("packed_bytes")
-        if not payload.is_file() or payload.stat().st_size != expected_size:
-            raise CacheIntegrityError(
-                f"cache payload size mismatch: expected {expected_size}"
-            )
-        digest = hashlib.sha256()
-        with payload.open("rb") as handle:
-            for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
-                digest.update(chunk)
-        if digest.hexdigest() != manifest.get("payload_sha256"):
-            raise CacheIntegrityError("cache payload SHA-256 mismatch")
-        return manifest, (time.perf_counter() - started) * 1000
+        _, lease_hit, saved_bytes, lookup_ms = _verify_payload(
+            entry,
+            manifest["cache_key"],
+            manifest,
+        )
+        return (
+            manifest,
+            (time.perf_counter() - started) * 1000,
+            lease_hit,
+            saved_bytes,
+            lookup_ms,
+        )
 
     def _status(
         self,
@@ -798,6 +1353,9 @@ class PackedWeightCache:
         timings: CacheTimings,
         pack_ms: float = 0.0,
         verify_ms: float = 0.0,
+        verification_lease_hit: bool = False,
+        verification_lease_saved_bytes: int = 0,
+        verification_lease_lookup_ms: float = 0.0,
         total_ms: float = 0.0,
     ) -> CacheStatus:
         return CacheStatus(
@@ -815,8 +1373,67 @@ class PackedWeightCache:
                 0.0,
                 verify_ms,
                 total_ms,
+                verification_lease_hit,
+                verification_lease_saved_bytes,
+                verification_lease_lookup_ms,
             ),
         )
+
+    def _finalize_provisional(
+        self,
+        provisional: _ProvisionalEffectiveBuild,
+        entry: Path,
+        key: str,
+        descriptor: dict[str, Any],
+        effective_input_fingerprint: Optional[str],
+    ) -> tuple[dict[str, Any], float]:
+        try:
+            effective_identity = descriptor["effective_execution_identity"]
+            manifest = {
+                "cache_key": key,
+                "descriptor": descriptor,
+                "execution_identity": {
+                    "normalization": "BF16",
+                    "source_dtypes": ["BF16"],
+                    "block_fingerprint": effective_identity[
+                        "block_fingerprint"
+                    ],
+                },
+                "source_guard": _source_guard(self.checkpoint),
+                "created_at": time.strftime(
+                    "%Y-%m-%dT%H:%M:%SZ",
+                    time.gmtime(),
+                ),
+                "tensor_count": len(provisional.records),
+                "logical_source_bytes": provisional.logical_bytes,
+                "packed_bytes": provisional.offset,
+                "padding_bytes": (
+                    provisional.offset - provisional.logical_bytes
+                ),
+                "payload_sha256": provisional.payload_hash.hexdigest(),
+                "tensors": provisional.records,
+            }
+            if effective_input_fingerprint is not None:
+                manifest["effective_input_fingerprint"] = (
+                    effective_input_fingerprint
+                )
+            manifest_temp = provisional.path / "manifest.json.tmp"
+            manifest_temp.write_text(
+                json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            os.replace(
+                manifest_temp,
+                provisional.path / "manifest.json",
+            )
+            os.replace(provisional.path, entry)
+            return (
+                manifest,
+                (time.perf_counter() - provisional.started) * 1000,
+            )
+        except BaseException:
+            provisional.cleanup()
+            raise
 
     def _build_atomic(
         self,
@@ -1080,10 +1697,59 @@ class PackedWeightCache:
             raise CacheIntegrityError(
                 "cache BF16 execution identity does not match its source"
             )
-        payload = status.path / "weights.bin"
         started = time.perf_counter()
-        self._handle = payload.open("rb")
-        self._mapped = mmap.mmap(self._handle.fileno(), 0, access=mmap.ACCESS_READ)
+        identity = _verified_payload_identity(
+            status.path,
+            status.key,
+            self.manifest,
+        )
+        if not _VERIFIED_PAYLOADS.is_verified(identity):
+            if status.hit:
+                (
+                    self.manifest,
+                    verify_ms,
+                    lease_hit,
+                    saved_bytes,
+                    lookup_ms,
+                ) = self._verify_entry(
+                    status.path,
+                    status.key,
+                    self.manifest["descriptor"],
+                )
+                status = CacheStatus(
+                    **{
+                        **asdict(status),
+                        "path": status.path,
+                        "timings": CacheTimings(
+                            status.timings.fingerprint_ms,
+                            status.timings.pack_ms,
+                            status.timings.disk_read_ms,
+                            status.timings.verify_ms + verify_ms,
+                            status.timings.total_ms + verify_ms,
+                            (
+                                status.timings.verification_lease_hit
+                                or lease_hit
+                            ),
+                            (
+                                status.timings.verification_lease_saved_bytes
+                                + saved_bytes
+                            ),
+                            (
+                                status.timings.verification_lease_lookup_ms
+                                + lookup_ms
+                            ),
+                        ),
+                    }
+                )
+                identity = _verified_payload_identity(
+                    status.path,
+                    status.key,
+                    self.manifest,
+                )
+            else:
+                _VERIFIED_PAYLOADS.mark_verified(identity)
+        self._lease = _VERIFIED_PAYLOADS.acquire(identity)
+        self._mapped = self._lease.mapped
         elapsed = (time.perf_counter() - started) * 1000
         self.status = CacheStatus(
             **{
@@ -1095,18 +1761,19 @@ class PackedWeightCache:
                     elapsed,
                     status.timings.verify_ms,
                     status.timings.total_ms + elapsed,
+                    status.timings.verification_lease_hit,
+                    status.timings.verification_lease_saved_bytes,
+                    status.timings.verification_lease_lookup_ms,
                 ),
             }
         )
         return self.status
 
     def close(self) -> None:
-        if self._mapped is not None:
-            self._mapped.close()
-            self._mapped = None
-        if self._handle is not None:
-            self._handle.close()
-            self._handle = None
+        self._mapped = None
+        if self._lease is not None:
+            self._lease.release()
+            self._lease = None
 
     def __enter__(self):
         self.open()
@@ -1190,6 +1857,8 @@ class PackedWeightCache:
         if not entry.exists():
             raise CacheIntegrityError(f"cache entry does not exist: {entry}")
         self._verify_entry(entry, key, descriptor)
+        self.close()
+        _VERIFIED_PAYLOADS.invalidate(entry)
         shutil.rmtree(entry)
         return entry
 
@@ -1223,6 +1892,11 @@ def prune_entry(key: str, cache_dir: Optional[Path] = None) -> Path:
     if not entry.is_dir():
         raise CacheIntegrityError(f"cache entry does not exist: {entry}")
     manifest = PackedWeightCache._read_manifest(entry)
-    PackedWeightCache._verify_entry(entry, key, manifest.get("descriptor"))
+    if manifest.get("cache_key") != key:
+        raise CacheIntegrityError("cache manifest key mismatch")
+    if not isinstance(manifest.get("descriptor"), dict):
+        raise CacheIntegrityError("cache manifest descriptor is invalid")
+    _verify_payload(entry, key, manifest)
+    _VERIFIED_PAYLOADS.invalidate(entry)
     shutil.rmtree(entry)
     return entry

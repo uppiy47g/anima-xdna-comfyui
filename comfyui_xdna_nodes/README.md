@@ -16,10 +16,16 @@ ComfyUI still executes:
 - LayerNorm/AdaLN, RMSNorm, softmax, GELU, gates, and residual operations
 - final projection/unpatchify, sampler orchestration, and Qwen Image VAE
 
-XDNA 2 executes 532 Linear/QK/AV GEMM dispatches in the default 28-block
-chain. The self/cross Q/K/V projection groups each run as one `NPUChain`
-dispatch; the optional `qkv_chaining=false` input restores the prior
-644-dispatch path for comparison. Weights, kernel objects, contexts, and BOs
+XDNA 2 executes 448 Linear/QK/AV GEMM dispatches in the default 28-block
+chain. The self/cross Q/K/V projection groups each run as one `NPUChain`,
+and each AdaLN `linear_1 -> linear_2` pair uses one externally bound BF16
+activation BO instead of a D2H/H2D round trip. Shape/dtype-compatible
+activation BOs are leased from a session-owned pool and closed with the session.
+Unsupported pair layouts retain the existing host-visible two-dispatch path.
+The optional `qkv_chaining=false` input disables Q/K/V grouping while retaining
+AdaLN activation chaining, producing 560 dispatches. Disabling both optimizations
+through the Python runtime restores the prior 644-dispatch path for comparison.
+Weights, kernel objects, contexts, and BOs
 remain resident between denoising steps. The wrapper never silently falls
 back to CPU.
 
@@ -156,9 +162,11 @@ On Ryzen AI 9 365 / Strix XDNA 2 (`npu2`), XRT 2.21.75 and Triton-XDNA
 - real Qwen prompt, CFG 3.5, one denoising step: normalized RMS 0.04068
   (the two CFG branches execute sequentially on the single-tenant NPU)
 - decoded 512x512 images: PSNR 36.33 dB, SSIM 0.8458
-- current 28-block Q/K/V-chained path: 532 dispatches and 8,085,045,248 H2D
+- validated 28-block Q/K/V-only chained path: 532 dispatches and 8,085,045,248 H2D
   bytes per denoising step, versus 644 dispatches and 8,349,286,400 H2D bytes
-  with chaining disabled; device-to-host-visible output bytes are unchanged
+  with chaining disabled; activation chaining reduces the expected dispatch
+  count to 448 and reports avoided transfer bytes separately, pending hardware
+  revalidation
 
 Turbo V1.1 was additionally validated from its native 685-tensor BF16
 checkpoint. A real Qwen/Euler/CFG 1 one-step sampler latent passed at
@@ -178,7 +186,11 @@ Base oracle limitation, not a passing Base chain gate.
 
 The first call additionally verifies the 3.96 GB packed cache and populates
 process-local XRT BOs, so cold and warm timings must not be compared as the
-same phase.
+same phase. Within one ComfyUI process, an unchanged payload that has already
+passed full SHA-256 verification reuses an identity-bound verification lease;
+model switching therefore skips the repeated 3.96 GB hash when returning to a
+previously verified cache. XRT BO population remains runtime-local and is not
+covered by this lease.
 
 Measured BF16 loader details, Windows process-memory methodology, the
 stock-FP32/BF16 memory pair, and the end-to-end image/latent comparison are

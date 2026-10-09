@@ -263,15 +263,22 @@ class ComfyUIXDNAWrapperTests(unittest.TestCase):
                     selector="diffusion_models:model.safetensors",
                     path=str(checkpoint.resolve()),
                     identity_token=_file_identity_token(checkpoint),
+                    loader_total_ms=11.0,
+                    loader_model_ms=9.0,
                 ),
             )
             cloned = source.clone()
             with mock.patch.object(SharedRuntime, "prepare"):
-                attached, _ = LoadAttachAnimaXDNAModel().attach(
+                attached, status_json = LoadAttachAnimaXDNAModel().attach(
                     cloned, AUTO_CHECKPOINT, False
                 )
             attachment = attached.get_attachment(ATTACHMENT_KEY)
             self.assertEqual(attachment.runtime.checkpoint, checkpoint.resolve())
+            status = json.loads(status_json)
+            self.assertEqual(status["source_loader_total_ms"], 11.0)
+            self.assertEqual(status["source_loader_model_ms"], 9.0)
+            self.assertGreaterEqual(status["attach_total_ms"], 0.0)
+            self.assertGreaterEqual(status["attach_model_load_ms"], 0.0)
             attachment.cleanup()
 
     def test_attach_auto_requires_loader_provenance(self):
@@ -423,7 +430,11 @@ class ComfyUIXDNAWrapperTests(unittest.TestCase):
         identity.assert_called_once_with(checkpoint)
 
     def test_identity_mismatch_closes_before_runtime_open(self):
-        runtime = SharedRuntime(Path("fixture.safetensors"))
+        provider = mock.Mock()
+        runtime = SharedRuntime(
+            Path("fixture.safetensors"),
+            effective_tensor_provider=provider,
+        )
         chain = mock.Mock()
         chain.source_identity = {
             "schema": "native-model-diffusion-model",
@@ -449,6 +460,8 @@ class ComfyUIXDNAWrapperTests(unittest.TestCase):
             runtime.prepare(Anima())
         chain.prepare_weight_cache.assert_called_once()
         chain.close.assert_called_once()
+        self.assertIsNone(runtime.effective_tensor_provider)
+        self.assertIsNone(chain.effective_tensor_provider)
 
     def test_clones_share_runtime_with_reference_counted_attachments(self):
         runtime = SharedRuntime(Path("fixture.safetensors"))
@@ -505,10 +518,26 @@ class ComfyUIXDNAWrapperTests(unittest.TestCase):
             _effective_lora_provider(patcher)
         )
         effective = provider("transformer_blocks.0.attn1.to_q.weight")
+        snapshot_fingerprint = provider.input_fingerprint
+        first.weights[0].fill_(100.0)
+        first.weights[1].fill_(100.0)
+        second.weights[0].fill_(100.0)
+        second.weights[1].fill_(100.0)
+        effective_after_mutation = provider(
+            "transformer_blocks.0.attn1.to_q.weight"
+        )
         self.assertEqual(patch_count, 2)
         self.assertIsInstance(base_fingerprint, str)
         self.assertEqual(base_schema, "comfyui-model-wrapper")
         self.assertEqual(effective.item(), 9.0)
+        self.assertEqual(effective_after_mutation.item(), 9.0)
+        self.assertEqual(provider.input_fingerprint, snapshot_fingerprint)
+        self.assertEqual(provider.snapshot_tensor_count, 4)
+        self.assertEqual(provider.snapshot_bytes, 16)
+        self.assertGreaterEqual(provider.snapshot_total_ms, 0.0)
+        self.assertGreaterEqual(provider.snapshot_clone_ms, 0.0)
+        self.assertGreaterEqual(provider.snapshot_hash_ms, 0.0)
+        self.assertGreaterEqual(provider.base_identity_ms, 0.0)
         self.assertEqual(
             parameters["blocks.0.self_attn.q_proj.weight"].item(),
             1.0,
@@ -538,10 +567,11 @@ class ComfyUIXDNAWrapperTests(unittest.TestCase):
         )
         patcher.model.diffusion_model = FakeAnimaParameters(parameters)
         key = "diffusion_model.blocks.0.self_attn.q_norm.weight"
+        diff = torch.tensor([0.5, -0.25])
         patcher.patches[key] = [
             (
                 0.5,
-                ("diff", (torch.tensor([0.5, -0.25]),)),
+                ("diff", (diff,)),
                 1.0,
                 None,
                 None,
@@ -550,12 +580,15 @@ class ComfyUIXDNAWrapperTests(unittest.TestCase):
 
         provider, patch_count, _, _ = _effective_lora_provider(patcher)
         effective = provider("transformer_blocks.0.attn1.norm_q.weight")
+        diff.zero_()
+        snapshotted = provider("transformer_blocks.0.attn1.norm_q.weight")
 
         self.assertEqual(patch_count, 1)
         torch.testing.assert_close(
             effective.float(),
             torch.tensor([1.25, 0.875]),
         )
+        torch.testing.assert_close(snapshotted.float(), effective.float())
         torch.testing.assert_close(
             parameters["blocks.0.self_attn.q_norm.weight"].float(),
             torch.ones(2),
@@ -587,11 +620,29 @@ class ComfyUIXDNAWrapperTests(unittest.TestCase):
 
     def test_runtime_snapshot_names_host_visible_output_bytes(self):
         with TemporaryDirectory() as directory:
-            runtime = SharedRuntime(Path(directory) / "checkpoint.safetensors")
-            self.assertEqual(
-                runtime.snapshot()["last_d2h_host_visible_bytes"],
-                0,
+            def provider(_key):
+                return torch.zeros(1)
+
+            provider.snapshot_total_ms = 12.0
+            provider.snapshot_clone_ms = 3.0
+            provider.snapshot_hash_ms = 2.0
+            provider.base_identity_ms = 6.0
+            provider.snapshot_bytes = 1024
+            provider.snapshot_tensor_count = 4
+            runtime = SharedRuntime(
+                Path(directory) / "checkpoint.safetensors",
+                effective_tensor_provider=provider,
+                attach_model_load_ms=7.0,
             )
+            snapshot = runtime.snapshot()
+            self.assertEqual(snapshot["last_d2h_host_visible_bytes"], 0)
+            self.assertEqual(snapshot["attach_model_load_ms"], 7.0)
+            self.assertEqual(snapshot["lora_snapshot_total_ms"], 12.0)
+            self.assertEqual(snapshot["lora_snapshot_clone_ms"], 3.0)
+            self.assertEqual(snapshot["lora_snapshot_hash_ms"], 2.0)
+            self.assertEqual(snapshot["lora_base_identity_ms"], 6.0)
+            self.assertEqual(snapshot["lora_snapshot_bytes"], 1024)
+            self.assertEqual(snapshot["lora_snapshot_tensor_count"], 4)
 
     def test_model_storage_profile_separates_blocks_from_nonblock_parameters(self):
         parameters = fake_anima_parameters(torch.bfloat16)
@@ -719,6 +770,8 @@ class ComfyUIXDNAWrapperTests(unittest.TestCase):
             "anima.safetensors",
         )
         self.assertEqual(provenance.identity_token, "source-identity")
+        self.assertGreaterEqual(provenance.loader_total_ms, 0.0)
+        self.assertGreaterEqual(provenance.loader_model_ms, 0.0)
         comfy_sd.load_diffusion_model.assert_called_once_with(
             "anima.safetensors",
             model_options={"dtype": torch.bfloat16},

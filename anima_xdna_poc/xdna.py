@@ -55,6 +55,38 @@ class DispatchResult:
     weight_population_bytes: int = 0
 
 
+class _ActivationBufferPool:
+    def __init__(self, factory):
+        self._factory = factory
+        self._buffers: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
+        self.allocations = 0
+        self.hits = 0
+
+    @contextmanager
+    def borrow(self, key: tuple[Any, ...]):
+        entries = self._buffers.setdefault(key, [])
+        entry = next((item for item in entries if not item["in_use"]), None)
+        if entry is None:
+            entry = {"buffer": self._factory(key), "in_use": True}
+            entries.append(entry)
+            self.allocations += 1
+            created = True
+        else:
+            entry["in_use"] = True
+            self.hits += 1
+            created = False
+        try:
+            yield entry["buffer"], created
+        finally:
+            entry["in_use"] = False
+
+    def close(self):
+        for entries in self._buffers.values():
+            for entry in entries:
+                entry["buffer"].close()
+        self._buffers.clear()
+
+
 def _imports() -> tuple[Any, Any, Any, Any]:
     try:
         import triton
@@ -175,6 +207,17 @@ class XDNASession:
         self._head_chains = {}
         self._qkv_chains = {}
         self._qkv_output_buffers = {}
+        self._linear_pair_chains = {}
+        self._activation_pool = _ActivationBufferPool(
+            self._create_activation_buffer
+        )
+
+    @staticmethod
+    def _create_activation_buffer(key):
+        from triton.backends.amd_triton_npu import shared
+
+        _, shape, dtype = key
+        return shared.empty(shape, dtype=dtype, device="xrt:0")
 
     def __enter__(self):
         self.triton, _, NPUDriver, _ = _imports()
@@ -197,6 +240,10 @@ class XDNASession:
                 for buffer in buffers:
                     buffer.close()
             self._qkv_output_buffers.clear()
+            for chain in self._linear_pair_chains.values():
+                chain.close()
+            self._linear_pair_chains.clear()
+            self._activation_pool.close()
             if self._compiler is not None:
                 self._compiler.__exit__(exc_type, exc_value, traceback)
         finally:
@@ -530,6 +577,129 @@ class XDNASession:
             )
             if first_call
             else 0,
+        }
+
+    def dispatch_linear_pair_chain(
+        self,
+        first: PreparedLinear,
+        second: PreparedLinear,
+        key: str,
+    ) -> dict[str, Any]:
+        if self.triton is None:
+            raise ExecutionFailure("XDNASession must be entered before dispatch")
+        import numpy as np
+        from triton.backends.amd_triton_npu.multilaunch import NPUChain
+        from .kernel import bf16_linear_kernel
+
+        first_m, first_n, _ = _validate_prepared(first)
+        second_m, _, second_k = _validate_prepared(second)
+        if first_m != second_m or first_n != second_k:
+            raise UnsupportedTensor(
+                "linear-pair intermediate layout is not directly bindable"
+            )
+        signature = (first.padded_shape, second.padded_shape)
+        chain = self._linear_pair_chains.get(signature)
+        if chain is None:
+            chain = NPUChain(
+                "anima_linear_pair_"
+                + "_".join(str(value) for shape in signature for value in shape),
+                air_project_path=str(
+                    Path.home() / ".cache" / "anima-xdna" / "air_project"
+                ),
+            )
+            intermediate = torch.empty((first_m, first_n), dtype=torch.bfloat16)
+            output = torch.empty(second.padded_shape[:2], dtype=torch.float32)
+            transform = str(
+                Path.home() / ".cache" / "anima-xdna" / "transform_aie2p_ascii.mlir"
+            )
+            for item, output_template, argument_map in (
+                (first, intermediate, {0: 0, 1: 1, 2: 2}),
+                (second, output, {0: 2, 1: 3, 2: 4}),
+            ):
+                chain.add(
+                    bf16_linear_kernel,
+                    (
+                        self.triton.cdiv(item.padded_shape[0], 256),
+                        self.triton.cdiv(item.padded_shape[1], 256),
+                    ),
+                    argument_map,
+                    args=(
+                        item.input_bf16,
+                        item.weight_k_n_bf16,
+                        output_template,
+                    ),
+                    constexprs={
+                        "M": item.padded_shape[0],
+                        "N": item.padded_shape[1],
+                        "K": item.padded_shape[2],
+                        "stride_im": item.input_bf16.stride(0),
+                        "stride_ik": item.input_bf16.stride(1),
+                        "stride_wk": item.weight_k_n_bf16.stride(0),
+                        "stride_wn": item.weight_k_n_bf16.stride(1),
+                        "stride_om": output_template.stride(0),
+                        "stride_on": output_template.stride(1),
+                        "BLOCK_M": 256,
+                        "BLOCK_N": 256,
+                        "BLOCK_K": item.padded_shape[2],
+                    },
+                    transform_script=transform,
+                )
+            self._linear_pair_chains[signature] = chain
+
+        arrays = [
+            ResidentXDNASession._bf16_numpy(first.input_bf16),
+            ResidentXDNASession._bf16_numpy(first.weight_k_n_bf16),
+            np.empty(first.padded_shape[:2], dtype=np.dtype("V2")),
+            ResidentXDNASession._bf16_numpy(second.weight_k_n_bf16),
+            np.empty(second.padded_shape[:2], dtype=np.float32),
+        ]
+        populated_keys = getattr(chain, "_anima_populated_keys", set())
+        first_call = key not in populated_keys
+        pool_key = (signature, first.padded_shape[:2], torch.bfloat16)
+        started = time.perf_counter()
+        try:
+            with self._activation_pool.borrow(pool_key) as (
+                intermediate_buffer,
+                buffer_created,
+            ):
+                arrays[2] = intermediate_buffer.numpy()
+                outputs = chain.run(
+                    arrays,
+                    bo_key=key,
+                    static_indices={1, 3},
+                    intermediate_indices={2, 4},
+                    output_indices={4},
+                    bound_buffers={2: intermediate_buffer.bo},
+                )
+            populated_keys.add(key)
+            chain._anima_populated_keys = populated_keys
+        except Exception as error:
+            if _is_compilation_error(error):
+                raise CompilationFailure(
+                    f"Triton-XDNA could not compile the linear pair: {error}"
+                ) from error
+            raise ExecutionFailure(f"XDNA linear-pair execution failed: {error}") from error
+        elapsed = (time.perf_counter() - started) * 1000
+        logical = torch.from_numpy(outputs[4])[
+            : second.rows, : second.out_features
+        ]
+        static_bytes = arrays[1].nbytes + arrays[3].nbytes
+        return {
+            "output": logical.to(torch.bfloat16),
+            "wall_ms": elapsed,
+            "dispatches": 1,
+            "h2d_bytes": arrays[0].nbytes + (static_bytes if first_call else 0),
+            "d2h_bytes": arrays[4].nbytes,
+            "allocation_count": (
+                4 + int(buffer_created) if first_call else int(buffer_created)
+            ),
+            "resident_hits": 0 if first_call else 2,
+            "weight_population_bytes": static_bytes if first_call else 0,
+            "activation_pool_allocations": int(buffer_created),
+            "activation_pool_hits": int(not buffer_created),
+            "external_bound_edges": 1,
+            "avoided_h2d_bytes": arrays[2].nbytes,
+            "avoided_d2h_bytes": arrays[2].nbytes * 2,
         }
 
 
