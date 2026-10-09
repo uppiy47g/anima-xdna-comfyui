@@ -39,8 +39,10 @@ https://note.com/loyal_owl5720/m/m79af97ed02e5
 
 Model weights, packed caches, captured tensors and vendor binaries are not
 distributed. Obtain models from their authorized sources and review their
-separate licenses. LoRA/LLLite patches, quantization, training, and other
-shapes are unsupported.
+separate licenses. Ordinary additive Anima LoRAs and the narrowly scoped
+hybrid Turbo LoRA Q/K norm `.diff` patches described below are supported.
+LLLite, LoHa/LoKr/OFT/DoRA, quantization, training, and other shapes or patch
+formats are unsupported.
 
 ## Installation
 
