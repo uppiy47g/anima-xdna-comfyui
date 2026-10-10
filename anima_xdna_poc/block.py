@@ -168,6 +168,12 @@ def _cpu_runner(_: str, inputs: torch.Tensor, weight: torch.Tensor) -> torch.Ten
     return cpu_linear(prepared).reshape(*shape[:-1], weight.shape[0])
 
 
+def _finalize_linear_outputs(partials, profiles) -> torch.Tensor:
+    if len(profiles) == 1:
+        return profiles[0].output_bf16
+    return torch.stack(partials).sum(dim=0).to(torch.bfloat16)
+
+
 class _BlockExecution:
     def __init__(
         self,
@@ -187,6 +193,8 @@ class _BlockExecution:
         self.qkv_runner = qkv_runner
         self.linear_pair_runner = linear_pair_runner
         self.metrics: list[StageMetric] = []
+        self._adaln_embedded = None
+        self._adaln_activated = None
 
     def host(self, name: str, operation: Callable[[], Any]) -> Any:
         started = time.perf_counter()
@@ -309,7 +317,12 @@ class _BlockExecution:
         embedded: torch.Tensor,
         temb: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        activated = self.host(prefix + ".silu", lambda: F.silu(embedded))
+        if self._adaln_embedded is not embedded:
+            self._adaln_embedded = embedded
+            self._adaln_activated = self.host(
+                prefix + ".silu", lambda: F.silu(embedded)
+            )
+        activated = self._adaln_activated
         pair_names = (prefix + ".linear_1.weight", prefix + ".linear_2.weight")
         if self.linear_pair_runner is not None:
             weights = (self.weights[pair_names[0]], self.weights[pair_names[1]])
@@ -677,7 +690,7 @@ def run_xdna_block(
             ):
                 setattr(runner, "last_" + field, sum(getattr(p, field) for p in profiles))
             runner.last_resident_hits = sum(p.resident_hit for p in profiles)
-            output = torch.stack(partials).sum(dim=0).to(torch.bfloat16)
+            output = _finalize_linear_outputs(partials, profiles)
             return output.reshape(*shape[:-1], weight.shape[0])
 
         def batched_runner(

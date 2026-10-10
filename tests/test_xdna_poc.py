@@ -1309,6 +1309,38 @@ class XDNAPocUnitTests(unittest.TestCase):
 
 
 class AnimaBlockUnitTests(unittest.TestCase):
+    def test_linear_output_finalize_uses_existing_bf16_for_single_dispatch(self):
+        from types import SimpleNamespace
+        from anima_xdna_poc.block import _finalize_linear_outputs
+
+        expected = torch.tensor([[1.0, 2.0]], dtype=torch.bfloat16)
+        fp32 = torch.tensor([[9.0, 9.0]], dtype=torch.float32)
+        actual = _finalize_linear_outputs(
+            [fp32],
+            [SimpleNamespace(output_bf16=expected, output_fp32=fp32)],
+        )
+        self.assertIs(actual, expected)
+
+    def test_linear_output_finalize_sums_split_fp32_once(self):
+        from types import SimpleNamespace
+        from anima_xdna_poc.block import _finalize_linear_outputs
+
+        partials = [
+            torch.tensor([[1.25, 2.5]], dtype=torch.float32),
+            torch.tensor([[3.0, 4.5]], dtype=torch.float32),
+        ]
+        profiles = [
+            SimpleNamespace(output_bf16=part.to(torch.bfloat16))
+            for part in partials
+        ]
+        actual = _finalize_linear_outputs(partials, profiles)
+        self.assertTrue(
+            torch.equal(
+                actual,
+                (partials[0] + partials[1]).to(torch.bfloat16),
+            )
+        )
+
     def test_adaln_linear_pair_matches_host_path_and_reports_saved_transfers(self):
         from anima_xdna_poc.block import _BlockExecution
 
@@ -1368,8 +1400,24 @@ class AnimaBlockUnitTests(unittest.TestCase):
             inputs.embedded_timestep,
             inputs.temb,
         )
+        chained.adaln(
+            "norm2",
+            inputs.hidden_states,
+            inputs.embedded_timestep,
+            inputs.temb,
+        )
+        chained.adaln(
+            "norm3",
+            inputs.hidden_states,
+            inputs.embedded_timestep,
+            inputs.temb,
+        )
         self.assertTrue(torch.equal(actual[0], expected[0]))
         self.assertTrue(torch.equal(actual[1], expected[1]))
+        self.assertEqual(
+            sum(metric.name.endswith(".silu") for metric in chained.metrics),
+            1,
+        )
         metric = next(
             item for item in chained.metrics if item.name == "norm1.linear_pair"
         )
