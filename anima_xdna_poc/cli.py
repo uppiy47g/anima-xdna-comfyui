@@ -321,6 +321,11 @@ def block_main(argv: list[str] | None = None) -> int:
                 "d2h_sync_ms": metric.d2h_sync_ms,
                 "weight_population_ms": metric.weight_population_ms,
                 "weight_population_bytes": metric.weight_population_bytes,
+                "activation_pool_allocations": metric.activation_pool_allocations,
+                "activation_pool_hits": metric.activation_pool_hits,
+                "external_bound_edges": metric.external_bound_edges,
+                "avoided_h2d_bytes": metric.avoided_h2d_bytes,
+                "avoided_d2h_bytes": metric.avoided_d2h_bytes,
             }
             for metric in result.metrics
         ],
@@ -521,6 +526,21 @@ def chain_main(argv: list[str] | None = None) -> int:
             ),
             "weight_population_bytes": sum(
                 metric.weight_population_bytes for metric in metrics
+            ),
+            "activation_pool_allocations": sum(
+                metric.activation_pool_allocations for metric in metrics
+            ),
+            "activation_pool_hits": sum(
+                metric.activation_pool_hits for metric in metrics
+            ),
+            "external_bound_edges": sum(
+                metric.external_bound_edges for metric in metrics
+            ),
+            "avoided_h2d_bytes": sum(
+                metric.avoided_h2d_bytes for metric in metrics
+            ),
+            "avoided_d2h_bytes": sum(
+                metric.avoided_d2h_bytes for metric in metrics
             ),
             "host_operations_ms": sum(
                 metric.wall_ms for metric in metrics if metric.device == "host"
