@@ -528,6 +528,523 @@ projection, and VAE remain on CPU.
 | Turbo 8-step workflow | Measured improvement | 147.56 s -> 139.18 s; image pixel-identical. |
 | Norm/RoPE/softmax/GELU/residual migration | Not implemented | Attention-scale epilogue still has the documented AIR lowering blocker. |
 
+## QK/scale epilogue hardware probe (2026-10-22)
+
+[Triton-XDNA PR 171](https://github.com/amd/Triton-XDNA/pull/171) enables
+an opt-in matmul epilogue schedule. A model-free experiment now successfully
+compiles and executes QK plus scale on npu2 for both Anima attention shapes:
+16 heads of dimension 128, 1024 queries, and 1024 self-attention or 512
+cross-attention keys. The reduction dimension is padded to 256, matching
+the current head-chain path. All variants use one 16-head NPUChain dispatch.
+This is not a complete attention, transformer-block, or ComfyUI measurement.
+
+The isolated environment uses the validated Windows Triton-XDNA
+`3.6.0.2026093004+75679dc` runtime with `matmul_transform.py` and all eight
+transform-library files taken from upstream merge commit
+`b0ecabc1916d32b2242865ca6e563c8508372665`. Compiler packages are
+MLIR-AIR `0.0.1.2026102020+508ca73.no.rtti`, MLIR-AIE
+`1.4.5.dev51+ge040370`, and LLVM-AIE `22.0.0.2026101201+83ba9ea9`.
+The newer Windows wheels tested (`2026102104+f0ec86e` and
+`2026101704+7a8fa24`) failed during import because their NPU language package
+imports the Unix-only `fcntl` module. The successful setup is therefore an
+explicit upstream-transform backport, not an unmodified latest-wheel test.
+The production ComfyUI environment and runtime are unchanged.
+
+The probe uses synthetic normal-distributed BF16 Q/K, seed 424242, and ten
+PyTorch threads. Following an initial seven-repeat experiment, a second
+process reused compiled artifacts, warmed each case three times, and
+measured 21 repeats. The following medians include input staging, NPU
+dispatch/wait, output synchronization, and the remaining host BF16
+conversion/scaling. Input generation/padding, softmax, AV, and image
+generation are excluded. First-call times are recorded separately and are
+not steady timings.
+
+| QK/scale path | Self median | Cross median |
+|---|---:|---:|
+| Unfused QK, FP32 output, host BF16 conversion and scale | 13.0812 ms | 9.2374 ms |
+| Scale epilogue, FP32 output, host BF16 conversion | 11.6198 ms | 8.8022 ms |
+| BF16-before-scale requested in kernel, BF16 output | 7.0383 ms | 5.9075 ms |
+
+The observed reductions are 11.17% / 4.71% for FP32 output and
+46.20% / 36.05% for BF16 output, respectively. BF16 output halves the
+host-visible output byte counts: self 67,108,864 -> 33,554,432, cross
+33,554,432 -> 16,777,216. Dispatch counts and input staging byte counts
+do not change. These are bounded operator observations, not a claimed
+generation speedup.
+
+**Numerical gates did not pass.** Both fused variants differ from the
+same-toolchain unfused control: maximum absolute difference 0.03125 and
+normalized RMS 0.000839748 (self) / 0.000841381 (cross), approximately
+0.084%. Even explicitly requesting the original BF16-before-scale boundary
+does not restore bitwise equality. Generated AIR for the FP32-output case
+shows accumulator and scale operands narrowed to BF16 before the multiply,
+then widened for storage; FP32 output does not imply FP32 epilogue arithmetic.
+
+The fixed CPU elementwise gate (`rtol=0.02, atol=0.03`) fails all six cases,
+including both unfused controls. CPU normalized RMS errors are approximately
+0.99-1.00%; maximum absolute errors are 0.0625 (self) and 0.0703125 (cross).
+The probe records these failures and exits nonzero rather than widening the
+gate. No captured-model, 28-block, latent, or image-quality pass is inferred.
+The result establishes compiler/runtime feasibility and motivates further
+evaluation, but does not enable this path in production.
+
+The [reusable probe](../examples/qk_scale_epilogue_probe.py) and
+[generated repeat-run evidence](evidence/qk-scale-epilogue-probe.json)
+retain the timings, package versions, transform hashes, and numerical
+failures. See the
+[probe instructions](../anima_xdna_poc/README.md#optional-qkscale-epilogue-experiment)
+for reproduction.
+
+## Real-model QK/scale experiment: Turbo V1.1, four steps
+
+The [real-model probe](../examples/qk_scale_model_probe.py) completed on the
+same isolated epilogue-capable toolchain. Conditions were Turbo V1.1 BF16,
+512x512, batch 1, four Euler/simple steps, CFG 1, denoise 1, no LoRA, and
+seed `700755787614899`. The positive prompt was
+`a cheerful anime girl under cherry blossoms, detailed illustration, soft daylight`;
+the negative prompt was `worst quality, low quality, blurry, jpeg artifacts`.
+The Turbo canonical fingerprint matched the validated model.
+
+This uses this checkout's 19-dispatch/block QKV-chained control, not the
+separately installed runtime with additional optimizations behind earlier
+27-second observations. All three variants use identical model weights,
+conditioning, and initial noise. Only QK/scale changes; softmax and AV are
+not fused. Production files and the normal ComfyUI environment are unchanged.
+
+### Warm sampler timing and stage accounting
+
+Three measured samplers per variant rotated order across three repeats.
+Compilation, weight population, tensor capture/comparison, text encoding,
+and VAE decoding are excluded from these instrumented sampler times.
+
+| Path | Median | Range | Reduction vs control |
+|---|---:|---:|---:|
+| Unfused control | 26.452 s | 26.408-26.557 s | - |
+| Scale epilogue, FP32 output | 26.353 s | 26.275-26.445 s | 0.37% |
+| BF16-before-scale requested, BF16 output | 25.083 s | 25.073-25.425 s | 5.18% |
+
+Stage spans below come from the actual median-wall sampler for each variant,
+not independently selected minima. They include allocations within those
+spans. Unclassified time includes everything outside the recorded stage
+spans, including block lifetime/management and sampler work. Its changing
+distribution means that an unrelated stage's change must not be attributed
+to faster arithmetic from QK fusion.
+
+| Stage, total over four steps | Control | FP32 output | BF16 output |
+|---|---:|---:|---:|
+| AdaLN | 1.500 s | 1.507 s | 1.502 s |
+| Self-attention | 9.627 s | 9.945 s | 9.288 s |
+| Cross-attention | 5.816 s | 5.946 s | 5.641 s |
+| MLP | 6.829 s | 8.167 s | 7.969 s |
+| Outside recorded stage spans | 2.681 s | 0.788 s | 0.683 s |
+
+Within attention, self QK plus scale was 2.169 / 2.030 / 1.702 s and cross
+QK plus scale was 1.374 / 1.450 / 1.079 s, in the same variant order.
+The bounded synthetic-kernel reductions therefore do not translate directly
+to full-sampler reductions.
+
+The following low-level counters are **nested inside** the wall times above,
+not additional time. XRT wait includes kernel execution and any runtime
+waiting; it is not a measurement of pure NPU compute or pure idle time.
+
+| Directly instrumented counter, four steps | Control | FP32 output | BF16 output |
+|---|---:|---:|---:|
+| XRT dispatches / wait calls | 2,128 | 2,128 | 2,128 |
+| Host input `copyto` | 0.742 s | 0.744 s | 0.743 s |
+| H2D BO sync | 0.252 s | 0.251 s | 0.254 s |
+| D2H BO sync | 0.339 s | 0.348 s | 0.346 s |
+| XRT start | 0.106 s | 0.108 s | 0.108 s |
+| XRT `wait2` | 10.540 s | 10.668 s | 10.546 s |
+| H2D synchronized BO sizes | 15.354 GiB | 15.354 GiB | 15.354 GiB |
+| D2H synchronized BO sizes | 32.758 GiB | 32.758 GiB | 27.508 GiB |
+
+Every step dispatched 532 times. Resident weight population was zero in
+every timing sample. BF16 output reduced D2H synchronized sizes by 5.25 GiB
+per sampler without reducing dispatches. These sizes are the exact BO sizes
+exposed to synchronization, **not physical bus traffic** on unified memory.
+The first baseline capture took 392.394 s including compilation/setup;
+it is not a performance comparison. Separate VAE decodes took 2.92-2.97 s.
+PNG encoding initially rejected the VAE's `[1,1,512,512,3]` output; the
+single-frame axis handling was fixed and decoding alone was rerun. All
+original sampler measurements and accuracy captures were retained.
+
+### Error propagation and fixed gates
+
+All 28 outputs were compared at each of the four actual denoising inputs.
+The CPU oracle is the existing **BF16 CPU block chain** on each captured
+input, not a stock-FP32 CPU sampler. The fixed Turbo policy remains 10%
+maximum intermediate NRMS and 2% final-block NRMS.
+
+Both fused variants produced bitwise-identical final latents to each other,
+but not to the control. Their per-block comparison results were also the
+same. The following NRMS values are percentages; the final-block columns
+refer to block 28, before final projection/unpatchify and sampler updates.
+
+| Denoising step | Control vs CPU, final block | Fused vs CPU, final block | Fused vs control, same-input final block | Fused vs control, independent-trajectory final block |
+|---|---:|---:|---:|---:|
+| 1 | 1.168% | 1.148% | 0.765% | 0.765% |
+| 2 | 3.511% | 3.309% | 2.637% | 3.454% |
+| 3 | 3.545% | 3.826% | 3.646% | 6.829% |
+| 4 | 2.277% | 2.273% | 2.057% | 8.218% |
+
+**Neither control nor fused paths pass the CPU chain gate across all four
+inputs:** step 1 passes, while steps 2-4 exceed the 2% final-block threshold.
+Maximum intermediate CPU NRMS stays below 10% (8.31% control, 9.26% fused).
+The same-input fused/control worst intermediate difference is 8.33%.
+With independent sampler feedback, it grows to 74.74% transiently inside
+step 4, even though that step's final-block difference is 8.22%.
+
+After the entire sampler, each fused final latent differs from control by
+**18.640% NRMS**, maximum absolute error 2.584403, and mean absolute error
+0.137809. Decoded RGB MAE is 9.937568 on the 0-255 scale; this is an image
+difference measurement, not a perceptual-quality pass. All three measured
+repeats reproduced the same recorded final-latent error metrics for their
+variant; control repeats were bitwise equal to the captured control.
+
+The [sanitized machine-readable evidence](evidence/qk-scale-model-probe.json)
+retains all 28-block comparisons, callback/latent errors, unchanged gate
+outcomes, and all nine aggregate timing profiles. Actual inputs, weights,
+latents, and images remain private local artifacts.
+
+**Conclusion:** QK/scale compilation and actual-model execution work, but
+this change alone does not approach the 12-second target and does not
+preserve the control output. The control's additional-step CPU gate failures
+also prevent interpreting this as a validated CPU-equivalent full sampler.
+No production enablement or relaxed numerical threshold follows from this
+experiment.
+
+## Separate BF16 direct-output comparison
+
+The earlier BF16 path explicitly requested BF16-before-scale *and* fused
+scale. Two additional paths now separate the output dtype from scale
+fusion:
+
+| Mode | Requested operation order |
+|---|---|
+| `baseline` | FP32 QK output, host BF16 cast, host scale |
+| `qk_bf16` | QK directly stored as BF16, unchanged host scale |
+| `scale_fp32` | Scale epilogue, FP32 output, host BF16 cast |
+| `direct_bf16` | Accumulator times scale, directly stored as BF16; no explicit pre-scale cast |
+| `legacy_bf16` | Explicit BF16-before-scale requested, BF16 output |
+
+The same 16-head self/cross shapes, synthetic seed 424242, ten CPU threads,
+three warm-ups, and 21 measured calls per case were used. Variants ran in
+the listed fixed order per shape. Times include staging, dispatch/wait,
+readback, and remaining host work, but exclude input padding, softmax, AV,
+and full-model execution.
+
+| Mode | Self total median | Cross total median | Self / cross D2H-visible output |
+|---|---:|---:|---:|
+| `baseline` | 12.5720 ms | 9.3508 ms | 64 / 32 MiB |
+| `qk_bf16` | 10.4116 ms | 8.1951 ms | 32 / 16 MiB |
+| `scale_fp32` | 11.4649 ms | 9.1898 ms | 64 / 32 MiB |
+| `direct_bf16` | 7.3070 ms | 5.9811 ms | 32 / 16 MiB |
+| `legacy_bf16` | 7.0800 ms | 6.0451 ms | 32 / 16 MiB |
+
+**QK-only BF16 direct output preserves the control's rounding in this
+experiment.** Both the unscaled BF16 QK hashes and the final host-scaled
+values are bitwise equal to control for both shapes. Operator time decreases
+17.18% self / 12.36% cross. It removes the host numerical cast and halves
+the synchronized output BO size, while keeping host scaling and one
+dispatch. H2D sizes remain 16 MiB self / 12 MiB cross.
+
+Host phases were timed separately rather than inferred from a difference
+between complete calls:
+
+| Host phase, self / cross medians | Control | QK-only BF16 | Scale then direct BF16 |
+|---|---:|---:|---:|
+| FP32-to-BF16 numerical cast | 2.0954 / 1.0695 ms | 0 / 0 ms | 0 / 0 ms |
+| BF16 host scale | 1.7184 / 0.8187 ms | 1.5348 / 0.6990 ms | 0 / 0 ms |
+| NumPy/Torch wrapper and bit view | 0.0482 / 0.0489 ms | 0.0824 / 0.0824 ms | 0.0871 / 0.0850 ms |
+
+A zero host-cast time means that no numerical host cast is called, not that
+all conversion is free: the NPU still converts the FP32 accumulator for its
+BF16 store, and that work is inside chain time. BF16 host views are zero-copy
+reinterpretations but have nonzero wrapper overhead. Phase medians are
+selected independently and need not sum exactly to the total median.
+Output sizes are synchronization exposure, not measured physical bus bytes.
+
+**Removing the explicit pre-scale BF16 cast does not fix fused rounding.**
+`direct_bf16` still differs from control by maximum absolute 0.03125 and
+NRMS 0.083975% self / 0.084138% cross. Its generated AIR narrows both
+accumulator and scale operands before `arith.mulf ... vector<16xbf16>`;
+the source request therefore does not establish FP32-scale-then-round
+semantics. In contrast, QK-only direct output's epilogue contains the output
+cast without that multiply. The CPU reference also demonstrates that the
+two ideal rounding orders are not interchangeable (about 0.279% NRMS on
+these inputs).
+
+In this toolchain, trying QK-only BF16 output with the *plain* matmul
+transform first failed with an L3 `memref.alloc` inside `air.segment`.
+Selecting `epilogue=True` for the output cast compiled and ran successfully
+without adding scale. This is an explicitly recorded schedule correction,
+not a fallback to FP32 output.
+
+The fixed CPU elementwise gate remains `rtol=0.02, atol=0.03` and fails all
+ten cases, including control. Output preservation relative to control is
+not a CPU-equivalence pass. Full timings, hashes, reference comparisons,
+and lowered arithmetic excerpts are in the
+[direct-output evidence](evidence/qk-direct-bf16-probe.json).
+
+### Direct output on the fixed-seed real model
+
+A separate complete run used the same Turbo V1.1 / 512x512 / four-step
+Euler/simple / CFG 1 / seed `700755787614899` conditions, now selecting
+`baseline`, `qk_bf16`, and `direct_bf16`. It captured all 28 outputs at every
+step, compared same-input replays and independent sampler trajectories,
+reran the BF16 CPU chain oracles, and measured three rotated samplers per
+variant. The new control's final latent was bitwise equal to the previous
+experiment's control.
+
+| Path | Warm sampler median | Range, three runs | Final latent NRMS vs control | RGB MAE vs control |
+|---|---:|---:|---:|---:|
+| Control | 25.821 s | 25.404-26.087 s | 0% | 0 |
+| QK-only BF16 output, CPU scale | 25.487 s | 24.976-26.436 s | **0%, bitwise equal** | **0, pixel equal** |
+| Scale then direct BF16 output | 24.726 s | 23.956-24.903 s | 18.640% | 9.937568 |
+
+The QK-only direct path was **bitwise equal at all 112 block outputs** in
+both comparison modes, all sampler callbacks, the final latent, and the
+decoded image. All three timed QK-only runs also produced a bitwise-equal
+final latent to control. The scale-then-direct path's final latent was
+bitwise equal to the previous explicit-BF16-before-scale fused variant,
+not to control; removing that explicit cast did not recover the output.
+
+QK-only direct output reduced the median by 1.29% (0.334 s), but the run
+ranges overlap and one rotated repeat was slower than its control. This
+small full-sampler difference is **not a demonstrated robust speedup**;
+the 17.18% / 12.36% operator reductions must not be extrapolated to image
+generation. Scale-then-direct output reduced this run's median by 4.24%
+while retaining the previously observed numerical change.
+
+Both BF16-output paths reduced D2H synchronized sizes from 32.758 to
+27.508 GiB per four-step sampler, a 5.25 GiB reduction. H2D sizes remained
+15.354 GiB, dispatches remained 2,128, and all timed weight population was
+zero. The unchanged CPU final-block gate still failed steps 2-4 for control
+and both variants: preserving the control does not repair its pre-existing
+CPU discrepancy. No production runtime was changed.
+
+The [real-model direct-output evidence](evidence/qk-direct-bf16-model-probe.json)
+retains every comparison and all nine aggregate timing profiles. Reproduce
+the operator comparison with `--threads 10 --warmups 3 --runs 21 --modes
+baseline qk_bf16 scale_fp32 direct_bf16 legacy_bf16` on the model-free probe.
+For the full real-model command above, append
+`--modes baseline qk_bf16 direct_bf16` and use a new private work directory.
+
+## Epilogue precision: source trace and cast-removal experiment
+
+The BF16 multiply is an explicit transform in the tested PR 171 revision,
+not merely inferred from output differences. At pinned commit
+`b0ecabc1916d32b2242865ca6e563c8508372665`,
+[`epilogue.mlir`](https://github.com/amd/Triton-XDNA/blob/b0ecabc1916d32b2242865ca6e563c8508372665/amd_triton_npu/backend/transform_library/epilogue.mlir)
+calls `@cast_bf16_only_ops` after linearizing the epilogue vectors.
+[`type_casting.mlir`](https://github.com/amd/Triton-XDNA/blob/b0ecabc1916d32b2242865ca6e563c8508372665/amd_triton_npu/backend/transform_library/type_casting.mlir)
+explicitly matches `arith.mulf` and applies
+`transform.air.vector_type_cast` with `target_element_type = bf16`.
+
+A controlled trace used one representative head for each self/cross shape,
+with both FP32-output and direct-BF16-output scale kernels. All eight
+lowerings explicitly set `bf16_emulation=False`. The four default cases
+converted input scalar `arith.mulf ... : f32` into
+`arith.mulf ... : vector<16xbf16>`. Replacing only the epilogue helper call
+with its vector-linearization portion, omitting the arithmetic cast, left
+`arith.mulf ... : vector<16xf32>` in all four corresponding cases.
+Thus, neither disabling BF16 emulation nor selecting FP32 output disables
+the epilogue's separate precision conversion. The inspected generator has
+no epilogue-multiply-precision argument; `accum_type="f32"` controls the
+matmul contraction accumulator, not this cast.
+
+The cast-disabled cross-attention FP32-output case was then compiled for
+`npu2`. It failed during AIEVec legalization in `aiecc`:
+
+```text
+aievec.mul_elem conversion is not supported for AIE2p.
+failed to legalize operation 'aievec.mul_elem'
+vector<16xf32>, vector<16xf32> -> vector<16xf32>
+```
+
+Removing the transform therefore preserves FP32 in intermediate AIR but
+is **not a working FP32 epilogue solution on the tested toolchain**.
+No cast-disabled binary was executed or used for performance/quality claims.
+This result is specific to this XDNA AIE2P vector path, not all Triton
+backends or every possible scalar/custom AIE implementation.
+
+The [precision-trace evidence](evidence/qk-epilogue-precision-trace.json)
+records the eight before/after comparisons and the compile failure.
+
+## Direct MLIR-AIR tiled attention experiment
+
+The hot path now has an **opt-in experimental** direct AIR implementation in
+[`examples/air_attention.py`](../examples/air_attention.py). QK, scale,
+online softmax and AV execute tile-by-tile in one XRT dispatch per attention
+call. The host ABI contains only BF16 Q/K/V and the final BF16 output.
+There are no complete score/probability host buffers or intermediate
+readbacks. Production block code and defaults remain unchanged.
+
+The custom AIR schedule reuses MIT-licensed AMD AIE microkernels from
+MLIR-AIR revision `508ca731ef0384fd3729ac1688e0b5d9a0ef5efe`. This is direct
+AIR orchestration, not Triton attention compilation or a claim of newly
+authored microkernels. The pinned sources, compile flags, source/artifact
+digests, and full measurement counters are recorded in the
+[sampler evidence](evidence/air-attention-model-probe.json) and
+[complete-hot-path evidence](evidence/air-attention-hotpath-probe.json).
+See the [reproduction commands](../anima_xdna_poc/README.md#opt-in-direct-mlir-air-attention).
+
+### Schedule and device constraints
+
+Both 16-head Anima shapes use query length 1024, head depth 128, a
+32-query/64-key tile, four query cores per head, and two simultaneous heads.
+Self-attention has 1024 keys; cross-attention has 512. Q/K/V and the output
+are staged through memtiles; score tiles, numerator and online-softmax row
+state stay in core memory. Explicit buffers total 53,504 bytes/core,
+excluding a 4 KiB stack and compiler allocation padding.
+
+K and V have separate memtile staging allocations and alternate through
+one core buffer. Sharing the inbound memtile allocation between distinct
+K/V channels caused device timeouts in an earlier attempt; separate
+allocations resolved repeated execution. Four simultaneous heads failed
+placement with insufficient shim DMA capacity. The measured two-head
+schedule executes successfully; the CLI does not silently fall back.
+
+K/V are streamed again for every 128-query group. Eliminating full matrix
+readbacks is therefore **not** a claim of eliminating internal DMA or
+retaining all heads' K/V permanently on chip. Masks are explicitly rejected.
+
+### Complete hot path and four-step sampler
+
+The real-model conditions are unchanged: Turbo V1.1, 512x512, four
+Euler/simple steps, CFG 1, seed `700755787614899`, established prompts,
+ten CPU threads, BF16 model, and QKV chaining. The paired control is this
+checkout's 19-dispatch/block runtime, not the separately installed optimized
+runtime behind earlier user observations.
+
+Three warmed sampler runs per mode rotated their execution order. Input
+capture, tensor comparisons, text/model setup and separate VAE decode are
+excluded. The sampler ranges did not overlap:
+
+| Measurement | Control | Direct AIR |
+|---|---:|---:|
+| Warm four-step sampler median | 27.095 s | 18.765 s |
+| Three-run range | 26.136-27.101 s | 18.388-19.157 s |
+| XRT dispatches/block | 19 | 17 |
+| XRT dispatches/four steps | 2,128 | 1,904 |
+| H2D synchronized BO sizes/four steps | 15.354 GiB | 6.604 GiB |
+| D2H synchronized BO sizes/four steps | 32.758 GiB | 16.133 GiB |
+
+The measured sampler median fell by **8.330 s / 30.74%**. This is not a
+12-second result or a full browser/API prompt measurement. VAE decoding
+was separate, about 3.5 seconds in the capture runs. Sync byte counts are
+cache-maintenance exposure on the unified-memory device, not physical
+discrete-device bus traffic.
+
+Twelve private actual Q/K/V captures cover self/cross attention at blocks
+0, 13 and 27 of steps 0 and 3. Each complete attention path was warmed three
+times and measured 21 times/mode with alternating control/AIR order.
+The control includes existing NPU QK, CPU BF16 scale/FP32 softmax, and NPU AV;
+all host preparation and output conversion are inside the timed call:
+
+| Whole attention wall, median of six case medians | Control | Direct AIR |
+|---|---:|---:|
+| Self | 44.823 ms | 20.173 ms |
+| Cross | 28.952 ms | 12.332 ms |
+| Self H2D / D2H synchronized buffers/call | 64 / 96 MiB | 12 / 4 MiB |
+| Cross H2D / D2H synchronized buffers/call | 36 / 64 MiB | 8 / 4 MiB |
+
+All twelve controls reproduced their captured attention outputs bitwise;
+all 21 repeated outputs per case/mode were bitwise stable. The hot-path
+case medians ranged from 44.180-65.936 ms control versus 19.567-21.461 ms
+AIR for self, and 28.418-33.320 ms versus 11.816-15.402 ms for cross.
+
+In the median sampler profiles, summed self QK/scale/softmax/AV spans fell
+from 5.695 s to 2.181 s, and cross spans from 3.593 s to 1.381 s. The tiny
+AIR-mode scale/softmax host spans are identity-handle bookkeeping, not CPU
+matrix processing. Across the entire sampler, individually measured NumPy
+copy time fell from 0.733 s to 0.305 s; H2D sync from 0.236 s to 0.117 s,
+D2H sync from 0.335 s to 0.248 s, XRT start from 0.117 s to 0.088 s, and
+XRT wait from 9.366 s to 7.967 s. Wait includes device execution/runtime
+waiting, not pure compute. These are nested counters, not additive
+components of wall time. Stage spans do not cover every allocation and
+sampler boundary, so the full 8.330-second difference is not attributed
+solely to a measured DMA or softmax component.
+
+### Numerical outcome: not production-ready
+
+The prototype uses BFP16-emulated BF16 matmuls, BF16 block outputs and
+online-softmax state, with scale combined into the exponential path. This
+changes rounding/order relative to the control's full BF16 score matrix
+and FP32 host softmax. Successful compilation and lower latency do not
+establish equivalent attention.
+
+Actual attention output NRMS against the separate BF16 CPU reference
+ranged from **0.922%-5.397% self** and **3.133%-3.893% cross**. Only 3 of 12
+cases passed the additional explicit 2% attention-output CPU gate. Against
+captured NPU attention, ranges were 0.820%-5.479% self and 2.468%-3.624%
+cross. The FP32 SDPA comparisons are also preserved separately.
+
+All 28 blocks at all four steps were compared for both same-input replay
+and independent sampler trajectories. AIR's final block NRMS against the
+same-input NPU control was 1.190%, 4.278%, 5.268% and 2.727% across steps.
+The unchanged BF16 CPU chain policy (10% maximum intermediate / 2% final)
+passed step 0 and failed steps 1-3 for **both control and AIR**. These
+pre-existing control failures do not excuse the additional AIR drift.
+
+With independent sampler feedback, final latent NRMS versus control was
+**29.035%**; all three timed AIR runs reproduced that same changed latent.
+Decoded RGB MAE was **15.975/255**, not image equivalence. The prototype is
+therefore retained only as an explicit experiment; no production switch
+was enabled and no quality or 12-second target was declared achieved.
+The next required work is numerical fidelity of the matmul/online-softmax
+path before increasing concurrency or integrating it into production.
+
+During validation an initial process-local AIR host hook also bypassed
+CPU-oracle softmax. The hook was restricted to `runner_device="xdna2"`,
+all four CPU chains were recomputed without probe hooks, and all 112 AIR
+same-input replay comparisons were rechecked unchanged. The evidence
+contains only corrected CPU results, records that recovery, and retains
+the original unaffected sampler timings and image/latent measurements.
+
+### User-directed live deployment
+
+After reviewing the numerical limitations, the user explicitly requested
+AIR as the **standard route in their actual ComfyUI environment** so that
+they can evaluate generated images themselves. The runtime now has a native,
+instance-scoped AIR attention callback, selected by
+`ANIMA_XDNA_AIR_ATTENTION_DIR` and `ANIMA_XDNA_ATTENTION_BACKEND`; see the
+[native runtime instructions](../anima_xdna_poc/README.md#native-comfyui-air-execution).
+This supersedes the earlier experiment-only integration for that local
+deployment, not the numerical findings or the repository's unconfigured
+baseline default.
+
+The live deployment uses persistent copies of the measured self/cross ELFs,
+with SHA-256 verification, rather than paths into session scratch storage.
+It retains the prior custom-node junction as a backup, does not modify
+its original checkout or upgrade the normal Python environment's compiler
+packages, and allows an explicit baseline restart. Runtime diagnostics name
+the selected backend and first use emits the precision warning.
+
+In the actual ComfyUI interpreter (the older AIR/AIE compiler packages still
+installed), both precompiled ELFs executed and all four real-input
+28-block native chains reproduced the prototype's measured per-block
+control differences. Each chain used 476 dispatches, i.e. 17 per block,
+without host QK/softmax stages. These replay checks are compatibility and
+integration evidence, not new warm-sampler performance measurements or a
+quality pass.
+
+The running normal ComfyUI server also completed actual API-workflow
+generation with the native nodes, KSampler and VAE decode. At the original
+fixed seed its saved 512x512 RGB image was **pixel-identical to the measured
+AIR prototype image**, not the control image (MAE versus control remained
+15.975/255). A second, different-seed request confirmed resident runtime reuse,
+`attention_backend="air_experimental"` and 476 dispatches per model evaluation.
+
+These normal-environment observations were a 56.22-second cold prompt and
+a 28.98-second resident prompt, with roughly 31.6 and 24.1 seconds of
+sampling respectively; the resident request used seed `700755787614900`.
+They are single operational checks, not a repeated paired benchmark.
+In particular, the isolated environment's 18.765-second median must **not**
+be presented as the measured speed of the deployed normal environment.
+The local launcher/configuration and generated images are retained outside
+the repository for the user's direct evaluation.
+
 ## Public verification ladder
 
 Set placeholders only in the current shell; do not commit paths or captures.

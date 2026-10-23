@@ -1,0 +1,399 @@
+{
+  "created_at": "2026-10-22T01:01:42.908757+00:00",
+  "status": "completed_with_cpu_gate_failures",
+  "input": "seeded synthetic BF16 Q/K, unit-scale normal, no model weights",
+  "heads": 16,
+  "head_dim": 128,
+  "padded_head_dim": 256,
+  "seed": 424242,
+  "warmups": 3,
+  "runs": 21,
+  "torch_threads": 10,
+  "timing_scope": "NPUChain input staging, dispatch/wait, output sync, and host BF16 conversion/scaling; excludes input generation/padding, softmax, AV, and complete image generation",
+  "packages": {
+    "torch": "2.14.1+cpu",
+    "triton-xdna": "3.6.0.2026093004+75679dc",
+    "mlir-air": "0.0.1.2026102020+508ca73.no.rtti",
+    "mlir-aie-no-rtti": "1.4.5.dev51+ge040370",
+    "llvm-aie": "22.0.0.2026101201+83ba9ea9"
+  },
+  "generator_sha256": "75a8bbebd08b9d3cb3bc0f6f280b325770fc38b4ec6af8d898ba0f069495c3ab",
+  "transform_library_sha256": {
+    "air_mapping.mlir": "b75ab346a0e76ca9c25a6b532aa98cb840a52940271c5f43f4d3b2c5c65e0b45",
+    "bufferization.mlir": "15845c8bc051bdfe10469a0721d6135567aa6c8b80d89929a4460a8086bfd9e8",
+    "canonicalization.mlir": "dacadbe4b24bdfdc17188153e962f79c5ddc4200c588297bfddd8c7b78f00dcd",
+    "elementwise.mlir": "3fadc46d2973aaceefc12a521ae62fa61d4b19c26217b0f577c44307b2b37b81",
+    "epilogue.mlir": "124c311fec67039dad6c1fbe53f0bbc8a9c5d52c91d49ec3cd05f21f82afc47f",
+    "fold_add.mlir": "9aaf4dc16094b59999d16e4d9eef41504ac6fda3ae2fa6aef679844c19060466",
+    "type_casting.mlir": "aeb9496ac4d97f93c2877a1e5ff503e682af5018e19f5b46833acdaef0f2de78",
+    "vectorization.mlir": "48e799c8021e3c4d00c29485802919ebaed95d1aa2c73cea86e72830812c700e"
+  },
+  "cpu_elementwise_gate": {
+    "rtol": 0.02,
+    "atol": 0.03
+  },
+  "cases": [
+    {
+      "attention": "self",
+      "q_shape": [
+        16,
+        1024,
+        128
+      ],
+      "k_shape": [
+        16,
+        1024,
+        128
+      ],
+      "mode": "baseline",
+      "compile_and_first_ms": 1784.43070000003,
+      "warm_ms": [
+        12.951000000157364,
+        13.142899999820656,
+        13.018000000101893,
+        13.404099999888786,
+        13.049800000089817,
+        13.01540000008572,
+        13.319400000000314,
+        13.449999999920692,
+        13.081199999987803,
+        12.949599999956263,
+        12.884399999848029,
+        12.941200000113895,
+        16.006900000093083,
+        13.539900000068883,
+        13.138399999888861,
+        13.059299999895302,
+        13.044999999920037,
+        12.997699999914403,
+        13.125699999818607,
+        13.198200000033466,
+        15.950400000065201
+      ],
+      "median_ms": 13.081199999987803,
+      "min_ms": 12.884399999848029,
+      "max_ms": 16.006900000093083,
+      "dispatches_per_call": 1,
+      "h2d_bytes_per_call": 16777216,
+      "d2h_visible_bytes_per_call": 67108864,
+      "vs_cpu_matching_rounding": {
+        "max_abs": 0.0625,
+        "mean_abs": 0.007500498089939356,
+        "normalized_rms": 0.009951849468052387,
+        "bitwise_equal": false,
+        "finite": true
+      },
+      "vs_unfused_control": {
+        "max_abs": 0.0,
+        "mean_abs": 0.0,
+        "normalized_rms": 0.0,
+        "bitwise_equal": true,
+        "finite": true
+      },
+      "cpu_gate_passed": false,
+      "cpu_gate_error": "Tensor-likes are not close!\n\nMismatched elements: 3630 / 16777216 (0.0%)\nGreatest absolute difference: 0.0625 at index (14, 809, 107) (up to 0.03 allowed)\nGreatest relative difference: 1000.0 at index (13, 752, 952) (up to 0.02 allowed)"
+    },
+    {
+      "attention": "self",
+      "q_shape": [
+        16,
+        1024,
+        128
+      ],
+      "k_shape": [
+        16,
+        1024,
+        128
+      ],
+      "mode": "scale_fp32",
+      "compile_and_first_ms": 1320.2289000000746,
+      "warm_ms": [
+        11.409199999889097,
+        11.45370000017465,
+        11.539899999888803,
+        11.403599999994185,
+        11.574400000199603,
+        11.70060000004014,
+        15.171000000009371,
+        11.914700000033918,
+        11.634899999990012,
+        11.555699999917124,
+        11.619800000062241,
+        11.643499999991036,
+        11.616300000014235,
+        11.749600000030114,
+        11.709699999983059,
+        11.647600000060265,
+        11.439600000130667,
+        11.416800000006333,
+        11.700499999960812,
+        11.480799999844749,
+        11.806799999931172
+      ],
+      "median_ms": 11.619800000062241,
+      "min_ms": 11.403599999994185,
+      "max_ms": 15.171000000009371,
+      "dispatches_per_call": 1,
+      "h2d_bytes_per_call": 16777216,
+      "d2h_visible_bytes_per_call": 67108864,
+      "vs_cpu_matching_rounding": {
+        "max_abs": 0.0625,
+        "mean_abs": 0.0076148780062794685,
+        "normalized_rms": 0.009860926307737827,
+        "bitwise_equal": false,
+        "finite": true
+      },
+      "vs_unfused_control": {
+        "max_abs": 0.03125,
+        "mean_abs": 0.00010674748045857996,
+        "normalized_rms": 0.000839747954159975,
+        "bitwise_equal": false,
+        "finite": true
+      },
+      "cpu_gate_passed": false,
+      "cpu_gate_error": "Tensor-likes are not close!\n\nMismatched elements: 3619 / 16777216 (0.0%)\nGreatest absolute difference: 0.060546875 at index (14, 51, 942) (up to 0.03 allowed)\nGreatest relative difference: 1000.0 at index (13, 752, 952) (up to 0.02 allowed)"
+    },
+    {
+      "attention": "self",
+      "q_shape": [
+        16,
+        1024,
+        128
+      ],
+      "k_shape": [
+        16,
+        1024,
+        128
+      ],
+      "mode": "legacy_bf16",
+      "compile_and_first_ms": 1269.1330999998627,
+      "warm_ms": [
+        6.993400000055772,
+        6.979400000091118,
+        7.038299999976516,
+        6.808099999943806,
+        6.900499999801468,
+        6.996899999876405,
+        7.090699999935168,
+        7.355400000051304,
+        7.160299999895869,
+        6.974299999910727,
+        6.844199999932243,
+        6.962100000009741,
+        6.83019999996759,
+        6.9161999999778345,
+        7.4709999998958665,
+        7.0627000000058615,
+        7.429400000091846,
+        7.956200000080571,
+        7.639400000016394,
+        7.584599999972852,
+        7.382499999948777
+      ],
+      "median_ms": 7.038299999976516,
+      "min_ms": 6.808099999943806,
+      "max_ms": 7.956200000080571,
+      "dispatches_per_call": 1,
+      "h2d_bytes_per_call": 16777216,
+      "d2h_visible_bytes_per_call": 33554432,
+      "vs_cpu_matching_rounding": {
+        "max_abs": 0.0625,
+        "mean_abs": 0.007531324867159128,
+        "normalized_rms": 0.009963496588170528,
+        "bitwise_equal": false,
+        "finite": true
+      },
+      "vs_unfused_control": {
+        "max_abs": 0.03125,
+        "mean_abs": 0.00010674748045857996,
+        "normalized_rms": 0.000839747954159975,
+        "bitwise_equal": false,
+        "finite": true
+      },
+      "cpu_gate_passed": false,
+      "cpu_gate_error": "Tensor-likes are not close!\n\nMismatched elements: 3627 / 16777216 (0.0%)\nGreatest absolute difference: 0.060546875 at index (14, 51, 942) (up to 0.03 allowed)\nGreatest relative difference: 1000.0 at index (13, 752, 952) (up to 0.02 allowed)"
+    },
+    {
+      "attention": "cross",
+      "q_shape": [
+        16,
+        1024,
+        128
+      ],
+      "k_shape": [
+        16,
+        512,
+        128
+      ],
+      "mode": "baseline",
+      "compile_and_first_ms": 1120.0248000000101,
+      "warm_ms": [
+        9.35750000007829,
+        9.253800000124102,
+        9.029800000007526,
+        8.903899999950227,
+        8.947099999886632,
+        9.045100000093953,
+        9.240500000032625,
+        12.00709999989158,
+        9.63240000010046,
+        9.662800000114657,
+        9.171400000013818,
+        9.042499999850406,
+        9.013599999889266,
+        9.237400000074558,
+        9.084199999961129,
+        9.185399999978472,
+        9.283299999879091,
+        9.705899999971734,
+        11.147200000095836,
+        9.3590999999833,
+        9.061800000154108
+      ],
+      "median_ms": 9.237400000074558,
+      "min_ms": 8.903899999950227,
+      "max_ms": 12.00709999989158,
+      "dispatches_per_call": 1,
+      "h2d_bytes_per_call": 12582912,
+      "d2h_visible_bytes_per_call": 33554432,
+      "vs_cpu_matching_rounding": {
+        "max_abs": 0.0703125,
+        "mean_abs": 0.007504160050302744,
+        "normalized_rms": 0.00995661597698927,
+        "bitwise_equal": false,
+        "finite": true
+      },
+      "vs_unfused_control": {
+        "max_abs": 0.0,
+        "mean_abs": 0.0,
+        "normalized_rms": 0.0,
+        "bitwise_equal": true,
+        "finite": true
+      },
+      "cpu_gate_passed": false,
+      "cpu_gate_error": "Tensor-likes are not close!\n\nMismatched elements: 1777 / 8388608 (0.0%)\nGreatest absolute difference: 0.0703125 at index (6, 216, 8) (up to 0.03 allowed)\nGreatest relative difference: 460.0 at index (10, 54, 370) (up to 0.02 allowed)"
+    },
+    {
+      "attention": "cross",
+      "q_shape": [
+        16,
+        1024,
+        128
+      ],
+      "k_shape": [
+        16,
+        512,
+        128
+      ],
+      "mode": "scale_fp32",
+      "compile_and_first_ms": 1211.5737999999965,
+      "warm_ms": [
+        8.922499999926004,
+        8.854100000007747,
+        8.810000000039508,
+        8.675799999991796,
+        8.642399999871486,
+        8.786000000100103,
+        8.843900000101712,
+        8.838700000069366,
+        8.861900000056266,
+        8.642999999892709,
+        8.508699999993041,
+        8.569100000158869,
+        8.652199999914956,
+        8.85670000002392,
+        8.629400000017995,
+        8.793199999900025,
+        9.165100000018356,
+        8.83069999986219,
+        8.943999999928565,
+        8.80219999999099,
+        8.796699999948032
+      ],
+      "median_ms": 8.80219999999099,
+      "min_ms": 8.508699999993041,
+      "max_ms": 9.165100000018356,
+      "dispatches_per_call": 1,
+      "h2d_bytes_per_call": 12582912,
+      "d2h_visible_bytes_per_call": 33554432,
+      "vs_cpu_matching_rounding": {
+        "max_abs": 0.0703125,
+        "mean_abs": 0.0076187169179320335,
+        "normalized_rms": 0.00986469630151987,
+        "bitwise_equal": false,
+        "finite": true
+      },
+      "vs_unfused_control": {
+        "max_abs": 0.03125,
+        "mean_abs": 0.00010713710071286187,
+        "normalized_rms": 0.0008413811447098851,
+        "bitwise_equal": false,
+        "finite": true
+      },
+      "cpu_gate_passed": false,
+      "cpu_gate_error": "Tensor-likes are not close!\n\nMismatched elements: 1771 / 8388608 (0.0%)\nGreatest absolute difference: 0.0703125 at index (6, 216, 8) (up to 0.03 allowed)\nGreatest relative difference: 460.0 at index (10, 54, 370) (up to 0.02 allowed)"
+    },
+    {
+      "attention": "cross",
+      "q_shape": [
+        16,
+        1024,
+        128
+      ],
+      "k_shape": [
+        16,
+        512,
+        128
+      ],
+      "mode": "legacy_bf16",
+      "compile_and_first_ms": 1194.0309999999954,
+      "warm_ms": [
+        6.058799999891562,
+        5.955500000027314,
+        5.830999999943742,
+        5.973599999833823,
+        5.909599999995407,
+        5.8483000000251195,
+        5.837100000007922,
+        5.72809999994206,
+        5.841400000008434,
+        5.814099999952305,
+        5.907499999921129,
+        6.088299999873925,
+        5.787099999906786,
+        5.828800000017509,
+        5.983500000183994,
+        6.546599999865066,
+        6.433699999888631,
+        5.92329999994945,
+        5.903100000068662,
+        5.851899999925081,
+        5.914399999937814
+      ],
+      "median_ms": 5.907499999921129,
+      "min_ms": 5.72809999994206,
+      "max_ms": 6.546599999865066,
+      "dispatches_per_call": 1,
+      "h2d_bytes_per_call": 12582912,
+      "d2h_visible_bytes_per_call": 16777216,
+      "vs_cpu_matching_rounding": {
+        "max_abs": 0.0703125,
+        "mean_abs": 0.007534998469054699,
+        "normalized_rms": 0.009968371130526066,
+        "bitwise_equal": false,
+        "finite": true
+      },
+      "vs_unfused_control": {
+        "max_abs": 0.03125,
+        "mean_abs": 0.00010713710071286187,
+        "normalized_rms": 0.0008413811447098851,
+        "bitwise_equal": false,
+        "finite": true
+      },
+      "cpu_gate_passed": false,
+      "cpu_gate_error": "Tensor-likes are not close!\n\nMismatched elements: 1779 / 8388608 (0.0%)\nGreatest absolute difference: 0.0703125 at index (6, 216, 8) (up to 0.03 allowed)\nGreatest relative difference: 460.0 at index (10, 54, 370) (up to 0.02 allowed)"
+    }
+  ],
+  "target": "npu2",
+  "execution_completed": true
+}

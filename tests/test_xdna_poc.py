@@ -1309,6 +1309,45 @@ class XDNAPocUnitTests(unittest.TestCase):
 
 
 class AnimaBlockUnitTests(unittest.TestCase):
+    def test_air_and_activation_chaining_are_forwarded_independently(self):
+        from anima_xdna_poc.block import BlockResult, run_xdna_block
+
+        config = _tiny_block_config()
+        weights = AnimaBlockWeights(
+            "transformer_blocks.0.", _block_tensors(config)
+        )
+        inputs = deterministic_block_inputs(config, 4, 3, seed=75)
+        attention = mock.Mock()
+        for resident_key in (None, "block0"):
+            for activation_chaining in (False, True):
+                for attention_runner in (None, attention):
+                    with self.subTest(
+                        resident=resident_key is not None,
+                        activation_chaining=activation_chaining,
+                        air=attention_runner is not None,
+                    ), mock.patch(
+                        "anima_xdna_poc.block._BlockExecution", autospec=True,
+                    ) as execution:
+                        execution.return_value.run.return_value = BlockResult(
+                            inputs.hidden_states, (),
+                        )
+                        run_xdna_block(
+                            config,
+                            weights,
+                            inputs,
+                            session=mock.Mock(),
+                            resident_key=resident_key,
+                            activation_chaining=activation_chaining,
+                            attention_runner=attention_runner,
+                        )
+                        kwargs = execution.call_args.kwargs
+                        self.assertIs(kwargs["attention_runner"], attention_runner)
+                        self.assertEqual(
+                            callable(kwargs["linear_pair_runner"]),
+                            resident_key is not None and activation_chaining,
+                        )
+                        execution.return_value.run.assert_called_once_with(inputs)
+
     def test_adaln_linear_pair_matches_host_path_and_reports_saved_transfers(self):
         from anima_xdna_poc.block import _BlockExecution
 

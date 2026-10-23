@@ -26,6 +26,7 @@ LinearPairRunner = Callable[
     [str, torch.Tensor, tuple[str, str], tuple[torch.Tensor, torch.Tensor]],
     dict[str, Any],
 ]
+AttentionRunner = Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]
 
 
 @dataclass(frozen=True)
@@ -178,6 +179,7 @@ class _BlockExecution:
         batched_runner: Optional[BatchedRunner] = None,
         qkv_runner: Optional[QKVRunner] = None,
         linear_pair_runner: Optional[LinearPairRunner] = None,
+        attention_runner: Optional[AttentionRunner] = None,
     ):
         self.config = config
         self.weights = weights
@@ -186,6 +188,7 @@ class _BlockExecution:
         self.batched_runner = batched_runner
         self.qkv_runner = qkv_runner
         self.linear_pair_runner = linear_pair_runner
+        self.attention_runner = attention_runner
         self.metrics: list[StageMetric] = []
 
     def host(self, name: str, operation: Callable[[], Any]) -> Any:
@@ -399,6 +402,8 @@ class _BlockExecution:
         mask: Optional[torch.Tensor],
     ) -> torch.Tensor:
         cfg = self.config
+        if self.attention_runner is not None and mask is not None:
+            raise UnsupportedTensor("AIR attention does not support masks; no fallback")
         query, key, value = self.qkv(prefix, hidden, context)
         query, key, value = self.host(
             prefix + ".qkv_layout",
@@ -419,6 +424,27 @@ class _BlockExecution:
 
             query = self.host(prefix + ".q_rope", lambda: apply_rope(query))
             key = self.host(prefix + ".k_rope", lambda: apply_rope(key))
+
+        if self.attention_runner is not None:
+            started = time.perf_counter()
+            output = self.attention_runner(
+                query.squeeze(0), key.squeeze(0), value.squeeze(0),
+            )
+            elapsed = (time.perf_counter() - started) * 1000
+            h2d = (query.numel() + key.numel() + value.numel()) * 2
+            d2h = output.numel() * 2
+            self.metrics.append(StageMetric(
+                prefix + ".air_attention", self.runner_device, elapsed, 1,
+                4 * cfg.num_heads * query.shape[2] * key.shape[2] * cfg.head_dim,
+                h2d + d2h, h2d, d2h,
+            ))
+            attended = self.host(
+                prefix + ".av_layout",
+                lambda: output.transpose(0, 1).reshape(
+                    1, hidden.shape[1], cfg.hidden_size,
+                ),
+            )
+            return self.linear(prefix + ".out", attended, prefix + ".to_out.0.weight")
 
         scale = cfg.head_dim**-0.5
         if self.batched_runner is None:
@@ -599,6 +625,7 @@ def run_xdna_block(
     block_index: Optional[int] = None,
     qkv_chaining: bool = True,
     activation_chaining: bool = True,
+    attention_runner: Optional[AttentionRunner] = None,
 ) -> BlockResult:
     _validate_inputs(config, inputs)
     from .xdna import XDNASession
@@ -824,9 +851,10 @@ def run_xdna_block(
             qkv_runner
             if resident_key is not None and qkv_chaining
             else None,
-            linear_pair_runner
+            linear_pair_runner=linear_pair_runner
             if resident_key is not None and activation_chaining
             else None,
+            attention_runner=attention_runner,
         ).run(inputs)
     return BlockResult(
         result.output,
