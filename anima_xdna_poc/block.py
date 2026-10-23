@@ -22,6 +22,10 @@ QKVRunner = Callable[
     [str, torch.Tensor, torch.Tensor, tuple[str, str, str], tuple[torch.Tensor, ...]],
     dict[str, Any],
 ]
+LinearPairRunner = Callable[
+    [str, torch.Tensor, tuple[str, str], tuple[torch.Tensor, torch.Tensor]],
+    dict[str, Any],
+]
 
 
 @dataclass(frozen=True)
@@ -52,6 +56,11 @@ class StageMetric:
     d2h_sync_ms: float = 0.0
     weight_population_ms: float = 0.0
     weight_population_bytes: int = 0
+    activation_pool_allocations: int = 0
+    activation_pool_hits: int = 0
+    external_bound_edges: int = 0
+    avoided_h2d_bytes: int = 0
+    avoided_d2h_bytes: int = 0
 
 
 @dataclass(frozen=True)
@@ -168,6 +177,7 @@ class _BlockExecution:
         runner_device: str,
         batched_runner: Optional[BatchedRunner] = None,
         qkv_runner: Optional[QKVRunner] = None,
+        linear_pair_runner: Optional[LinearPairRunner] = None,
     ):
         self.config = config
         self.weights = weights
@@ -175,6 +185,7 @@ class _BlockExecution:
         self.runner_device = runner_device
         self.batched_runner = batched_runner
         self.qkv_runner = qkv_runner
+        self.linear_pair_runner = linear_pair_runner
         self.metrics: list[StageMetric] = []
 
     def host(self, name: str, operation: Callable[[], Any]) -> Any:
@@ -299,8 +310,64 @@ class _BlockExecution:
         temb: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         activated = self.host(prefix + ".silu", lambda: F.silu(embedded))
-        modulation = self.linear(prefix + ".linear_1", activated, prefix + ".linear_1.weight")
-        modulation = self.linear(prefix + ".linear_2", modulation, prefix + ".linear_2.weight")
+        pair_names = (prefix + ".linear_1.weight", prefix + ".linear_2.weight")
+        if self.linear_pair_runner is not None:
+            weights = (self.weights[pair_names[0]], self.weights[pair_names[1]])
+            started = time.perf_counter()
+            try:
+                profile = self.linear_pair_runner(
+                    prefix, activated, pair_names, weights
+                )
+            except UnsupportedTensor:
+                profile = None
+            if profile is not None:
+                elapsed = (time.perf_counter() - started) * 1000
+                rows = activated.numel() // activated.shape[-1]
+                flops = (
+                    2 * rows * weights[0].shape[0] * weights[0].shape[1]
+                    + 2 * rows * weights[1].shape[0] * weights[1].shape[1]
+                )
+                transfer = (
+                    activated.numel()
+                    + weights[0].numel()
+                    + weights[1].numel()
+                    + profile["output"].numel()
+                ) * 2
+                self.metrics.append(
+                    StageMetric(
+                        prefix + ".linear_pair",
+                        self.runner_device,
+                        elapsed,
+                        profile["dispatches"],
+                        flops,
+                        transfer,
+                        profile["h2d_bytes"],
+                        profile["d2h_bytes"],
+                        profile["allocation_count"],
+                        profile["resident_hits"],
+                        weight_population_bytes=profile[
+                            "weight_population_bytes"
+                        ],
+                        activation_pool_allocations=profile[
+                            "activation_pool_allocations"
+                        ],
+                        activation_pool_hits=profile["activation_pool_hits"],
+                        external_bound_edges=profile["external_bound_edges"],
+                        avoided_h2d_bytes=profile["avoided_h2d_bytes"],
+                        avoided_d2h_bytes=profile["avoided_d2h_bytes"],
+                    )
+                )
+                modulation = profile["output"]
+            else:
+                modulation = self.linear(
+                    prefix + ".linear_1", activated, pair_names[0]
+                )
+                modulation = self.linear(
+                    prefix + ".linear_2", modulation, pair_names[1]
+                )
+        else:
+            modulation = self.linear(prefix + ".linear_1", activated, pair_names[0])
+            modulation = self.linear(prefix + ".linear_2", modulation, pair_names[1])
 
         def normalize() -> tuple[torch.Tensor, torch.Tensor]:
             combined = modulation + temb
@@ -531,6 +598,7 @@ def run_xdna_block(
     packed_cache=None,
     block_index: Optional[int] = None,
     qkv_chaining: bool = True,
+    activation_chaining: bool = True,
 ) -> BlockResult:
     _validate_inputs(config, inputs)
     from .xdna import XDNASession
@@ -695,6 +763,58 @@ def run_xdna_block(
             )
             return result
 
+        def linear_pair_runner(
+            prefix: str,
+            value: torch.Tensor,
+            weight_names: tuple[str, str],
+            pair_weights: tuple[torch.Tensor, torch.Tensor],
+        ) -> dict[str, Any]:
+            if resident_key is None or not hasattr(
+                active_session, "dispatch_linear_pair_chain"
+            ):
+                raise UnsupportedTensor(
+                    "resident linear-pair chaining requires a fingerprint-scoped "
+                    "XDNA session"
+                )
+            flattened = value.reshape(-1, value.shape[-1])
+            if flattened.shape[1] > 2048 or pair_weights[0].shape[0] > 2048:
+                raise UnsupportedTensor(
+                    "resident linear-pair chaining supports widths up to 2048"
+                )
+            prepared = []
+            pair_inputs = (
+                flattened,
+                torch.empty(
+                    flattened.shape[0],
+                    pair_weights[0].shape[0],
+                    dtype=torch.bfloat16,
+                ),
+            )
+            for item_input, weight, weight_name in zip(
+                pair_inputs, pair_weights, weight_names
+            ):
+                if packed_cache is not None and block_index is not None:
+                    item = packed_cache.prepared(
+                        block_index,
+                        weight_name,
+                        0,
+                        item_input,
+                        weight.shape[0],
+                    )
+                else:
+                    item = prepare_linear(item_input, weight)
+                prepared.append(item)
+            profile = active_session.dispatch_linear_pair_chain(
+                prepared[0],
+                prepared[1],
+                f"{packed_cache.manifest['cache_key'] if packed_cache is not None else resident_key}:"
+                f"{resident_key}:{prefix}:linear_pair",
+            )
+            profile["output"] = profile["output"].reshape(
+                *value.shape[:-1], pair_weights[1].shape[0]
+            )
+            return profile
+
         result = _BlockExecution(
             config,
             weights,
@@ -703,6 +823,9 @@ def run_xdna_block(
             batched_runner if batched_attention else None,
             qkv_runner
             if resident_key is not None and qkv_chaining
+            else None,
+            linear_pair_runner
+            if resident_key is not None and activation_chaining
             else None,
         ).run(inputs)
     return BlockResult(
