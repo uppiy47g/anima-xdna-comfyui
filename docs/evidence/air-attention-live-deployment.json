@@ -1,0 +1,83 @@
+{
+  "schema_version": 1,
+  "status": "installed_and_serving",
+  "authorization": "User explicitly selected AIR as the standard path in the actual ComfyUI environment for personal image-quality evaluation.",
+  "attention_backend": "air_experimental",
+  "repository_unconfigured_default": "baseline",
+  "deployment": {
+    "package": "Persistent copy of the current worktree runtime, not a junction to the working branch.",
+    "artifacts": "Persistent copies of the measured self/cross ELFs, relative ELF paths and SHA-256 verification.",
+    "previous_installation": "Previous custom-node junction retained as a backup; its target checkout untouched.",
+    "python_environment": "Existing normal ComfyUI interpreter; no package/compiler upgrades.",
+    "startup": "Local interpreter startup configuration selects the installed package and persistent artifact directory.",
+    "baseline_switch": "ANIMA_XDNA_ATTENTION_BACKEND=baseline and restart the server.",
+    "air_switch": "ANIMA_XDNA_ATTENTION_BACKEND=air and restart the server.",
+    "silent_fallback": false
+  },
+  "packages": {
+    "torch": "2.14.1+cpu",
+    "triton-xdna": "3.6.0.2026093004+75679dc",
+    "mlir-air": "0.0.1.2026092206+ff5d95c.no.rtti",
+    "mlir-aie-no-rtti": "1.4.3.dev55+g10767b5"
+  },
+  "native_replay": {
+    "actual_installed_module_and_interpreter_verified": true,
+    "steps": 4,
+    "blocks_per_step": 28,
+    "all_112_block_control_nrms_match_measured_air_prototype": true,
+    "dispatches_per_step": [476, 476, 476, 476],
+    "host_qk_softmax_stages_present": false,
+    "final_block_nrms_vs_control": [
+      0.011898383921268121,
+      0.042784192331156656,
+      0.052683176093359596,
+      0.02727073447493295
+    ]
+  },
+  "normal_comfyui_generation": {
+    "workflow": "LoadAnimaBF16 -> LoadAttachAnimaXDNAModel -> KSampler -> VAEDecode -> SaveImage; CLIPLoader/Qwen and EmptyCosmosLatentVideo.",
+    "model": "Turbo V1.1",
+    "size": [512, 512],
+    "steps": 4,
+    "sampler": "euler",
+    "scheduler": "simple",
+    "cfg": 1,
+    "denoise": 1,
+    "batch": 1,
+    "cold": {
+      "seed": 700755787614899,
+      "status": "success",
+      "server_prompt_wall_seconds": 56.22,
+      "client_request_wall_ms": 56740.67709999963,
+      "approximate_sampler_seconds_from_progress_log": 31.6,
+      "saved_image_verified": true,
+      "image_rgb_sha256": "d1eced8c1bec7c793439fc3237de5308a0ed19f0cf19ae5c0869a033f5d67486",
+      "pixel_equal_to_measured_air_prototype": true,
+      "pixel_equal_to_control": false,
+      "rgb_mae_vs_control": 15.97534465789795
+    },
+    "resident": {
+      "seed": 700755787614900,
+      "status": "success",
+      "server_prompt_wall_seconds": 28.98,
+      "client_request_wall_ms": 30295.365400000264,
+      "approximate_sampler_seconds_from_progress_log": 24.1,
+      "saved_image_verified": true,
+      "runtime_diagnostics": {
+        "attention_backend": "air_experimental",
+        "state": "open",
+        "chain_runs": 8,
+        "last_dispatches": 476,
+        "last_chain_ms": 5914.205300005051,
+        "model_variant": "Turbo V1.1"
+      }
+    }
+  },
+  "limitations": {
+    "quality_pass": false,
+    "known_prototype_final_latent_nrms_vs_control": 0.29035156183571814,
+    "twelve_second_goal_achieved": false,
+    "normal_environment_speed_is_not_isolated_18_765_second_median": true,
+    "performance_scope": "One cold and one resident normal-server request, not a repeated paired benchmark; different seeds. Replay checks validate compatibility, not sampler timing."
+  }
+}

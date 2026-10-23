@@ -91,6 +91,18 @@ class AnimaXDNAChainRuntime:
         self._packed_cache: Optional[PackedWeightCache] = None
         self.cache_status: Optional[CacheStatus] = None
         self._fixture_captured = False
+        air_directory = os.environ.get("ANIMA_XDNA_AIR_ATTENTION_DIR", "").strip()
+        backend = os.environ.get("ANIMA_XDNA_ATTENTION_BACKEND", "baseline")
+        if backend not in ("air", "baseline"):
+            raise UnsupportedTensor(f"unknown attention backend: {backend!r}")
+        if backend == "air" and not air_directory:
+            raise UnsupportedTensor("AIR attention requires ANIMA_XDNA_AIR_ATTENTION_DIR")
+        self.attention_backend = "air_experimental" if backend == "air" else "baseline"
+        self._air_attention = None
+        if backend == "air":
+            from .air_attention import AIRAttentionBackend
+
+            self._air_attention = AIRAttentionBackend(air_directory)
 
     def __enter__(self):
         if self._session is not None:
@@ -129,6 +141,8 @@ class AnimaXDNAChainRuntime:
         )
 
     def close(self):
+        if self._air_attention is not None:
+            self._air_attention.close()
         if self._session is not None:
             self._session.__exit__(None, None, None)
             self._session = None
@@ -138,13 +152,7 @@ class AnimaXDNAChainRuntime:
         self._weights.clear()
 
     def __exit__(self, exc_type, exc_value, traceback):
-        if self._session is not None:
-            self._session.__exit__(exc_type, exc_value, traceback)
-            self._session = None
-        if self._packed_cache is not None:
-            self._packed_cache.close()
-            self._packed_cache = None
-        self._weights.clear()
+        self.close()
 
     def _ensure_packed_cache(self, start: int, end: int) -> None:
         if not self.weight_cache_enabled:
@@ -261,6 +269,8 @@ class AnimaXDNAChainRuntime:
         self._validate_range(start, end)
         if self._session is None:
             raise RuntimeError("AnimaXDNAChainRuntime must be entered before execution")
+        if self._air_attention is not None:
+            self._air_attention.validate(self.config, inputs)
         self._capture_fixture(inputs)
         self._ensure_packed_cache(start, end)
         hidden = inputs.hidden_states
@@ -278,6 +288,7 @@ class AnimaXDNAChainRuntime:
                 packed_cache=self._packed_cache,
                 block_index=index,
                 qkv_chaining=self.qkv_chaining,
+                attention_runner=self._air_attention,
             )
             wall_ms = (time.perf_counter() - started) * 1000
             hidden = result.output
@@ -317,6 +328,8 @@ class AnimaXDNAChainRuntime:
         self._validate_range(start, end)
         if self._session is None:
             raise RuntimeError("AnimaXDNAChainRuntime must be entered before execution")
+        if self._air_attention is not None:
+            self._air_attention.validate(self.config, inputs)
         self._capture_fixture(inputs)
         self._ensure_packed_cache(start, end)
         cpu_hidden = inputs.hidden_states
@@ -341,6 +354,7 @@ class AnimaXDNAChainRuntime:
                 packed_cache=self._packed_cache,
                 block_index=index,
                 qkv_chaining=self.qkv_chaining,
+                attention_runner=self._air_attention,
             )
             xdna_ms = (time.perf_counter() - started) * 1000
             cpu_hidden = cpu_result.output

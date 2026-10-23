@@ -10,6 +10,9 @@ param(
     [string]$InputDirectory = "",
     [string]$OutputDirectory = "",
     [int]$Port = 8190,
+    [ValidateSet("baseline", "air")]
+    [string]$AttentionBackend = "baseline",
+    [string]$AIRAttentionDirectory = "",
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]]$ComfyUIArgs
 )
@@ -25,6 +28,20 @@ foreach ($path in @($python, $main, $XRTDevDir, $ModelPathsConfig)) {
 
 $env:XRT_DEV_DIR = (Resolve-Path -LiteralPath $XRTDevDir).Path
 $env:PYTHONUTF8 = "1"
+$env:ANIMA_XDNA_ATTENTION_BACKEND = $AttentionBackend
+if ($AttentionBackend -eq "air") {
+    if (-not $AIRAttentionDirectory) {
+        throw "-AttentionBackend air requires -AIRAttentionDirectory."
+    }
+    foreach ($name in @("self", "cross")) {
+        $manifest = Join-Path (Join-Path $AIRAttentionDirectory $name) "manifest.json"
+        if (-not (Test-Path -LiteralPath $manifest -PathType Leaf)) {
+            throw "Required AIR manifest does not exist: $manifest"
+        }
+    }
+    $env:ANIMA_XDNA_AIR_ATTENTION_DIR = (Resolve-Path -LiteralPath $AIRAttentionDirectory).Path
+    Write-Warning "Experimental AIR attention is not quality-equivalent: fixed-seed latent NRMS 29.035%, RGB MAE 15.975/255. No silent fallback."
+}
 $arguments = @(
     $main,
     "--cpu",

@@ -70,6 +70,7 @@ class RuntimeDiagnostics:
     model_fingerprint: Optional[str] = None
     model_variant: Optional[str] = None
     qkv_chaining: bool = True
+    attention_backend: str = "baseline"
     model_block_parameter_count: int = 0
     model_block_parameter_dtypes: Optional[dict[str, int]] = None
     model_block_parameter_bytes: int = 0
@@ -187,6 +188,7 @@ class SharedRuntime:
             )
             self.diagnostics.lora_patch_count = self.lora_patch_count
             self.diagnostics.qkv_chaining = self.qkv_chaining
+            self.diagnostics.attention_backend = runtime.attention_backend
             self.diagnostics.model_block_parameter_count = storage_profile[
                 "block_parameter_count"
             ]

@@ -18,7 +18,27 @@ cache entry.
 This is an experimental **CPU-hybrid** implementation, not NPU-only image
 generation. XDNA executes Linear and attention QK/AV GEMMs. Qwen, patch/time
 embeddings, normalization, RoPE, softmax, GELU, residuals, sampling, final
-projection, and VAE decoding remain on CPU.
+projection, and VAE decoding remain on CPU in the default path.
+
+## 0.2.0-alpha.1: experimental AIR attention
+
+The default remains the existing baseline. This prerelease adds an **explicitly
+opt-in** direct MLIR-AIR path fusing tiled QK -> scale -> online softmax -> AV,
+without returning full score/probability matrices to the CPU. It is not a
+quality-equivalent replacement: fixed-seed final latent NRMS versus baseline
+was **29.035%**, with decoded RGB MAE **15.975/255**.
+
+In the isolated paired experiment, the warmed four-step sampler median fell
+from 27.095 s to 18.765 s and dispatches from 2,128 to 1,904. Normal ComfyUI
+operational checks instead measured about 24.1 s sampling / 28.98 s total on
+one resident request; user-observed generation is approximately 25 seconds.
+These are different timing scopes, not a 12-second result or a quality pass.
+
+Use the [release notes](docs/releases/0.2.0-alpha.1.md) and
+[AIR build/runtime instructions](anima_xdna_poc/README.md#native-comfyui-air-execution)
+to compile the fixed-shape artifacts and deliberately select AIR. Merely
+configuring an artifact directory does not enable it. Model weights, private
+captures and compiled vendor/device binaries are not included.
 
 ## Development log
 

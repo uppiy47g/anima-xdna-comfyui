@@ -1,0 +1,134 @@
+{
+  "scope": "One representative head, both actual shapes; lowering trace, not numerical or latency validation.",
+  "generator_signature": "(l1_m: int = 64, l1_n: int = 64, l2_k: int = 64, l1_k: int = None, pack_sizes: tuple = (8, 8, 8), accum_type: str = 'f32', contract_input_type: str = None, bf16_emulation: bool = False, k_loop: bool = False, epilogue: bool = False) -> str",
+  "cases": [
+    {
+      "keys": 1024,
+      "mode": "scale_fp32",
+      "bf16_emulation": false,
+      "epilogue_cast_removed": false,
+      "input_scalar_multiply": [
+        "%14 = arith.mulf %in, %in_4 : f32 loc(#loc17)"
+      ],
+      "lowered_multiplies": [
+        "%22 = arith.mulf %20, %21 : vector<16xbf16>"
+      ],
+      "lowered_sha256": "37da9e0bcdbbb44c9d3f62e7150e1c4884b59335354979ffa5696dfa00dec59e"
+    },
+    {
+      "keys": 1024,
+      "mode": "scale_fp32",
+      "bf16_emulation": false,
+      "epilogue_cast_removed": true,
+      "input_scalar_multiply": [
+        "%14 = arith.mulf %in, %in_4 : f32 loc(#loc17)"
+      ],
+      "lowered_multiplies": [
+        "%20 = arith.mulf %19, %cst : vector<16xf32>"
+      ],
+      "lowered_sha256": "d707fb30f1c616736d8e2a96093ca3d7de3f1ac19fcc2a901c0d4d7424f295cb"
+    },
+    {
+      "keys": 1024,
+      "mode": "direct_bf16",
+      "bf16_emulation": false,
+      "epilogue_cast_removed": false,
+      "input_scalar_multiply": [
+        "%16 = arith.mulf %in, %in_4 : f32 loc(#loc17)"
+      ],
+      "lowered_multiplies": [
+        "%22 = arith.mulf %20, %21 : vector<16xbf16>"
+      ],
+      "lowered_sha256": "51d85ee1146f0249b44ab9ea5542315923565abe0efd56704edc2d98ac5392d6"
+    },
+    {
+      "keys": 1024,
+      "mode": "direct_bf16",
+      "bf16_emulation": false,
+      "epilogue_cast_removed": true,
+      "input_scalar_multiply": [
+        "%16 = arith.mulf %in, %in_4 : f32 loc(#loc17)"
+      ],
+      "lowered_multiplies": [
+        "%20 = arith.mulf %19, %cst : vector<16xf32>"
+      ],
+      "lowered_sha256": "1bb845144f0c6decf9085d6c04d6342770474141e5820dd94c6d4243d8c70642"
+    },
+    {
+      "keys": 512,
+      "mode": "scale_fp32",
+      "bf16_emulation": false,
+      "epilogue_cast_removed": false,
+      "input_scalar_multiply": [
+        "%14 = arith.mulf %in, %in_4 : f32 loc(#loc17)"
+      ],
+      "lowered_multiplies": [
+        "%22 = arith.mulf %20, %21 : vector<16xbf16>"
+      ],
+      "lowered_sha256": "d5e812df8885d63c2d5138f72852dc286893d9a5b64dce577da175e555c77b0d"
+    },
+    {
+      "keys": 512,
+      "mode": "scale_fp32",
+      "bf16_emulation": false,
+      "epilogue_cast_removed": true,
+      "input_scalar_multiply": [
+        "%14 = arith.mulf %in, %in_4 : f32 loc(#loc17)"
+      ],
+      "lowered_multiplies": [
+        "%20 = arith.mulf %19, %cst : vector<16xf32>"
+      ],
+      "lowered_sha256": "8b7a12f190e5aa89f2452700f08990e21eeebfdb1aa7b124cd925cdb94debe4d"
+    },
+    {
+      "keys": 512,
+      "mode": "direct_bf16",
+      "bf16_emulation": false,
+      "epilogue_cast_removed": false,
+      "input_scalar_multiply": [
+        "%16 = arith.mulf %in, %in_4 : f32 loc(#loc17)"
+      ],
+      "lowered_multiplies": [
+        "%22 = arith.mulf %20, %21 : vector<16xbf16>"
+      ],
+      "lowered_sha256": "6f60daf48246ef78b72c87e11ea20529acc726d8fe581a92a22a5fa20196595d"
+    },
+    {
+      "keys": 512,
+      "mode": "direct_bf16",
+      "bf16_emulation": false,
+      "epilogue_cast_removed": true,
+      "input_scalar_multiply": [
+        "%16 = arith.mulf %in, %in_4 : f32 loc(#loc17)"
+      ],
+      "lowered_multiplies": [
+        "%20 = arith.mulf %19, %cst : vector<16xf32>"
+      ],
+      "lowered_sha256": "e9329b69a62e66b2c57194eaa16034bf08c94ed5a94edcf13ba0d9973f934447"
+    }
+  ],
+  "no_cast_compile": {
+    "status": "failed",
+    "target": "npu2 / AIE2P",
+    "keys": 512,
+    "mode": "scale_fp32",
+    "stage": "AIEVec legalization during aiecc",
+    "diagnostic": "aievec.mul_elem conversion is not supported for AIE2p; failed to legalize operation 'aievec.mul_elem'",
+    "operand_types": "vector<16xf32>, vector<16xf32> -> vector<16xf32>",
+    "executed": false
+  },
+  "upstream_commit": "b0ecabc1916d32b2242865ca6e563c8508372665",
+  "source_files": {
+    "epilogue.mlir": "https://github.com/amd/Triton-XDNA/blob/b0ecabc1916d32b2242865ca6e563c8508372665/amd_triton_npu/backend/transform_library/epilogue.mlir",
+    "type_casting.mlir": "https://github.com/amd/Triton-XDNA/blob/b0ecabc1916d32b2242865ca6e563c8508372665/amd_triton_npu/backend/transform_library/type_casting.mlir"
+  },
+  "conclusions": {
+    "origin": "epilogue_vectorize -> cast_bf16_only_ops -> match_bf16_only_op (includes arith.mulf) -> action_cast_to_bf16 -> transform.air.vector_type_cast target_element_type=bf16",
+    "bf16_emulation_false_does_not_disable_epilogue_cast": true,
+    "output_dtype_does_not_control_multiply_precision": true,
+    "removing_cast_is_not_a_working_fp32_compile_solution": true,
+    "scope_limit": "Specific pinned XDNA AIE2P vector schedule and toolchain; does not establish that all Triton targets or all custom/scalar AIE implementations lack FP32 arithmetic.",
+    "generator_precision_switch": "No epilogue-multiply-precision argument in the inspected generate_matmul_transform signature. accum_type controls the contraction accumulator, not this epilogue cast."
+  },
+  "diagnostic_script_sha256": "f4acbd9d9357bfd93dffa7be1fe24d7f25329508f15d519d18cc06aef122681b"
+}

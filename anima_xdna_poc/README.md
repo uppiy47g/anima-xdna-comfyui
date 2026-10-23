@@ -151,6 +151,127 @@ dispatches, H2D/D2H staging bytes, allocations/resident hits, host-copy,
 cache-sync and kernel/wait time, logical NPU FLOPs, cold/populate/cached timing,
 and blockwise numerical errors.
 
+### Optional QK/scale epilogue experiment
+
+`examples/qk_scale_epilogue_probe.py` is a model-free hardware experiment,
+not a production attention replacement. It requires the opt-in epilogue
+generator and transform library from
+[Triton-XDNA PR 171](https://github.com/amd/Triton-XDNA/pull/171), with a
+matching AIR/AIE/Peano toolchain. Use an isolated environment rather than
+upgrading the environment serving ComfyUI.
+
+From the repository root, using that environment's interpreter:
+
+```powershell
+$env:PYTHONUTF8 = "1"
+python -m examples.qk_scale_epilogue_probe `
+  --work-dir "<LOCAL_ASCII_EXPERIMENT_DIRECTORY>" --runs 7 --warmups 2
+```
+
+The default runs all 16 heads, head dimension 128 (padded to 256 as in the
+current runtime), with 1024 queries and either 1024 or 512 keys. Seeded
+synthetic BF16 inputs need no model checkpoint. It compares unfused QK plus
+host scaling, a float32-output scale epilogue, and an epilogue requesting the existing
+BF16-before-scale boundary with BF16 output. Compiler optimization and
+lowering can still change rounding; the probe measures parity rather than
+assuming it.
+
+`results.json` records first-call and warmed timings, transfer byte counts,
+CPU-oracle errors, and differences from the unfused control. Timings include
+input staging, dispatch/wait, output synchronization, and host conversion or
+scaling, but exclude input preparation, softmax, AV, and image generation.
+Each head group remains one dispatch in every variant.
+
+For separate BF16 direct-output and conversion-phase measurements, use:
+
+```powershell
+python -m examples.qk_scale_epilogue_probe `
+  --work-dir "<NEW_LOCAL_ASCII_EXPERIMENT_DIRECTORY>" `
+  --threads 10 --warmups 3 --runs 21 `
+  --modes baseline qk_bf16 scale_fp32 direct_bf16 legacy_bf16
+```
+
+`qk_bf16` stores QK directly as BF16 but keeps the existing host scale.
+`direct_bf16` requests scale followed by a BF16 store without an explicit
+pre-scale BF16 cast. These are different experiments. Output-cast epilogues
+use the epilogue transform even when no scale is fused. The report separates
+chain, host numerical conversion, host bit-view wrapping, and host scale
+times. See the [direct-output comparison](../docs/anima-xdna-reproducibility.md#separate-bf16-direct-output-comparison).
+
+The fixed CPU elementwise gate is `rtol=0.02, atol=0.03`. The experiment
+records gate failures without widening the threshold and continues to the
+other variants; it exits nonzero if any case fails. A successful compile or
+a speed improvement is not a production numerical-quality pass, especially
+when the unfused control itself fails that gate.
+
+### Fixed-seed real-model epilogue experiment
+
+`examples/qk_scale_model_probe.py` uses the same isolated epilogue-capable
+environment to call the validated ComfyUI sampler directly, without a web
+server or loading third-party custom nodes. It temporarily instruments the
+current checkout's runtime inside that process; production files and the
+normal ComfyUI environment are not modified.
+
+```powershell
+$env:PYTHONUTF8 = "1"
+python -m examples.qk_scale_model_probe `
+  --comfy-root "<VALIDATED_COMFYUI_ROOT>" `
+  --checkpoint "<TURBO_V11_SAFETENSORS>" `
+  --text-encoder "<QWEN_3_06B_BASE_SAFETENSORS>" `
+  --vae "<QWEN_IMAGE_VAE_SAFETENSORS>" `
+  --work-dir "<NEW_LOCAL_ASCII_EXPERIMENT_DIRECTORY>" `
+  --seed 700755787614899 --runs 3
+```
+
+Conditions are 512x512, batch 1, four Euler/simple steps, CFG 1, denoise 1,
+BF16 loading, QKV chaining, and no LoRA. Positive and negative prompts are
+the established cherry-blossom fixture prompts. This checkout uses the
+19-dispatch/block control, not a separately installed optimized runtime.
+
+The experiment saves all four actual pre-block inputs, compares all 28
+block outputs for both same-input replays and independent sampler
+trajectories, runs a CPU block-chain oracle on each captured input, and
+compares sampler callbacks and final latents. CPU comparisons use the
+existing BF16 CPU block oracle, not a separate stock-FP32 CPU sampler.
+Turbo's fixed 10% intermediate / 2% final chain policy is reported without
+relaxation. Independently generated images are decoded after sampler
+profiling.
+
+Warmed sampler measurements rotate the three variant orders across three
+repeats. Stage spans and dispatch counts are recorded alongside individually
+timed original XRT synchronization, start/wait, and NumPy copy calls.
+Instrumentation is inserted into in-memory copies of the existing runner
+methods; no package source is edited. Nested counters must not be added to
+stage wall times. BO sync byte counts describe synchronized buffer sizes,
+not physical bus traffic on this unified-memory device.
+
+`report.json` separates cold setup, capture/comparison runs, and resident
+timing runs. The run's status indicates execution completion; numerical
+gate outcomes are separate and must be inspected before production use.
+Local `.pt` files and PNGs are private experiment artifacts; never commit
+model weights, conditioning, captured activations, or latent tensors.
+The work directory may reuse a cache from a failed initial setup but refuses
+to overwrite an existing real-input capture.
+
+The completed fixed-seed experiment and all per-block errors are documented
+in the [real-model results](../docs/anima-xdna-reproducibility.md#real-model-qkscale-experiment-turbo-v11-four-steps)
+and [sanitized evidence](../docs/evidence/qk-scale-model-probe.json).
+Warm sampler medians were 26.452 s (control), 26.353 s (FP32 output), and
+25.083 s (BF16 output). Both fused final latents differed from control by
+18.640% NRMS; the control and both fused variants failed the unchanged CPU
+final-block gate on three of the four inputs. This is not production
+enablement or a numerical-quality pass.
+
+To test the separate direct-output paths with the same real-model command,
+append `--modes baseline qk_bf16 direct_bf16` and choose a new work directory.
+The completed comparison preserved all 112 block outputs, final latent,
+and image exactly with QK-only BF16 output plus CPU scale, while halving QK
+output sizes and removing the host numerical cast. Full-sampler medians were
+25.821 s control / 25.487 s QK-only BF16; overlapping timing ranges prevent
+claiming a robust generation speedup. Scale-then-direct-BF16 still changed
+the final latent by 18.640% NRMS. See the
+[real-model direct-output results](../docs/anima-xdna-reproducibility.md#direct-output-on-the-fixed-seed-real-model).
+
 On the validated Ryzen AI 9 365 / NPU Strix system, Anima Base block 0 at
 1024/512 captured inputs produced:
 
@@ -348,6 +469,149 @@ CPU normalized-RMS gate continued to pass. Times vary with OS file-cache state;
 cold build time is intentionally not presented as warm-hit performance.
 
 ## Tests and limitations
+
+### Opt-in direct MLIR-AIR attention
+
+`examples.air_attention` is an experimental fixed-shape QK/scale/online-softmax/
+AV implementation, not a production runtime switch. Its AIR schedule uses
+32-query/64-key tiles, four query cores per head, and two concurrent heads.
+Only Q, K, V and the final attention output are host-visible; no full score
+or probability matrix is returned. K/V are streamed again for each 128-query
+group, so smaller host synchronization buffers do not imply elimination of
+internal DMA traffic.
+
+The AIE microkernels are reused from AMD's MIT-licensed MLIR-AIR example at
+revision `508ca731ef0384fd3729ac1688e0b5d9a0ef5efe`, not newly authored here.
+Keep the upstream copyright/license notices when obtaining or redistributing
+those sources. Download them to a **private scratch directory**, outside this
+repository, using the isolated, validated AIR/AIE/Peano/XRT environment:
+
+```powershell
+$source = "<PRIVATE_UPSTREAM_SOURCE_DIRECTORY>"
+New-Item -ItemType Directory -Path $source -Force | Out-Null
+$revision = "508ca731ef0384fd3729ac1688e0b5d9a0ef5efe"
+$base = "https://raw.githubusercontent.com/Xilinx/mlir-air/$revision/programming_examples/flash_attention/kernel_fusion_based"
+foreach ($name in @("attn_npu2.cc", "zero.cc")) {
+  Invoke-WebRequest "$base/$name" -OutFile (Join-Path $source $name)
+}
+python -m examples.air_attention --keys 1024 --parallel-heads 2 `
+  --source-dir $source --work-dir "<PRIVATE_SELF_BUILD_DIRECTORY>"
+python -m examples.air_attention --keys 512 --parallel-heads 2 `
+  --source-dir $source --work-dir "<PRIVATE_CROSS_BUILD_DIRECTORY>"
+```
+
+Compilation verifies both source SHA-256 digests, writes direct AIR and ELF
+artifacts plus a private manifest, and invokes the AIE compiler without
+Triton JIT attention lowering. Four concurrent heads exhausted shim DMA
+capacity on this device; the supported CLI schedules are one or two heads,
+with two used for the measured prototype. Each core has 53,504 bytes of
+explicit working buffers, excluding the 4 KiB stack and compiler padding.
+K and V deliberately use separate memtile allocations: aliasing their
+inbound staging caused device timeouts in an earlier schedule.
+
+This is **not control-equivalent arithmetic**: BFP16-emulated BF16 matmuls,
+BF16 online-softmax state, and scale inside the exponential path differ from
+the control's full BF16 score rounding and FP32 host softmax. Numerical gates
+must be inspected independently of successful execution.
+
+Run the real-model command above with a new private work directory and:
+
+```powershell
+  --modes baseline air_attention `
+  --air-self-manifest "<PRIVATE_SELF_BUILD_DIRECTORY>\manifest.json" `
+  --air-cross-manifest "<PRIVATE_CROSS_BUILD_DIRECTORY>\manifest.json"
+```
+
+The process-local hooks replace only the attention hot path. Masks are
+explicitly rejected; the production block code, normal environment, and
+default probe modes are unchanged. This captures private Q/K/V/control
+outputs at blocks 0, 13 and 27 of steps 0 and 3. Compare the **complete**
+round-trip attention path, including host preparation, synchronization,
+dispatch/wait and output conversion, rather than timing softmax alone:
+
+```powershell
+python -m examples.air_attention_probe `
+  --self-manifest "<PRIVATE_SELF_BUILD_DIRECTORY>\manifest.json" `
+  --cross-manifest "<PRIVATE_CROSS_BUILD_DIRECTORY>\manifest.json" `
+  --input-dir "<PRIVATE_MODEL_WORK_DIRECTORY>\attention_inputs" `
+  --report "<PRIVATE_PROBE_REPORT_JSON>" --runs 21 --warmups 3
+```
+
+The benchmark alternates control/AIR order, verifies the control reproduces
+captured outputs, and records both the CPU BF16-chain reference and FP32
+SDPA reference outside timed regions. Its explicit 2% attention-output CPU
+NRMS gate is an additional prototype check, not a replacement or relaxation
+of the existing 10% intermediate / 2% final block-chain policy.
+
+The completed experiment reduced the warmed four-step sampler median from
+27.095 s to 18.765 s and dispatches from 2,128 to 1,904. However, final latent
+NRMS versus control was 29.035%, decoded RGB MAE was 15.975/255, and only
+3/12 sampled attention cases passed the additional CPU gate. This remains
+an opt-in prototype, not production enablement or a 12-second result. See
+the [measured results and numerical limitations](../docs/anima-xdna-reproducibility.md#direct-mlir-air-tiled-attention-experiment).
+
+### Native ComfyUI AIR execution
+
+The measured AIR prototype is also wired into the normal chain runtime,
+without process-global monkey patches or score-shaped placeholder tensors.
+Set `ANIMA_XDNA_AIR_ATTENTION_DIR` to a persistent artifact directory containing
+`self\manifest.json` and `cross\manifest.json` (and their ELFs). Each manifest
+must include `elf_sha256`; compilation now writes this digest automatically.
+ELF paths may be relative to their manifest. Loading verifies the ELF hash
+before opening XRT.
+
+```powershell
+$env:ANIMA_XDNA_AIR_ATTENTION_DIR = "<PERSISTENT_AIR_ARTIFACT_DIRECTORY>"
+$env:ANIMA_XDNA_ATTENTION_BACKEND = "air"
+# Start ComfyUI with its usual XDNA launcher.
+```
+
+The repository default is always the baseline, even when an artifact directory
+is configured. AIR requires an explicit `ANIMA_XDNA_ATTENTION_BACKEND="air"`.
+The MODEL attachment and Runtime Status report
+`attention_backend: "air_experimental"`. First use logs an
+`EXPERIMENTAL AIR attention ACTIVE` warning including the known precision
+difference. The normal Load Anima (BF16) -> Load/Attach XDNA -> sampler
+workflow does not need replacement nodes. Both standard `run_range` and
+CPU-versus-NPU chain validation use the selected NPU backend; the CPU oracle
+never uses AIR.
+
+AIR is fixed to batch 1, 1024 image tokens, 512 context tokens and 16 heads
+of depth 128. Masks, unsupported shapes, missing/corrupt artifacts and device
+failures raise errors; there is no silent baseline/CPU fallback. Runners
+remain resident across sampler steps and close on runtime unload.
+
+For a controlled comparison with identical seed, prompt and sampler settings,
+stop ComfyUI, set the following and restart:
+
+```powershell
+$env:ANIMA_XDNA_ATTENTION_BACKEND = "baseline"
+```
+
+This disables AIR even if the artifact directory is still configured. Restart
+with `"air"` to re-enable it. Merely changing an environment variable outside
+an already-running server does not replace a cached MODEL runtime.
+
+On the user's explicitly requested local deployment, AIR is the standard
+route selected by its local configuration in the normal ComfyUI interpreter;
+this does **not** change the
+unconfigured repository default or make the failed numerical gates pass.
+
+The repository launcher also supports explicit selection:
+
+```powershell
+.\examples\run_comfyui_xdna.ps1 `
+  -ComfyUIRoot "<COMFYUI_ROOT>" -XDNAVenv "<XDNA_VENV>" `
+  -XRTDevDir "<XRT_SDK_DIR>" -ModelPathsConfig "<USER_MODEL_PATHS_YAML>" `
+  -AttentionBackend air -AIRAttentionDirectory "<PERSISTENT_AIR_ARTIFACT_DIRECTORY>"
+```
+
+Without `-AttentionBackend air`, this launcher explicitly selects baseline,
+including when the parent shell has an AIR environment setting. The user's
+previously configured local launchers are separate and are not changed by
+this release.
+
+### Runtime test coverage
 
 CPU tests cover exact key/config discovery, lazy block loading, shape rejection,
 layout/padding, deterministic inputs, RoPE, attention masks, the complete CPU
