@@ -1609,6 +1609,199 @@ The harness fails if the real-input comparisons, reference latent or
 repeat latents change. This remains an isolated experiment: production
 files, defaults, packed weights and NPU binaries were not modified.
 
+## Native INT8 QKV and attention output projections (2026-11-06)
+
+The next isolated experiment extends W8A8 from the MLP to both
+self-attention and cross-attention projections. It retains the previous
+fused host Q/K preparation as its baseline (`int8-qk`) and compares two
+new modes: `int8-attn-out` quantizes only attention output projections;
+`int8-attn` also quantizes Q, K and V projections.
+**AIR QK/scale/softmax/AV remains the existing BF16 implementation.**
+Production defaults, the installed node, packed weights and deployed
+NPU binaries are unchanged.
+
+The compact machine-readable results are in
+[`evidence/int8-attention-projection-probe.json`](evidence/int8-attention-projection-probe.json).
+Implementation sources, compiled artifacts, complete profiles and images
+remain in the persistent session's `files\int8` directory.
+
+### Native projections and fused host boundaries
+
+Activations use symmetric per-token INT8 quantization and weights use
+symmetric per-output-channel quantization, both with
+`scale = max(absmax, 1e-12) / 127`, round-to-nearest-even and range
+`[-127, 127]`. Weights are quantized once and retained in XRT BOs after
+warmup. Matrix products accumulate in INT32. Dequantization preserves
+`bf16((float(accumulator) * row_scale) * weight_scale)` before subsequent
+BF16 operations.
+
+QKV chaining is retained: three INT8 GEMMs are compiled into one
+multi-launch ELF with **one XRT dispatch per attention**, not three
+separate host launches. Self-attention shares one quantized input across
+Q/K/V. Cross-attention uses one quantized query input and one quantized
+context shared by K/V. Shapes `(M,N,K)` are:
+
+| Projection | Shape |
+|---|---|
+| Self Q/K/V and cross Q | 1024, 2048, 2048 |
+| Cross K/V | 512, 2048, 1024 |
+| Self/cross output projection | 1024, 2048, 2048 |
+
+The new QKV ELFs reuse the native INT8 `tl.dot` kernel and wide32
+schedule: 512x512 blocks, 64x128 core tiles, `l2_k=256`, `l1_k=32`,
+`accum_type="i32"` and no contract input cast. Their lowered LLVM IR
+loads `<64 x i8>` vectors into the AIE2P integer MAC intrinsic. Output
+projections reuse the previously verified `i8-sq2048-wide32` ELF.
+Standalone repeated random/saturation checks cover 33 complete matrix
+outputs, all bitwise equal to the exact integer oracle.
+
+The integration avoids standalone PyTorch quantize/dequantize passes:
+
+- The existing fused modulation + quantization operation is reused for
+  `norm1` and `norm2`; LayerNorm and host AdaLN GEMVs remain unchanged.
+- A new native operation dequantizes INT32 Q/K/V, applies the validated
+  RMSNorm/RoPE arithmetic, and writes head-major BF16 AIR inputs. It
+  reuses `fused_qk.cpp` rather than implementing a second reduction order.
+- AIR output layout conversion and per-token quantization share one
+  native pass, without a separate full BF16 token-major tensor.
+- The existing fused dequantization + BF16 gate + residual operation is
+  reused for attention output projections.
+
+The fixed-shape wrappers reject invalid inputs rather than falling back.
+INT32 QKV outputs borrow shared BO storage only until the next dispatch;
+the host preparation consumes them synchronously and returns newly owned
+BF16 tensors. The new host probe passes 82 checks, including bit patterns,
+RNE ties, subnormals, storage offsets, output ownership, thread counts,
+invalid scales, NaN payloads, overflow and shape/dtype/stride rejection.
+The DLL uses the same strict-floating-point AVX-512/OpenMP build flags
+as the previous fusion.
+
+During each real warmup, every new host boundary is compared bitwise
+with its PyTorch reference. Every quantized projection also checks three
+spread-out rows and 32 output channels against an exact full-K integer
+oracle: 1,120 projection checks across the two new modes per comparison.
+These checks do not claim the quantized output matches BF16; they verify
+the chosen quantization scheme and its native implementation agree.
+All extra verification is disabled for timed samples.
+
+### Matched sampler performance
+
+Conditions remain Turbo V1.1, 512x512, four Euler/simple steps, CFG 1,
+seed `700755787614899`, the cherry-blossom prompt above and ten threads.
+After warming all three modes, six samples per mode use balanced orders
+`ABC, ACB, CAB, CBA, BCA, BAC`, where A is `int8-qk`, B is
+`int8-attn-out` and C is `int8-attn`. Each mode occupies each execution
+position twice. Loading, text encoding, VAE and saving are excluded.
+
+| Per four-step sampler | Previous INT8 MLP + fused Q/K | + INT8 attention output | + INT8 QKV and output |
+|---|---:|---:|---:|
+| Median sampler | 9.336 s | 8.747 s | **7.474 s** |
+| Reduction against matched baseline | - | 0.589 s / 6.31% | **1.862 s / 19.94%** |
+| Individual times, seconds | 9.372, 9.226, 9.267, 9.354, 9.319, 10.380 | 8.782, 8.591, 8.712, 8.646, 8.786, 9.467 | 7.407, 7.473, 7.520, 7.457, 7.476, 8.107 |
+| Dispatches | 896 | 896 | 896 |
+| Model forwards | 4 | 4 | 4 |
+
+Both candidates improve in all six paired comparisons. Full projection
+INT8 saves 1.965, 1.753, 1.747, 1.897, 1.843 and 2.273 s. The last
+iteration is slower for all modes and is retained, not discarded.
+The new baseline is measured alongside the candidates; do not use the
+previous experiment's 9.282 s as the denominator.
+
+Mean profile totals, not medians:
+
+| Component | Baseline | Output only | QKV + output |
+|---|---:|---:|---:|
+| QKV projection chains | 2.133 s | 2.036 s | 1.143 s |
+| Attention output projections | 0.968 s | 0.551 s | 0.547 s |
+| Q/K/V preparation, including dequantization when needed | 0.252 s | 0.248 s | 0.325 s |
+| Attention LayerNorm + modulation / quantization | 0.294 s | 0.310 s | 0.184 s |
+| AIR output layout / layout + quantization | 0.069 s | 0.088 s | 0.098 s |
+| Attention gated residual / fused dequantization + residual | 0.183 s | 0.159 s | 0.134 s |
+| AIR attention stages | 2.705 s | 2.674 s | 2.662 s |
+| Inner AIR runner | 2.080 s | 2.079 s | 2.070 s |
+| MLP projections + fused middle | 1.412 s | 1.408 s | 1.399 s |
+| Block overhead outside stages | 0.657 s | 0.533 s | 0.301 s |
+| Complete sampler mean | 9.486 s | 8.831 s | 7.573 s |
+
+This is the benefit of **INT8 projections plus fused host boundaries and
+their integration**, not a device-only GEMM speedup. QKV/output stage
+times include host work and transfers; block overhead also decreases.
+The AIR runner remains approximately 2.07 s and includes copies and
+synchronization, not only device execution. No Softmax or AIR-kernel
+acceleration is claimed, and dispatch count does not decrease.
+
+All 18 timed samples reproduce their own warmup latent bitwise. The
+baseline latent and decoded PNG also match the previous `int8-qk`
+experiment exactly. FP32 VAE single-decode measurements were 4.670,
+4.791 and 4.762 s respectively. The full projection variant therefore
+has an estimated sampler-plus-VAE time of **12.24 s** (7.474 + 4.762).
+This sum is **not an end-to-end median**, and still excludes loading,
+text encoding and saving.
+
+### Output changes and limits
+
+The speedup is not output-equivalent. Two additional prompt/seed cases
+were run through all three modes, with one timed repeat per mode and
+separate FP32 VAE decodes. They check reproducibility and output changes,
+not the six-sample performance estimate.
+
+| Prompt/seed case | Output-only latent NRMSE | Full projection latent NRMSE | Output-only RGB MAE / 255 | Full projection RGB MAE / 255 |
+|---|---:|---:|---:|---:|
+| Cherry blossoms, `700755787614899` | 40.32% | 36.24% | 21.264 | 18.240 |
+| Blue-haired portrait, `42` | 32.99% | 30.09% | 16.433 | 16.302 |
+| Mountain village/lake, `314159265` | 20.25% | 30.92% | 6.896 | 10.899 |
+
+Each comparison uses the corresponding **existing INT8 MLP + BF16
+attention-projection baseline**, not an original FP32/BF16 model.
+All outputs are finite, reproducible and decode to images, but visual
+inspection shows changed hair, clothing and flowers in the first case,
+portrait details in the second, and buildings/foreground in the
+landscape. NRMSE/MAE measure output difference, not perceptual quality.
+The smaller error of full projection INT8 in some cases does not show
+that quantizing more layers improves quality. Three cases do not
+establish general quality equivalence or justify automatic deployment.
+The baseline's existing experimental AIR and MLP quantization
+limitations also remain.
+
+### Persistent implementation and reproduction
+
+New session-local sources are `int8_attention_runner.py`,
+`int8_attention_probe.py`, `fused_attention.cpp`, `fused_attention.py`,
+`fused_attention_probe.py` and `int8_attention_summary.py`; the existing
+`int8_e2e.py` and profile formatter now support the two new modes.
+The authoritative measurement directory is `int8-attention-final`.
+The additional cases are in `int8-attention-quality-portrait` and
+`int8-attention-quality-landscape`. Each contains its report, FP32
+latents and PNGs. `int8-attention-final\implementation.zip` pins the
+experiment scripts, dependent host DLLs and five required INT8 ELFs;
+extract its contents back into a session `files\int8` directory with
+the existing node/model/environment setup, not into the production node.
+Source, DLL, ELF and archive hashes are recorded in the evidence JSON.
+
+With the earlier experiment's environment variables and artifacts, run
+from the session `files\int8` directory. Compile the QKV ELFs with the
+newer compiler environment used in the native INT8 feasibility probe;
+run the host probe and ComfyUI harness with the production Python venv:
+
+```powershell
+& $compilerPython int8_attention_probe.py
+# Build in this directory after setting the VS x64 environment in the same cmd.exe:
+# cl /nologo /LD /O2 /MD /std:c++17 /EHsc /arch:AVX512 /fp:strict /openmp fused_attention.cpp /Fe:fused_attention.dll
+& $python fused_attention_probe.py
+& $python int8_e2e.py --out int8-attention-repeat --runs 6 `
+  --modes int8-qk int8-attn-out int8-attn `
+  --reference int8-qk-final\latent_int8-qk.pt `
+  --verify-qk --verify-attention
+```
+
+For the supplementary cases, use the exact prompts/seeds in the evidence
+JSON, `--runs 1`, and omit `--reference` (the reference above belongs only
+to the original prompt/seed). The harness retains its original default
+modes, requires all modes to reproduce their own warmups, rejects missing
+or incomplete verification, and checks 896 dispatches/four forwards.
+The public runtime still rejects INT8 requests; this experiment does not
+add an installable production quantization mode.
+
 ## Public verification ladder
 
 Set placeholders only in the current shell; do not commit paths or captures.
