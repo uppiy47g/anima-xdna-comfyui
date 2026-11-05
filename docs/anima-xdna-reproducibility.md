@@ -1134,6 +1134,73 @@ so the data-type fields must be checked as well as the implementation name.
 The earlier synthetic-op check was insufficient to establish these
 real-workload distinctions.
 
+## Native INT8 GEMM feasibility (2026-11-05)
+
+This is a standalone hardware probe, not a production path. Production
+remains BF16 (`quantization_scheme="none"`). The probe used the same
+compiler stack as the deployed wide32 library: mlir-air
+`0.0.1.2026102020+508ca73`, mlir-aie `1.4.5.dev51+ge040370`, llvm-aie
+`22.0.0.2026101201+83ba9ea9`, Triton-XDNA `3.6.0.2026093004+75679dc`, and
+XRT `2.21.75`. Kernels used `tl.dot` on `int8` operands with
+`accum_type="i32"` and no contract input cast, which keeps the operands
+signed. The wide32 transform was reused (`l1_m=64`, `l1_n=128`, `l2_k=256`,
+`l1_k=32`, 512x512 blocks) unless noted otherwise.
+
+**INT8 is native:** the core LLVM IR loads raw `<64 x i8>` vectors directly
+into `llvm.aie2p.I512.I512.ACC2048.mac.conf`, and nothing converts them to
+BF16. Every INT8 run gave int32 output bitwise equal to the CPU integer
+matmul, with zero mismatches. This held for random data and for the real
+block-0 fixtures. Because of this, the quality of any INT8 scheme can be
+simulated exactly on the CPU.
+
+A whole-K load fails at `K=8192` with Triton's "Maximum allowed number of
+elements is 1048576" error. A K-loop kernel (`acc = tl.dot(a, b, acc)`,
+`k_loop=True`, `BLOCK_K == l2_k`) compiles and removes the production 4x
+`K=2048` split.
+
+Times are the median `kernel_sync` of 21 warm runs with the weight resident
+and no ComfyUI process running.
+
+| Shape (M,N,K) | BF16 kernel | INT8 kernel | INT8 schedule | Speedup |
+|---|---:|---:|---|---:|
+| MLP `proj_in` 1024,8192,2048 | 7.03 ms (production) | 3.79 ms | `l2_k=512`, `l1_k=64` | 1.85x |
+| Attention 1024,2048,2048 | 2.31 ms (production) | 1.54 ms | wide32 | 1.51x |
+| MLP `proj_out` 1024,2048,8192 | 5.42 ms (BF16 K-loop) / 4 x 2.31 ms (production split) | 3.76 ms | wide32 K-loop | 1.44x / 2.46x |
+
+On the same `proj_in` shape, the INT8 wide32 schedule took 4.95 ms and
+`l1_k=64` took 3.97 ms. A BF16 build with `l1_k=64` stayed at 6.99 ms. The
+best effective INT8 throughput is about 9 TOPS, well below the int8 peak,
+so the schedule is not yet tuned.
+
+A **BF16 K-loop** `proj_out` is a separate candidate. Its kernel time is
+5.42 ms against 9.25 ms for the production split. It also needs no host
+partial sums, and it reduces those dispatches from 448 to 112 per sampler.
+
+Numerical error on real block-0 inputs is the NRMSE against FP64
+computed from the same BF16 inputs. The W8A8 row uses int8 activations
+quantized per token and int8 weights quantized per output channel, run on
+the NPU. The other quantized rows are exact CPU simulations.
+
+| Layer | Production BF16/BFP16 | W8A8 per-token / per-channel | W8A8 per-tensor activation | W8-only |
+|---|---:|---:|---:|---:|
+| `attn1.q` | 0.57% | 1.55% | 2.78% | 0.80% |
+| `attn1.out` | 0.29% | 0.61% | 0.61% | 0.45% |
+| `attn2.out` | 0.20% | 0.47% | 0.57% | 0.20% |
+| `ff.proj_in` | 0.48% | 1.22% | 1.25% | 0.75% |
+| `ff.proj_out` | 0.40% | 1.26% | 2.12% | 0.67% |
+
+W8A8 error is about 2.5-3x the error of the current BFP16 path, and its
+cosine similarity stayed at or above 0.99988. Its effect on generated
+images has not been measured.
+
+The host cost is the main obstacle. With 10 threads, the current
+fp32 -> BF16 -> GELU step on the 1024x8192 MLP middle takes 4.5 ms.
+Doing int32 dequantization, GELU, and per-row int8 requantization with
+stock PyTorch takes 13.4 ms. `torch.quantize_per_channel` is slower still,
+at 28 ms for the quantization step alone. Over 28 blocks and 4 steps, this
+extra host work would add about 1 s per sampler unless the dequantization
+and quantization are fused into one host kernel or moved to the NPU.
+
 ## Public verification ladder
 
 Set placeholders only in the current shell; do not commit paths or captures.
