@@ -27,6 +27,7 @@ LinearPairRunner = Callable[
     dict[str, Any],
 ]
 AttentionRunner = Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]
+AdaLNRunner = Callable[[torch.Tensor, tuple[str, str]], torch.Tensor]
 
 
 @dataclass(frozen=True)
@@ -180,6 +181,7 @@ class _BlockExecution:
         qkv_runner: Optional[QKVRunner] = None,
         linear_pair_runner: Optional[LinearPairRunner] = None,
         attention_runner: Optional[AttentionRunner] = None,
+        adaln_runner: Optional[AdaLNRunner] = None,
     ):
         self.config = config
         self.weights = weights
@@ -189,6 +191,7 @@ class _BlockExecution:
         self.qkv_runner = qkv_runner
         self.linear_pair_runner = linear_pair_runner
         self.attention_runner = attention_runner
+        self.adaln_runner = adaln_runner
         self.metrics: list[StageMetric] = []
 
     def host(self, name: str, operation: Callable[[], Any]) -> Any:
@@ -314,7 +317,14 @@ class _BlockExecution:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         activated = self.host(prefix + ".silu", lambda: F.silu(embedded))
         pair_names = (prefix + ".linear_1.weight", prefix + ".linear_2.weight")
-        if self.linear_pair_runner is not None:
+        if self.adaln_runner is not None:
+            # Single-row AdaLN GEMVs are weight-bandwidth bound; host BF16 avoids
+            # two NPU dispatches whose fixed cost dominates their arithmetic.
+            modulation = self.host(
+                prefix + ".adaln_linear_pair",
+                lambda: self.adaln_runner(activated, pair_names),
+            )
+        elif self.linear_pair_runner is not None:
             weights = (self.weights[pair_names[0]], self.weights[pair_names[1]])
             started = time.perf_counter()
             try:
@@ -626,6 +636,7 @@ def run_xdna_block(
     qkv_chaining: bool = True,
     activation_chaining: bool = True,
     attention_runner: Optional[AttentionRunner] = None,
+    host_adaln: bool = False,
 ) -> BlockResult:
     _validate_inputs(config, inputs)
     from .xdna import XDNASession
@@ -842,6 +853,23 @@ def run_xdna_block(
             )
             return profile
 
+        def adaln_runner(
+            value: torch.Tensor,
+            weight_names: tuple[str, str],
+        ) -> torch.Tensor:
+            value = value.to(torch.bfloat16)
+            for weight_name in weight_names:
+                if packed_cache is not None and block_index is not None:
+                    weight = packed_cache.host_linear(block_index, weight_name)
+                else:
+                    weight = weights[weight_name]
+                    if weight.is_meta:
+                        raise UnsupportedTensor(
+                            f"host AdaLN requires materialized weight {weight_name}"
+                        )
+                value = F.linear(value, weight.to(torch.bfloat16))
+            return value
+
         result = _BlockExecution(
             config,
             weights,
@@ -855,6 +883,7 @@ def run_xdna_block(
             if resident_key is not None and activation_chaining
             else None,
             attention_runner=attention_runner,
+            adaln_runner=adaln_runner if host_adaln else None,
         ).run(inputs)
     return BlockResult(
         result.output,

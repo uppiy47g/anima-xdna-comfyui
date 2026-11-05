@@ -17,7 +17,7 @@ ComfyUI still executes:
 - final projection/unpatchify, sampler orchestration, and Qwen Image VAE
 
 XDNA 2 executes 448 Linear/QK/AV GEMM dispatches in the default 28-block
-chain. The self/cross Q/K/V projection groups each run as one `NPUChain`,
+chain when `ANIMA_XDNA_ADALN_DEVICE=xdna`. The self/cross Q/K/V projection groups each run as one `NPUChain`,
 and each AdaLN `linear_1 -> linear_2` pair uses one externally bound BF16
 activation BO instead of a D2H/H2D round trip. Shape/dtype-compatible
 activation BOs are leased from a session-owned pool and closed with the session.
@@ -25,6 +25,14 @@ Unsupported pair layouts retain the existing host-visible two-dispatch path.
 The optional `qkv_chaining=false` input disables Q/K/V grouping while retaining
 AdaLN activation chaining, producing 560 dispatches. Disabling both optimizations
 through the Python runtime restores the prior 644-dispatch path for comparison.
+
+By default (`ANIMA_XDNA_ADALN_DEVICE=host`) the single-row AdaLN
+`linear_1 -> linear_2` GEMVs instead run on the host in BF16 from the packed
+(LoRA-effective) weights, removing their XDNA dispatches (three per block with
+pair chaining, six without). These GEMVs are weight-bandwidth bound, so the
+fixed dispatch cost dominated. Results are not bitwise identical to the XDNA
+AdaLN path; set `ANIMA_XDNA_ADALN_DEVICE=xdna` before starting ComfyUI to
+restore it.
 Weights, kernel objects, contexts, and BOs
 remain resident between denoising steps. The wrapper never silently falls
 back to CPU.

@@ -592,6 +592,11 @@ This disables AIR even if the artifact directory is still configured. Restart
 with `"air"` to re-enable it. Merely changing an environment variable outside
 an already-running server does not replace a cached MODEL runtime.
 
+`ANIMA_XDNA_ADALN_DEVICE` selects where the AdaLN `linear_1 -> linear_2`
+GEMVs run for both backends: `host` (default, BF16 on the CPU, no XDNA
+dispatches) or `xdna`. The two are not bitwise identical; use `xdna` to
+reproduce images generated before this option existed.
+
 On the user's explicitly requested local deployment, AIR is the standard
 route selected by its local configuration in the normal ComfyUI interpreter;
 this does **not** change the

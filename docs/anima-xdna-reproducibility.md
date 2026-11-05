@@ -1045,6 +1045,34 @@ be presented as the measured speed of the deployed normal environment.
 The local launcher/configuration and generated images are retained outside
 the repository for the user's direct evaluation.
 
+### Host AdaLN and lightweight AIR finite checks
+
+A later profile of the deployed AIR route (Turbo V1.1, 512x512, four
+Euler/simple steps, CFG 1, seed `700755787614899`, ten CPU threads, three
+warmed sampler runs each) found two host-side costs:
+
+- `torch.isfinite(t).all()` on every AIR Q/K/V input and output cost about
+  1.2 s/sampler in elementwise ATen ops. The checks now reduce once in FP32
+  (`isfinite(t.sum(dtype=float32))`), which still rejects any NaN/Inf.
+- The six single-row AdaLN GEMV dispatches per block (that deployment's GEMM
+  layout cannot use pair chaining) were dominated by fixed dispatch cost.
+  `ANIMA_XDNA_ADALN_DEVICE=host` (the new default) runs them on the host in
+  BF16 from the packed, LoRA-effective weights; `xdna` restores the NPU path.
+
+| Measurement | Before | Finite check only | + host AdaLN |
+|---|---:|---:|---:|
+| Warm four-step sampler median | 12.658 s | 11.507 s | 10.881 s |
+| XRT dispatches/model evaluation | 476 | 476 | 308 |
+| Decoded image vs before (RGB MAE) | - | 0 (bitwise) | 11.91/255 |
+
+The finite-check change is output-identical. Host AdaLN is not: on real
+inputs its modulation differed from the NPU path by 0.25% relative L2
+(median), while its error against an FP32 computation from the same weights
+was 0.17% versus the NPU path's 0.21%. That bf16-rounding-level change is
+amplified by the four-step trajectory into a visibly different fixed-seed
+image; it is not a weight or layout error (the unpacked weights were
+bitwise equal to the loaded model's).
+
 ## Public verification ladder
 
 Set placeholders only in the current shell; do not commit paths or captures.
