@@ -1328,6 +1328,158 @@ the wrapper checks AVX-512 availability and tensor layouts before use.
 These remain experimental session artifacts, not a new production
 dependency or an enabled quantization mode.
 
+## INT8 full-section profile and fused MLP entry/exit (2026-11-06)
+
+Same real-ComfyUI conditions as the section above: Anima Turbo V1.1,
+512x512, four Euler/simple steps, CFG 1, the same seed and prompts, ten
+PyTorch threads, experimental AIR attention, host AdaLN, and W8A8 MLPs
+with the fused host middle. A new harness timed every stage the block
+executes, the NPU runner calls inside the AIR attention stage, and the
+time *between* stages, so the components below sum to the measured
+sampler time. After one warmup per mode, the two modes alternated
+(ABBAABBAAB) for five measured samples each. Sampler times **exclude
+model loading, text encoding and VAE decoding**. The stage timers are
+active in both modes, so absolute times include their (small) cost.
+
+### Where the INT8 sampler time goes
+
+Mean of five measured four-step samples. "Before" is the INT8 W8A8
+configuration from the previous section; "After" adds the fused MLP
+entry/exit described below. Before the change, the MLP stage timers also
+contain the host quantization (0.218 s) and dequantization (0.082 s).
+
+| Component | Before | After |
+|---|---:|---:|
+| NPU AIR attention stages (`attn1` + `attn2`) | 2.819 s (26.5%) | 2.807 s |
+| NPU Q/K/V chain stages | 1.971 s (18.5%) | 1.991 s |
+| NPU INT8 MLP stages (`proj_in` + `proj_out`) | 1.530 s (14.4%) | 1.209 s |
+| NPU attention out-projection (BF16) | 0.953 s (8.9%) | 0.956 s |
+| Host Q/K RMSNorm | 0.875 s (8.2%) | 0.875 s |
+| Host RoPE (self-attention only) | 0.540 s (5.1%) | 0.567 s |
+| Block time outside every stage timer | 0.474 s (4.5%) | 0.498 s |
+| Host LayerNorm + modulation | 0.329 s (3.1%) | 0.331 s |
+| Host gated residuals | 0.229 s (2.2%) | 0.232 s |
+| Host AdaLN (SiLU + two BF16 GEMVs) | 0.218 s (2.1%) | 0.217 s |
+| Host fused dequant + GELU + requant | 0.186 s (1.7%) | 0.187 s |
+| ComfyUI sampler outside the model forward | 0.179 s (1.7%) | 0.187 s |
+| Forward-call overhead (lock/validation) | 0.143 s (1.3%) | 0.148 s |
+| Host head layout | 0.099 s (0.9%) | 0.099 s |
+| Embedding, time embedding and final layer | 0.088 s (0.8%) | 0.094 s |
+| Chain overhead outside blocks | 0.017 s (0.2%) | 0.016 s |
+| **Sampler mean** | **10.650 s** | **10.413 s** |
+
+With the fused entry/exit, NPU stage walls total 6.96 s (67%), host-only
+stages 2.51 s (24%), and time outside every stage timer 0.94 s (9%).
+All 896 dispatches per sample are unchanged. The profile shows:
+
+- Only 2.07 s of the 2.81 s AIR attention stage is `runner.run`
+  (1.274 s for the 1024-token self-attention, 0.794 s for the 512-token
+  cross-attention). The remaining 0.74 s (26%) is host work around the
+  dispatches.
+- The BF16 out-projection stages take 0.956 s. The NPU kernel is 0.554 s
+  of that (2.47-2.48 ms per call) and the copy/H2D/D2H counters add
+  0.09 s. About 0.31 s is host work those counters do not cover; the
+  source shows a zero-filled padded input copy and an FP32-to-BF16 output
+  conversion on this path, but this has not been broken down yet.
+- Q/K RMSNorm, RoPE and head layout together take 1.54 s (14.8%). They
+  are eager PyTorch operations with several full-tensor FP32/BF16
+  temporaries (for example 2.6 ms for one self-attention Q RMSNorm).
+- The Q/K/V chain stages (1.99 s) have no sub-timers yet.
+
+The "before" sampler here (10.652 s median) is 0.165 s faster than the
+10.817 s of the previous section's run, inside the run-to-run variation
+of about 0.3 s. Compare absolute times only within one comparison.
+
+### Fused MLP entry and exit
+
+Two further OpenMP/AVX-512 host operations replace the unfused PyTorch
+steps around the INT8 MLP:
+
+- **Entry.** `F.layer_norm` stays in PyTorch (0.21 ms, and its reduction
+  order is not worth replicating). One kernel then applies the
+  BF16-rounded modulation, `bf16(bf16(ln * bf16(1 + scale)) + shift)`,
+  checks finiteness, finds each token's absolute maximum, and writes the
+  INT8 activation (round-to-nearest-even, [-127, 127]) and per-token
+  scale directly as the NPU input.
+- **Exit.** The `proj_out` INT32 accumulators are dequantized with the
+  per-token and per-output-channel scales, rounded to BF16, multiplied by
+  the gate, rounded, added to the residual and rounded again in a single
+  pass that writes the new hidden state. The intermediate BF16 MLP output
+  and gate product are never materialized.
+
+BF16 rounding uses an integer round-to-nearest-even implementation that
+matches PyTorch's conversion for finite values; `vcvtneps2bf16` was not
+used because its denormal handling differs. Isolated CPU-only
+microbenchmark, ten threads, median of 60 runs:
+
+| Operation | PyTorch reference | Fused |
+|---|---:|---:|
+| Modulation + INT8 quantization | 1.83 ms | 0.38 ms |
+| Dequantization + gated residual | 1.03 ms | 0.37 ms |
+
+A 22-case probe compared both kernels with the PyTorch reference. Outputs
+were **bitwise identical** for random data at several magnitudes, an
+outlier, a zero row, tiny (1e-30) values, all-zero input, strided
+gate/shift/scale views, accumulators spanning the full INT32 range and a
+zero gate. NaN/Inf inputs, a NaN modulation scale, zero or NaN
+dequantization scales, and wrong dtype or shape raised explicit errors
+instead of falling back.
+
+| Four-step sample, five alternating runs | INT8 | INT8 + fused entry/exit |
+|---|---:|---:|
+| Median sampler | 10.652 s | 10.418 s |
+| Per-pair sampler difference | - | -0.22, -0.18, -0.24, -0.30, -0.25 s |
+| MLP entry (`norm3` LayerNorm/modulation + `proj_in`) | 0.948 s | 0.684 s |
+| MLP exit (`proj_out` + `ff.gated_residual`) | 0.734 s | 0.657 s |
+| All NPU dispatches | 896 | 896 |
+
+The sampler improved by **0.234 s / 2.19%**, matching the roughly 0.24 s
+predicted from the microbenchmark (about 2.1 ms per block over 112
+blocks). The stage-level savings add up to 0.34 s, but about 0.1 s of it
+was offset by slightly slower unmodified stages in this run (largest:
+`norm1` LayerNorm/modulation +0.030 s, `attn1.q_rope` +0.027 s,
+`attn1.qkv_chain` +0.020 s). The cause was not investigated, so the
+sampler-level alternating comparison is the number to rely on.
+
+The final latent is **bitwise identical** to the earlier INT8 latent from
+a separate process (`torch.equal` true, NRMSE 0, maximum difference 0),
+and the decoded PNG has the same SHA-256. All ten measured samples also
+reproduced their mode's warmup latent bitwise. The fusion therefore
+changes speed only; the INT8 quality caveats above (26.7% latent NRMSE
+against the BF16 K-loop from one prompt/seed, and the AIR attention's
+29% NRMSE against control) are unchanged. With the FP32 VAE decode
+(single 3.42 s measurement) one image takes about 13.8 s, excluding text
+encoding and model loading.
+
+### Remaining host-side targets
+
+Ordered by measured share; the savings are estimates, not measurements.
+
+1. **Fused Q/K RMSNorm + RoPE writing the AIR input layout directly**
+   (1.54 s including head layout). The entry kernel moves the same 4 MB
+   tensors in 0.38 ms, so about 0.5 ms per call (roughly 0.2 s per
+   sampler) is a plausible target. Bitwise equality requires matching
+   PyTorch's `mean` reduction order; if that cannot be matched, the
+   kernel needs an explicit error bound and a new latent-quality
+   measurement.
+2. **Itemize the host work around NPU dispatches**: 0.74 s in the AIR
+   stages, about 0.31 s in the out-projection stages, 0.50 s of block
+   time outside every stage timer, and the Q/K/V chain (1.99 s with no
+   sub-timers). Finer instrumentation should come before kernel choices.
+3. **INT8 attention projections.** The out-projection kernel is 0.554 s
+   of its 0.956 s, so even a 2x faster kernel recovers under 0.3 s, and
+   quantizing attention carries more quality risk than the MLP.
+
+Persistent session-local evidence is under `files\int8`: `int8_e2e.py`
+(profile and A/B harness), `int8_profile_table.py`, `fused_io.cpp`,
+`fused_io.py`, `fused_io_probe.py`, `fused_io_report.json`, and the
+`int8-io-e2e` directory with the report, `profile.md`, latents and PNGs.
+`fused_io.dll` was built with the same MSVC toolchain and flags as
+`fused_middle.dll`; the wrapper checks AVX-512 availability, dtypes,
+shapes and contiguity before use. These remain experimental session
+artifacts. The production node, packed weights and defaults are
+unchanged, and no quantization mode is enabled.
+
 ## Public verification ladder
 
 Set placeholders only in the current shell; do not commit paths or captures.
