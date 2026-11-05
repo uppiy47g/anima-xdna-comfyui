@@ -1453,7 +1453,8 @@ encoding and model loading.
 
 ### Remaining host-side targets
 
-Ordered by measured share; the savings are estimates, not measurements.
+Candidates identified from this profile; the first is measured in the
+next section. The following estimates are not measured speedups.
 
 1. **Fused Q/K RMSNorm + RoPE writing the AIR input layout directly**
    (1.54 s including head layout). The entry kernel moves the same 4 MB
@@ -1479,6 +1480,134 @@ Persistent session-local evidence is under `files\int8`: `int8_e2e.py`
 shapes and contiguity before use. These remain experimental session
 artifacts. The production node, packed weights and defaults are
 unchanged, and no quantization mode is enabled.
+
+## Fused host Q/K RMSNorm, RoPE and AIR input layout (2026-11-06)
+
+The next experiment adds one dedicated CPU call per attention to the
+previous INT8 + fused MLP entry/exit configuration. It consumes the
+token-major BF16 Q/K/V projection outputs, normalizes Q and K, applies
+split-half RoPE for self-attention, and writes contiguous head-major
+Q/K/V tensors directly for AIR. Cross-attention omits RoPE. The V tensor
+is only rearranged; it is neither normalized nor quantized.
+
+This is **host fusion**, not a new NPU kernel or another quantization
+change. Attention GEMMs, AIR attention, MLPs, AdaLN, gated residuals and
+the AIR output layout operation are unchanged. Existing AIR input/output
+finite checks remain enabled. The native call uses OpenMP with ten
+threads and AVX-512, with newly owned output buffers rather than shared
+scratch outputs. It accepts both the actual 2-D QKV-chain outputs and
+batch-one 3-D tensors, for 16 heads, depth 128, 1024 queries and either
+1024 or 512 keys.
+
+### Matching the reference arithmetic
+
+The deployed PyTorch 2.14.1+cpu build
+(`5c4886908584029761b579af026dcfb627c84070`) uses an eight-lane FP32
+reduction order for the 128-element mean, despite the CPU supporting
+AVX-512. A sixteen-lane or tree reduction is not bitwise equivalent.
+The kernel therefore accumulates squared values in four eight-lane
+accumulators, combines them left-to-right, and sums the resulting eight
+lanes serially before dividing by 128. Reciprocal square root uses
+division by square root, not an approximate reciprocal instruction.
+
+The existing BF16 rounding after normalization, after multiplication by
+the learned weight, and after RoPE is preserved. RoPE uses separate FP32
+multiplications and addition, without FMA contraction. The DLL is built
+with `/LD /O2 /MD /std:c++17 /EHsc /arch:AVX512 /fp:strict /openmp`.
+The Python wrapper checks AVX-512 support and the installed PyTorch mean
+reduction contract at initialization; an incompatible reduction raises
+an error rather than selecting a silent fallback.
+
+The final CPU probe passed 61 checks, covering both key lengths,
+2-D/3-D inputs, storage offsets, signed zeros, BF16 subnormals, outliers,
+zero rows, zero/negative weights, identity/quarter-turn RoPE, and
+1/4/10 threads. It compares BF16 bit patterns, including signed zeros,
+and checks input immutability and independent output ownership.
+Invalid shapes/dtypes/strides, nonfinite inputs (including unusual NaN
+payloads), variance overflow and invalid thread counts are rejected.
+
+Interleaved CPU microbenchmarks, 60 measured calls per mode after warmup,
+including allocation and contiguous Q/K/V output preparation:
+
+| Complete attention-input preparation | PyTorch | Fused |
+|---|---:|---:|
+| Self-attention, 1024 queries/keys | 8.284 ms | 1.184 ms |
+| Cross-attention, 1024 queries / 512 keys | 3.404 ms | 0.639 ms |
+
+### Matched real-ComfyUI result
+
+Conditions remain Turbo V1.1, 512x512, four Euler/simple steps, CFG 1,
+seed `700755787614899`, the same prompts, host AdaLN and experimental
+AIR attention. The baseline is `int8-io`, not the original BF16 model.
+Both modes warm up, then run in alternating order (ABBAABBAAB), five
+samples each. During the fused warmup only, every prepared Q/K/V tensor
+is compared bitwise with the reference: 112 self-attention and 112
+cross-attention calls, covering all 28 blocks and all four steps.
+These extra comparisons are disabled for the timed samples.
+
+| Per four-step sampler | INT8 + fused MLP I/O | Plus fused Q/K preparation |
+|---|---:|---:|
+| Median sampler, excluding VAE | 10.493 s | 9.282 s |
+| Individual sampler times | 10.493, 10.433, 10.424, 10.804, 10.940 s | 9.214, 9.281, 9.282, 9.614, 9.478 s |
+| Self-attention input preparation, mean total | 1.116 s | 0.154 s |
+| Cross-attention input preparation, mean total | 0.391 s | 0.099 s |
+| Combined input preparation, mean total | 1.507 s | 0.253 s |
+| AIR attention stages, mean total | 2.854 s | 2.727 s |
+| Inner AIR `runner.run`, mean total | 2.071 s | 2.067 s |
+| NPU dispatches | 896 | 896 |
+
+The median sampler improvement is **1.210 s / 11.54%**. All five matched
+pairs improved, by 1.279, 1.152, 1.142, 1.190 and 1.462 s. The last two
+pairs were slower in absolute terms in both modes; they remain included.
+A preceding run before the final invalid-NaN-input guard gave a similar
+10.420 -> 9.212 s result (-11.60%); the table above uses the final DLL.
+
+Input preparation itself fell by 1.254 s (83.2%). In the baseline its
+stage sum includes Q/K layout views, RMSNorm and RoPE, while the
+remaining contiguous copies occur inside the AIR stage. The fused sum
+already includes all three contiguous input tensors, including V.
+Consequently the combined preparation + AIR boundary is the fair
+accounting comparison: 4.361 -> 2.981 s mean. The unchanged AIR output
+layout operation is excluded from that boundary. Some gains are offset
+elsewhere (for example QKV-chain time +0.063 s and block time outside
+stage timers +0.080 s), so use the sampler result for the overall gain.
+**`runner.run` includes copies and synchronization; it is not a pure
+device-kernel timer.** No NPU-kernel speedup is claimed here.
+
+The saved final FP32 latent is bitwise identical to the earlier
+`int8-io` latent, with NRMSE and maximum absolute difference both zero.
+All ten timed samples reproduce their mode's warmup latent. The FP32
+VAE decode produces the same PNG SHA-256 as the previous INT8 result;
+identical latents share that decode rather than decoding twice.
+The single VAE measurement was 3.777 s, giving an approximate
+sampler-plus-VAE time of **13.1 s**, excluding model loading, text
+encoding and image saving. This is a sum of the sampler median and one
+VAE measurement, not an independently measured end-to-end median.
+There is no added output difference for this prompt/seed; the previously
+documented INT8 and AIR quality limitations remain unchanged.
+
+Persistent session-local evidence under `files\int8`:
+`fused_qk.cpp`, `fused_qk.py`, `fused_qk_probe.py`,
+`fused_qk_report.json`, the extended `int8_e2e.py` and
+`int8_profile_table.py`, and `int8-qk-final` containing `report.json`,
+`profile.md`, latents and PNGs. The report records source and DLL hashes,
+PyTorch build identity, per-stage times and verification counts.
+The final `fused_qk.dll` SHA-256 is
+`424290e3949b9d43e936fd7257e60088d2ae2bf99b689cbf4d3ec053c664806d`.
+
+With the same Python environment and environment variables as the
+previous experiment, run from the session's `files\int8` directory:
+
+```powershell
+python fused_qk_probe.py
+python int8_e2e.py --out int8-qk-repeat --runs 5 `
+  --modes int8-io int8-qk `
+  --reference int8-io-e2e\latent_int8-io.pt --verify-qk
+```
+
+The harness fails if the real-input comparisons, reference latent or
+repeat latents change. This remains an isolated experiment: production
+files, defaults, packed weights and NPU binaries were not modified.
 
 ## Public verification ladder
 
