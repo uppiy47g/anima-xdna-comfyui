@@ -1073,6 +1073,67 @@ amplified by the four-step trajectory into a visibly different fixed-seed
 image; it is not a weight or layout error (the unpacked weights were
 bitwise equal to the loaded model's).
 
+These are three warmed runs per configuration in separate processes, not
+an interleaved paired benchmark. The modified configuration was measured
+on a session-local copy of the deployed node, which also includes local GEMM
+layout optimizations absent from this repository. The production node was
+not modified. Text encoding, loading, and VAE decoding are outside the
+sampler medians; default FP32 VAE decode separately took a 2.909 s median
+before the changes and 2.870 s with them.
+
+In the first instrumented before/after runs, sampler wall time was
+12.776 / 10.925 s and summed XRT `wait2` time was 5.629 / 5.082 s.
+Wait includes device execution and runtime waiting; it is **not** pure NPU
+compute, and the ratio to wall time is not NPU utilization. The remaining
+wall time cannot all be assigned to CPU arithmetic either.
+`ff.proj_out` still used four dispatches per block (448 per four-step
+sample), taking 1.954 s in the modified run including its host handling.
+Reducing that split is a dispatch-reduction candidate, not a demonstrated
+speedup or a reason to repeat the unsuccessful MLP/elementwise fusion.
+
+#### Actual-workload AVX-512 BF16 verification
+
+On 2026-11-05, separate diagnostic processes traced the real Qwen text
+encoding, warmed four-step sampler, and default VAE decode on an AMD Ryzen
+AI 9 365 (Zen 5), using PyTorch `2.14.1+cpu`, oneDNN `3.12.0`, and ten CPU
+threads. Both the unchanged production node and the modified copy completed
+normally; each traced sampler reproduced its own warmup latent bitwise.
+Verbose tracing was separate from the latency measurements above.
+
+The check used `torch.backends.mkldnn.verbose(torch.backends.mkldnn.VERBOSE_ON)`
+around each actual workflow phase, with additional markers around the host
+AdaLN pairs. The following are **executed primitive records**, not just
+CPU support flags or synthetic GEMM results:
+
+| Actual operation | Configuration | Executed oneDNN implementation | Data type | Calls |
+|---|---|---|---|---:|
+| MLP GELU, `1x1024x8192` | Both | `jit:avx512_core_bf16` | BF16 | 112 per sampler |
+| AdaLN first linear, `1x2048:2048x256` | Host AdaLN | `brg_matmul:avx512_core_bf16` | BF16 input/weight/output | 336 per sampler |
+| AdaLN second linear, `1x256:256x6144` | Host AdaLN | `brg_matmul:avx512_core_bf16` | BF16 input/weight/output | 336 per sampler |
+| Default VAE convolutions | Both | `jit:avx512_core` / `jit_1x1:avx512_core` | FP32 | 35 per decode |
+
+Representative raw execution lines (the last field is diagnostic time in
+milliseconds, not a benchmark):
+
+```text
+onednn_verbose,v1,primitive,exec,cpu,eltwise,jit:avx512_core_bf16,forward_training,data:bf16::blocked:abc::f0,attr-scratchpad:user,alg:eltwise_gelu_erf alpha:0 beta:0,1x1024x8192,1.0466
+onednn_verbose,v1,primitive,exec,cpu,matmul,brg_matmul:avx512_core_bf16,undef,src:bf16::blocked:ab::f0 wei:bf16::blocked:ba::f0 dst:bf16::blocked:ab::f0,attr-scratchpad:user,,1x2048:2048x256,0.0796
+onednn_verbose,v1,primitive,exec,cpu,matmul,brg_matmul:avx512_core_bf16,undef,src:bf16::blocked:ab::f0 wei:bf16::blocked:ba::f0 dst:bf16::blocked:ab::f0,attr-scratchpad:user,,1x256:256x6144,0.1314
+```
+
+**AVX-512 BF16 is being used:** the existing production sampler selects a
+BF16-capable GELU kernel, and the new host AdaLN path executes all 672
+linears with the native BF16 matmul implementation. The production trace
+did **not** contain those CPU matmuls: its AdaLN still runs on XDNA.
+GELU is not a BF16 dot product, and no claim is made that every host
+operation uses BF16 instructions. In particular, the VAE remains FP32,
+and no oneDNN execution records appeared during Qwen text encoding;
+oneDNN logging alone cannot identify the ISA of non-oneDNN operations.
+The trace also contains FP32 GELU records with the `_bf16` ISA suffix,
+so the data-type fields must be checked as well as the implementation name.
+The earlier synthetic-op check was insufficient to establish these
+real-workload distinctions.
+
 ## Public verification ladder
 
 Set placeholders only in the current shell; do not commit paths or captures.
