@@ -2520,6 +2520,295 @@ with compile and hang logs, the assembled `pp-dir` and `nq8-dir`, the sampler
 harnesses and both A/B reports, the standalone VAE bench, the evidence generator
 and the patched node files with their diffs. The archive is not committed.
 
+## VAE decode: BF16, channels_last and an upsample stride fix (2026-11-06)
+
+After the AIR scale-out the warmed sampler takes about 6.1 s, and the default
+FP32 VAE decode of its 512x512 latent adds about 2.8 s on the CPU. This
+experiment checks three things: whether the decode can use the AVX-512 BF16
+fast paths, whether BF16 adds data-type conversion work, and how much it
+changes the output. Every run builds its own `comfy.sd.VAE` instance in a
+session process. ComfyUI, its launch flags, the node, the model files and the
+production defaults are unchanged, and **nothing in this section is
+deployed**.
+
+The compact machine-readable results are in
+[`evidence/vae-bf16-channels-last.json`](evidence/vae-bf16-channels-last.json).
+Scripts, oneDNN and profiler logs, PNGs and the full reports remain in the
+persistent session's `files\vae` and `files\int8` (`int8-vae-e2e`)
+directories.
+
+**Result.** The A/B ran in the INT8 sampler harness: the `nq8pp` mode, eight
+timed runs, both VAEs decoding the same sampled latent in rotated order.
+
+- The median of sampler plus VAE decode falls from 8.832 s with the FP32 VAE to
+  **7.322 s** with BF16+clfix: a median paired delta of -1.541 s (8 of 8 runs
+  faster) and -17.1% on the medians.
+- The decode alone falls from 2.762 s to 1.219 s (-55.9%).
+- This is the first **measured** VAE-inclusive figure for these artifacts. It
+  still excludes model loading, text encoding and image saving.
+- BF16 is not bitwise equal to the FP32 VAE. On this image the PSNR is 49.0 dB,
+  23% of pixels differ, and the largest difference is 40 levels.
+
+### Variants
+
+| Variant | Change |
+|---|---|
+| `fp32` | `comfy.sd.VAE(dtype=float32)`, the ComfyUI default on this CPU |
+| `bf16` | `comfy.sd.VAE(dtype=bfloat16)`, what `--bf16-vae` selects |
+| `fp32-cl`, `bf16-cl` | adds `channels_last(_3d)` Conv3d/Conv2d weights and a `channels_last_3d` decoder input |
+| `fp32-clfix`, `bf16-clfix` | adds an `nn.Upsample` forward wrapper that restrides a `channels_last` N=1 input to `(c*h*w, 1, w*c, c)` with `as_strided`: zero copy, same values |
+
+### Code path
+
+These findings come from reading ComfyUI 0.38.0 (`170594057a22`); it was not
+modified.
+
+- **Causal convolutions.** A single-frame latent is decoded without
+  `feat_cache`, so every `CausalConv3d` takes the `causal_zero` path in
+  `comfy/ops.py`. The weight is sliced to the input depth (kd=1), and
+  `conv3d` runs on a one-frame input.
+- **Upsample layout.** `Resample` rearranges `b c t h w -> (b t) c h w` for
+  `nn.Upsample(nearest-exact)` and `Conv2d`. With T=1 and a
+  `channels_last_3d` tensor, the size-1 batch dimension keeps the channel
+  stride. `suggest_memory_format()` therefore reports a contiguous tensor, and
+  the upsample allocates an NCHW output (see the stride table below).
+- **RMS norm.** `RMS_norm` is `F.normalize(x, dim=1) * scale * gamma`. Its
+  channel reduction (`linalg_vector_norm`) is strided in NCDHW and contiguous
+  in `channels_last`.
+
+### oneDNN execution trace (one decode per variant)
+
+The trace comes from `torch.backends.mkldnn.verbose` around one warm decode,
+with oneDNN v3.12.0, ISA "Intel AVX-512 with Intel DL Boost and bfloat16
+support" and ten OpenMP threads. Times are diagnostic per-primitive exec
+times, not benchmarks.
+
+| Variant | Convolution implementations (calls) | Conv ms | Reorders (calls / ms) | Data-type-changing reorders | oneDNN total ms |
+|---|---|---:|---:|---:|---:|
+| `fp32` | `jit:avx512_core` (32), `jit_1x1:avx512_core` (3) | 2102.6 | 105 / 556.0 | 0 | 2658.5 |
+| `fp32-cl` | `brg_conv_fwd:avx512_core` (32), `jit_1x1:avx512_core` (3) | 1685.6 | 41 / 17.5 | 0 | 1703.0 |
+| `bf16` | `jit_bf16:avx512_core_bf16` (33), `jit_bf16_1x1:avx512_core_bf16` (4) | 864.9 | 111 / 123.7 | 0 | 1012.2 |
+| `bf16-cl` | `brg_conv_fwd:avx512_core_bf16` (33), 1x1 BF16 (4) | 884.9 | 43 / 9.0 | 0 | 920.1 |
+
+- **BF16 path.** With `--bf16-vae` semantics the VAE convolutions run the
+  native AVX-512 BF16 kernels. The mid-block attention runs
+  `brg_matmul:avx512_core_bf16` (2 calls, 23.7 ms). The FP32 trace has no
+  oneDNN matmul records.
+- **Conversions.** All BF16 primitives are bf16 to bf16, and no reorder in any
+  trace changes the data type. BF16 adds **no conversion work** inside oneDNN.
+  In the profiler, `aten::_to_copy` is about 1 ms per decode in every
+  variant.
+- **Layout reorders.** The overhead is layout reorders. The default NCDHW
+  activations are reordered into and out of the blocked `nChw16c` layout
+  around every convolution: 556 ms in FP32 and 124 ms in BF16.
+  `channels_last` removes them (17.5 ms and 9.0 ms), and it also lets FP32 use
+  the faster `brg_conv_fwd` kernels.
+- **FP32 call counts.** In FP32, two small convolutions take PyTorch's
+  `slow_conv3d` path (2.6 ms) instead of oneDNN, so the convolution counts
+  differ.
+
+### Profiler (one warm decode, self CPU ms)
+
+| Operator | `fp32` | `bf16` | `bf16-cl` | `bf16-clfix` |
+|---|---:|---:|---:|---:|
+| Profiled decode | 3086.7 | 1778.3 | 1524.0 | 1378.7 |
+| `mkldnn_convolution` | 2251.3 | 1209.1 | 976.8 | 1056.8 |
+| `linalg_vector_norm` (RMS norm) | 262.2 | 259.5 | 14.4 | 13.2 |
+| `copy_` | 13.7 | 8.6 | 184.9 | 8.6 |
+| `_upsample_nearest_exact2d` | 21.6 | 33.7 | 66.0 | 6.5 |
+| `mul` | 132.2 | 61.8 | 62.7 | 63.5 |
+| `add` | 105.6 | 53.4 | 63.1 | 64.3 |
+| `silu` | 59.5 | 51.6 | 53.2 | 52.4 |
+| `_to_copy` | 0.9 | 0.7 | 0.8 | 1.2 |
+
+Profiled times include profiler overhead.
+
+- `channels_last` turns the strided RMS-norm reduction into a contiguous one
+  (260 ms to 14 ms).
+- It also exposes the upsample problem: `copy_` jumps to 185 ms.
+
+### Upsample stride fix
+
+Input and output strides of the three decoder upsamples, as logged by
+`vae_probe.py --mode strides`:
+
+| Upsample | Variant | Input stride | Output stride | Output `channels_last` |
+|---|---|---|---|---|
+| 64 -> 128 (384 ch) | `bf16-cl` | (384, 1, 24576, 384) | (6291456, 16384, 128, 1) | no |
+| 64 -> 128 (384 ch) | `bf16-clfix` | (1572864, 1, 24576, 384) | (6291456, 1, 49152, 384) | yes |
+| 128 -> 256 (384 ch) | `bf16-cl` | (384, 1, 49152, 384) | (25165824, 65536, 256, 1) | no |
+| 128 -> 256 (384 ch) | `bf16-clfix` | (6291456, 1, 49152, 384) | (25165824, 1, 98304, 384) | yes |
+| 256 -> 512 (192 ch) | `bf16-cl` | (192, 1, 49152, 192) | (50331648, 262144, 512, 1) | no |
+| 256 -> 512 (192 ch) | `bf16-clfix` | (12582912, 1, 49152, 192) | (50331648, 1, 98304, 192) | yes |
+
+- **The cause.** The batch stride of 384 or 192 on a size-1 dimension is
+  harmless for addressing, but it makes the layout heuristic choose NCHW. The
+  following `Conv2d` then receives NCHW and returns `channels_last`, so copies
+  run in both directions.
+- **The fix.** Restriding only the size-1 dimension addresses the same
+  elements, so values are unchanged. The upsample then keeps `channels_last`:
+  `copy_` falls from 184.9 ms to 8.6 ms, and the upsample, including its
+  internal copies, from 198.7 ms to 6.5 ms.
+- **Limit.** The wrapper assumes N=1 after the rearrange.
+
+### Standalone in-process A/B
+
+This A/B decodes the `nq8pp` latent with all four VAEs resident in one
+process: ten threads, two warm decodes each, then eight rounds in rotated
+order.
+
+| Variant | Median ms | Min ms | Median paired delta vs `fp32` | Ratio of medians |
+|---|---:|---:|---:|---:|
+| `fp32` | 2937.2 | 2851.3 | - | - |
+| `fp32-clfix` | 2478.1 | 2396.8 | -472.3 ms | 0.844 |
+| `bf16` | 1933.8 | 1793.5 | -1045.1 ms | 0.658 |
+| `bf16-clfix` | **1622.3** | 1543.4 | **-1363.3 ms** | **0.552** |
+
+Every variant produced one pixel hash across the eight rounds.
+
+### Output difference against the FP32 VAE
+
+The comparison uses three INT8 latents: the `nq8pp` sampler output, and the
+portrait and landscape latents of the earlier attention-quality runs. Pixels
+are converted to uint8 with round-to-nearest.
+
+| Latent | Variant | MAE (/255) | Max | PSNR dB | Pixels >= 1 level | > 2 | > 8 |
+|---|---|---:|---:|---:|---:|---:|---:|
+| `nq8pp` | `bf16` | 0.303 | 41 | 48.98 | 23.12% | 1.31% | 0.17% |
+| `nq8pp` | `bf16-clfix` | 0.300 | 40 | 49.03 | 22.97% | 1.28% | 0.17% |
+| portrait | `bf16` | 0.309 | 50 | 49.13 | 23.60% | 1.42% | 0.14% |
+| portrait | `bf16-clfix` | 0.308 | 41 | 49.15 | 23.49% | 1.43% | 0.15% |
+| landscape | `bf16` | 0.362 | 39 | 46.76 | 22.64% | 2.60% | 0.36% |
+| landscape | `bf16-clfix` | 0.358 | 58 | 46.90 | 22.50% | 2.60% | 0.34% |
+
+- **FP32 baselines.** A repeated FP32 decode is bitwise identical. A 20-thread
+  FP32 decode differs from the 10-thread one by at most one level in
+  0.001-0.002% of pixels.
+- **`fp32-clfix`** is in the same range: at most one level, in 0.005-0.007% of
+  pixels.
+- **BF16** changes the output well beyond thread-order noise.
+- **The ?8 difference images.** The differences concentrate in high-frequency
+  detail (foliage and buildings in the landscape). This is a visual
+  observation, not a metric. No perceptual or quality-equivalence claim is
+  made.
+
+### End-to-end in the sampler harness
+
+`int8_e2e_vae.py` is `int8_e2e_air.py` with in-loop VAE decodes. Each timed
+`nq8pp` sample (one warmup, eight runs) is decoded once by the FP32 VAE
+and once by the BF16+clfix VAE, in rotated order, after two warm decodes per
+VAE. Pixels are converted by truncation, as in ComfyUI's `SaveImage`.
+
+| | FP32 VAE | BF16+clfix VAE |
+|---|---:|---:|
+| Sampler median (shared) | 6.116 s | 6.116 s |
+| VAE decode median (min-max) | 2.762 s (2.676-2.862) | **1.219 s** (1.194-1.240) |
+| Sampler + VAE median | 8.832 s | **7.322 s** |
+| Median paired delta (range) | - | **-1.541 s** (-1.625 to -1.458), 8 of 8 negative |
+| Image vs FP32 VAE | - | MAE 0.302, max 40, PSNR 49.03 dB, 23.06% of pixels differ |
+
+**Integrity checks.**
+
+- Every sampler made 896 NPU dispatches.
+- Every timed sample was bitwise equal to its warmup.
+- The latent is bitwise equal to the `int8-nq8-ab` latent of the AIR
+  scale-out above.
+- The FP32 PNG is byte-identical to that A/B's image.
+- Each VAE produced a single pixel hash across the eight runs.
+
+**Comparison with earlier figures.**
+
+- The sampler median (6.116 s) comes from a different process than the 6.056 s
+  of the AIR A/B, and the two are not compared.
+- The measured 8.83 s with the FP32 VAE replaces the earlier **estimate** of
+  9.14-9.93 s, which was built from separate standalone decodes.
+
+### Reproduction
+
+From the session `files\vae` and `files\int8` directories. The placeholders
+are as in the AIR scale-out reproduction above. In addition:
+
+- `$comfyRoot` is the ComfyUI checkout.
+- `$vaeFile` is `qwen_image_vae.safetensors`.
+- The ComfyUI root and the extra model-path file are set at the top of
+  `vae_probe.py`.
+
+```powershell
+Set-Location "$files\vae"
+foreach ($variant in 'fp32', 'bf16', 'fp32-cl', 'bf16-cl') {
+  cmd /c "`"$python`" vae_probe.py --mode onednn --variant $variant > onednn-$variant.log 2>&1"
+}
+& $python parse_onednn.py onednn-fp32.log onednn-bf16.log onednn-bf16-cl.log onednn-fp32-cl.log
+foreach ($variant in 'fp32', 'bf16', 'bf16-cl', 'bf16-clfix') {
+  cmd /c "`"$python`" vae_probe.py --mode profile --variant $variant --out profile-$variant.json > profile-$variant.log 2>&1"
+}
+foreach ($variant in 'bf16-cl', 'bf16-clfix') {
+  cmd /c "`"$python`" vae_probe.py --mode strides --variant $variant > strides-$variant.log 2>&1"
+}
+& $python vae_probe.py --mode ab --variants fp32,fp32-clfix,bf16,bf16-clfix --out ab-t10.json
+& $python vae_probe.py --mode quality --variants fp32,fp32-clfix,bf16,bf16-clfix `
+  --latent "$files\int8\int8-nq8-ab\latent_int8-attn-l1k64-nq8pp.pt" `
+  --latent "$files\int8\int8-attention-quality-portrait\latent_int8-attn.pt" `
+  --latent "$files\int8\int8-attention-quality-landscape\latent_int8-attn.pt" `
+  --out quality\quality.json
+
+Set-Location "$files\int8"
+$env:ANIMA_XDNA_ATTENTION_BACKEND = 'air'
+$env:ANIMA_XDNA_ADALN_DEVICE = 'host'
+$env:ANIMA_XDNA_GEMM_LAYOUT_DIR = $gemmLayoutDir
+$env:ANIMA_XDNA_AIR_ATTENTION_DIR = $pinnedAir
+& $python int8_e2e_vae.py --out int8-vae-e2e --runs 8 --modes int8-attn-l1k64-nq8pp `
+  --air-nq8-dir "$files\air\nq8-dir" --verify-attention
+& $python "$files\vae\vae_summary.py" --out "$repo\docs\evidence\vae-bf16-channels-last.json" `
+  --repo $repo --comfy $comfyRoot --vae-file $vaeFile
+```
+
+**What the summary script checks.** It re-verifies the following before
+writing the evidence file:
+
+- the recorded harness hash;
+- the eight runs (896 dispatches, bitwise warmup repeats);
+- one pixel hash per VAE;
+- the latent and FP32 PNG against `int8-nq8-ab`;
+- the stride logs;
+- the absence of data-type-changing reorders.
+
+It also writes `files\vae\implementation.zip` with fixed member timestamps:
+49 members, SHA-256
+`6516996eb0da340fb6c12b6fa1139c772f3cde445198baa34a1bff5ab53d0c73`, stored
+in the evidence file. The archive holds the probe, parser, summary and
+harness scripts, every log, report and PNG of this section, and the
+end-to-end latent. It is not committed.
+
+The `vae_probe.py` docstring was extended (with the `strides` mode and the
+`-clfix` variants) after the oneDNN, profile, A/B and quality runs. The code
+is unchanged, so the recorded source hash is that of the documented file.
+
+### Limits
+
+- **Scope.** One machine, one 512x512 single-frame latent shape, ten torch
+  threads. Other resolutions, thread counts and video latents were not
+  measured.
+- **Timing scope.** The end-to-end figures cover the warmed sampler and the
+  VAE decode in one process. Loading, text encoding and saving are excluded.
+- **Statistics.** There are eight runs per variant, all with negative paired
+  deltas; no statistical test was run.
+- **Absolute decode times.** These depend on the process and on how many VAEs
+  are resident. For `bf16-clfix`:
+  - 1.22 s median in the harness, with two VAEs resident;
+  - 1.62 s in the standalone A/B, with four resident;
+  - 1.30-1.41 s for standalone warm decodes.
+
+  Compare variants only inside one run.
+- **Output difference.** BF16 changes the output (PSNR 46.8-49.2 dB on three
+  latents). `fp32-clfix` keeps FP32 precision and gives a smaller speedup
+  (-472 ms in the standalone A/B); it was not timed end to end.
+- **Production adoption.** It would need the `--bf16-vae` launch flag, which
+  is a production change needing approval. It would also need a node-side
+  patch that applies the `channels_last` weights, the decoder-input layout and
+  the upsample restride when the VAE loads. Neither exists in the repository or
+  the install.
+
 ## Public verification ladder
 
 Set placeholders only in the current shell; do not commit paths or captures.
