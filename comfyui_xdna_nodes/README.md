@@ -60,11 +60,14 @@ below still requires the same BF16 Anima source.
 
 ## Experimental INT8/AIR profile
 
-Build the four native host DLLs from an x64 Visual Studio developer
-PowerShell with `.\examples\build_fused_host.ps1`. The C++ sources are included;
-generated DLLs are not committed. A wheel built after this step includes the
-DLLs. The profile requires OS-enabled AVX-512 F/DQ/BW/VL and the validated
-PyTorch reduction behavior. It is not a portable CPU fallback.
+Install the versioned Windows runtime bundle from the root README with
+`.\tools\install_int8_runtime.ps1 -ComfyUIRoot "<COMFYUI_ROOT>"`. It installs
+the fixed-shape NPU artifacts, four host-kernel DLLs and the launcher. The
+bundle does not install ComfyUI, Python dependencies, the AMD driver/XRT
+stack, or model weights. To build the host DLLs yourself, use an x64 Visual
+Studio developer PowerShell with `.\examples\build_fused_host.ps1`. The profile
+requires OS-enabled AVX-512 F/DQ/BW/VL and the validated PyTorch reduction
+behavior; it is not a portable CPU fallback.
 
 `run-xdna-int8.ps1` is an explicit opt-in launcher for the fixed
 `int8-attn-l1k64-nq8pp` profile. It requires the five tuned INT8 artifact
@@ -75,12 +78,11 @@ BF16 Qwen VAE channels-last/clfix path. The existing `run-xdna.ps1` and other
 launchers remain unchanged; this profile launcher restores its environment
 variables and working directory when ComfyUI exits.
 
-Place this launcher beside an existing `run-xdna.ps1` in the ComfyUI root.
-It is a deployment adapter for the validated local installation, not a
-standalone installer: the base launcher and compiled NPU artifacts must
-already be provisioned. Artifact generation and experiment provenance are
-described in the [reproducibility report](../docs/anima-xdna-reproducibility.md).
-The compiled NPU artifacts are not included in this repository.
+The installer places this launcher beside an existing `run-xdna.ps1` in the
+ComfyUI root. It is a deployment adapter for the validated local installation:
+the base launcher and compatible Python/XRT toolchain must already be
+provisioned. Artifact generation and experiment provenance are described in
+the [reproducibility report](../docs/anima-xdna-reproducibility.md).
 
 MLP and QKV/output projections use symmetric W8A8 with INT32 accumulation.
 AIR QK, softmax, and AV remain BF16, and the VAE change is limited to
