@@ -1802,6 +1802,188 @@ or incomplete verification, and checks 896 dispatches/four forwards.
 The public runtime still rejects INT8 requests; this experiment does not
 add an installable production quantization mode.
 
+## Exact INT8 GEMM schedule retune (2026-11-06)
+
+After the native INT8 projections, four of the five INT8 GEMM artifacts
+still used the original wide32 schedule (`l2_k=256`, `l1_k=32`); only
+`proj_in` had been retuned to `l2_k=512`, `l1_k=64`. This experiment
+applies the same two schedule knobs to the remaining shapes. INT32
+accumulation is exact, so a schedule change must not change one output
+bit. Each new artifact is compared bitwise with the integer oracle, and
+the full ComfyUI latent and decoded PNG are compared bitwise with the
+previous schedule. Production defaults, the installed node, packed weights
+and deployed NPU binaries are unchanged.
+
+The compact machine-readable results are in
+[`evidence/int8-gemm-schedule-retune.json`](evidence/int8-gemm-schedule-retune.json).
+Sources, compiled artifacts and the complete report remain in the
+persistent session's `files\int8` directory (`int8-l1k64-ab`).
+
+### NPU-side ideas that did not pay off
+
+- **Shrinking the INT32 output is a small lever.** Reading the 33.5 MB INT32
+  `proj_in` output back costs 0.23 ms (`d2h_sync` median) after a 3.79 ms
+  kernel, so the readback is not the bottleneck. Writing it inside the kernel
+  may cost more: at every matched schedule in the sweep below, the `proj_out`
+  K-loop (the same 34.4 GOP, but an 8.4 MB output) is 0.64-1.19 ms faster than
+  `proj_in`. Output volume and loop structure (K=2048 against K=8192) are
+  confounded in these data. If the whole 0.74 ms gap at the best schedules
+  were output writes, removing it would save about 0.083 s per sampler
+  (112 calls), roughly 1.2% of the 6.99 s sampler. That is an estimate, not a
+  measurement.
+- **An in-kernel BF16 epilogue is slower, and it floors instead of rounding
+  to nearest.** A probe kernel stored
+  `(accumulator.to(float32) * SCALE).to(bfloat16)` for `proj_in` with scale
+  1.0. The output halves to 16.8 MB, but the kernel median is 13.19 ms against
+  3.79 ms for the INT32 output (about 3.5x slower, 2.60 TOPS; a rebuild with a
+  byte-identical ELF measured 12.30 ms). Only 50.27% of its outputs equal the
+  round-to-nearest-even BF16 reference, the NRMSE against FP64 is 0.33%, and
+  the maximum absolute error against the unrounded reference is 8,174. A
+  bit-level comparison of one device run on the probe's inputs (8,388,608
+  outputs, 99.5% of them inexact in BF16) found the output equal to a
+  round-toward-negative-infinity reference in every element (0 mismatches),
+  against 50.36% for round-toward-zero and 0.49% for round-toward-positive-
+  infinity. The largest accumulator is 1,290,372, below 2^24, so the
+  INT32-to-FP32 conversion is exact and the floor comes from the BF16
+  narrowing. The result reproduced on a second run. The behavior was measured
+  for this kernel and these inputs only. The epilogue is not used.
+
+### Standalone schedule sweep
+
+Every artifact is bitwise equal to the integer oracle. Times are the median
+`kernel_sync` of 21 warm runs of the standalone probe, under the same
+conditions as the feasibility probe above. All schedules use the 512x512 block
+and 64x128 core tile.
+
+| Shape (M,N,K) | `l2_k` / `l1_k` | Kernel median | Effective TOPS |
+|---|---|---:|---:|
+| Attention output 1024,2048,2048 | 256 / 32 (previous) | 1.536 ms | 5.59 |
+| | 256 / 64 | **1.197 ms** (-22.1%) | 7.18 |
+| | 512 / 64 | 1.232 ms | 6.97 |
+| `proj_out` K-loop 1024,2048,8192 | 256 / 32 (previous) | 3.759 ms | 9.14 |
+| | 256 / 64 | 3.324 ms | 10.34 |
+| | 512 / 64 | **3.055 ms** (-18.7%) | 11.25 |
+| `proj_in` 1024,8192,2048 (already used) | 256 / 32 | 4.953 ms | 6.94 |
+| | 256 / 64 | 3.966 ms | 8.66 |
+| | 512 / 64 | 3.794 ms | 9.06 |
+
+Rebuilding the attention-output and `proj_out` artifacts later gave
+byte-identical ELFs, and repeating the 21-run bench gave 1.255 ms (+4.9%) and
+2.868 ms (-6.1%). Standalone differences of about 5% between rows, such as 1.197
+against 1.232 ms, are therefore within run-to-run variation. The 19-22% gains
+of the best schedules over the previous one are well outside it, and the matched
+sampler A/B below confirms them.
+
+`l2_k=1024` does not compile for the 512x512 block. For both the
+attention-output and `proj_in` shapes, the `air-to-aie` pass fails with
+`'aie.dma_bd' op ... out of bounds access in buffer, for index 262143 in memref
+of length 131072`.
+
+QKV chains use three launches in one ELF and the `l2_k=256`, `l1_k=64`
+schedule chosen from the 1024,2048,2048 rows above (`l2_k=512` was within
+run-to-run variation). The two cross K/V
+launches (512,2048,1024) were not swept separately. The standalone runner
+medians below include host staging, synchronization, XRT launch/wait and
+output sync. The probe compared 33 output matrices with the integer oracle
+(15 for each chain, from three random repeats and two saturated repeats of
+three projections, plus 3 for the attention-output artifact), and all were
+bitwise exact:
+
+| Chain | Previous schedule | `l1_k=64` | Change |
+|---|---:|---:|---:|
+| Self Q/K/V, one dispatch | 5.409 ms | **4.399 ms** | -18.7% |
+| Cross Q/K/V, one dispatch | 3.844 ms | **3.119 ms** | -18.9% |
+
+### Matched sampler performance
+
+The harness gained an `int8-attn-l1k64` mode. It is identical to
+`int8-attn`, except that `proj_out`, attention output and both QKV chains
+load the retuned ELFs; `proj_in` is unchanged. Both modes keep independent
+resident weights in one process. Conditions are Turbo V1.1, 512x512, four
+Euler/simple steps, CFG 1, seed `700755787614899`, the cherry-blossom prompt,
+ten threads, host AdaLN and the pinned AIR attention ELFs. After one verified
+warmup per mode, six samples per mode alternate their order (`AB, BA, AB, BA,
+AB, BA`). Loading, text encoding, VAE and saving are excluded.
+
+| Per four-step sampler | Previous INT8 schedule | Retuned schedule |
+|---|---:|---:|
+| Median sampler | 7.392 s | **6.994 s** |
+| Reduction against the matched baseline | - | **0.398 s / 5.39%** |
+| Mean sampler | 7.408 s | 7.054 s (-4.77%) |
+| Individual times, seconds | 7.421, 7.361, 7.380, 7.504, 7.404, 7.375 | 6.953, 6.972, 7.148, 7.270, 7.015, 6.969 |
+| Dispatches / model forwards | 896 / 4 | 896 / 4 |
+
+All six paired comparisons improve: -469, -389, -233, -234, -389 and -406 ms.
+The earlier three-mode run measured 7.474 s for the same baseline schedule;
+this two-mode run measured 7.392 s (1.1% lower). The 5.39% figure uses the
+matched in-run baseline, not the earlier measurement.
+
+Mean profile timers show where the saving appears; AIR and `proj_in` are
+unchanged:
+
+| Per sampler (seconds) | Previous | Retuned |
+|---|---:|---:|
+| Self QKV chains | 0.627 | 0.515 |
+| Cross QKV chains | 0.445 | 0.397 |
+| Self / cross attention output | 0.263 / 0.260 | 0.228 / 0.225 |
+| `proj_out` | 0.583 | 0.472 |
+| `proj_in` | 0.593 | 0.593 |
+| AIR runner (1024 / 512 queries) | 1.266 / 0.788 | 1.267 / 0.789 |
+
+The five changed runner timers sum to a 0.341 s reduction, against a 0.353 s
+mean sampler reduction (unrounded 353.3 ms); the 12 ms difference is not
+attributed to a specific timer. These are real-flow runner timers including
+host staging, not pure device time.
+
+**Output identity.** The retuned latent and the decoded PNG
+(`df4043656c71999b38324b5b048a6b337121ca9fa43981a8193351a61381a7cf`)
+are bitwise identical to the previous schedule, and every timed sample
+reproduces its own warmup latent. Both modes passed all INT32 projection and
+fused host boundary checks during their warmups (34 check categories, 17 per
+mode, each covering all 112 calls). This run is therefore an exact speedup
+relative to the INT8 baseline. It makes **no new quality claim**, and the
+INT8/AIR approximation limits above still apply.
+
+**VAE and end-to-end.** One FP32 VAE decode in this run took 3.07 s. It is a
+single sample, and the FP32 decodes recorded elsewhere in this document range
+from 2.9 to 4.8 s. The retuned sampler plus this decode is about 10.06 s, and
+the same sampler plus the 2.9-4.8 s range is 9.9-11.8 s. Neither is an
+end-to-end median, and both still exclude loading, text encoding and saving.
+
+### Reproduction
+
+From the session `files\int8` directory. The first three commands use the
+compiler environment of the INT8 probes (`run_batch.ps1` selects it and sets
+`XRT_DEV_DIR` and `TRITON_CACHE_DIR`; set the same two variables for the
+rounding check). The last two use the production Python venv and the earlier
+experiment's environment variables:
+
+```powershell
+& $compilerPython int8_attention_probe.py --l2-k 256 --l1-k 64 "--tag=-l1k64" `
+  --out-artifact i8-sq2048-l1k64 --out int8_attention_kernel_report-l1k64.json
+.\run_batch.ps1 -ConfigList ('i8-sq2048-l1k64|--rows 1024 --columns 2048 --inner 2048 --l1-k 64;' +
+  'i8-proj_out-kloop-l2k512-l1k64|--rows 1024 --columns 2048 --inner 8192 --kloop --l2-k 512 --l1-k 64;' +
+  'i8bf16-proj_in-l2k512-l1k64|--rows 1024 --columns 8192 --inner 2048 --epilogue bf16 --scale 1.0 --l2-k 512 --l1-k 64')
+& $compilerPython int8_bf16_rounding_check.py --artifact build\i8bf16-proj_in-l2k512-l1k64 `
+  --out bench\i8bf16-rounding-check.json
+& $python int8_e2e.py --out int8-l1k64-ab --runs 6 `
+  --modes int8-attn int8-attn-l1k64 --verify-attention
+& $python int8_schedule_summary.py --out int8-gemm-schedule-retune.json
+```
+
+`run_batch.ps1` compiles a configuration only if its build directory has no
+ELF, then runs the 21-run bench. Building the same three configurations again
+under different artifact names gave ELFs byte-identical to the pinned ones
+(`rebuild_check` in the evidence file), and the repeated benches differed from
+the originals by 5-7% in kernel median. The summary script re-verifies source,
+ELF, latent and PNG hashes, the compile-failure logs, the rebuild check and
+the BF16 rounding check before writing the evidence.
+`int8-l1k64-ab\implementation.zip` pins the changed scripts, including the
+rounding check, the sweep, epilogue, rounding-check and rebuild results, the
+two `l2_k=1024` compile logs, the four retuned ELFs and the epilogue ELF. It
+extends the earlier `int8-attention-final\implementation.zip` rather than
+replacing it.
+
 ## Public verification ladder
 
 Set placeholders only in the current shell; do not commit paths or captures.
