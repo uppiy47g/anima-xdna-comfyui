@@ -50,3 +50,4 @@ packages = ["comfyui_xdna_nodes", "anima_xdna_poc"]
 
 [tool.setuptools.package-data]
 "*" = ["README.md"]
+"anima_xdna_poc" = ["*.cpp", "*.dll"]

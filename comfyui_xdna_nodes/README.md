@@ -50,11 +50,53 @@ back to CPU.
 - adapted Qwen context `[1,512,1024]`
 - BF16 model weights and block activations, FP32 sampler latent
 
-Preview/Aesthetic checkpoints, LoRA patches, LLLite, INT8, other
+Preview/Aesthetic checkpoints, LoRA patches, LLLite, other
 batch/resolution/context sizes, and training are rejected. The normal ComfyUI
 MODEL is cloned; it is not modified. Before XRT opens, the wrapper computes a
 canonical full digest over all 560 block tensors. Base/Turbo or other
-MODEL/source mismatches are rejected before BO population or dispatch.
+MODEL/source mismatches are rejected before BO population or dispatch. The
+default path remains BF16; the separate, experimental INT8 projection profile
+below still requires the same BF16 Anima source.
+
+## Experimental INT8/AIR profile
+
+Build the four native host DLLs from an x64 Visual Studio developer
+PowerShell with `.\examples\build_fused_host.ps1`. The C++ sources are included;
+generated DLLs are not committed. A wheel built after this step includes the
+DLLs. The profile requires OS-enabled AVX-512 F/DQ/BW/VL and the validated
+PyTorch reduction behavior. It is not a portable CPU fallback.
+
+`run-xdna-int8.ps1` is an explicit opt-in launcher for the fixed
+`int8-attn-l1k64-nq8pp` profile. It requires the five tuned INT8 artifact
+directories and the matching `air-attention-nq8pp` self/cross artifacts under
+`xdna-runtime`; missing or incompatible artifacts stop startup rather than
+falling back. It also enables host AdaLN, the 10-thread GEMM layout, and the
+BF16 Qwen VAE channels-last/clfix path. The existing `run-xdna.ps1` and other
+launchers remain unchanged; this profile launcher restores its environment
+variables and working directory when ComfyUI exits.
+
+Place this launcher beside an existing `run-xdna.ps1` in the ComfyUI root.
+It is a deployment adapter for the validated local installation, not a
+standalone installer: the base launcher and compiled NPU artifacts must
+already be provisioned. Artifact generation and experiment provenance are
+described in the [reproducibility report](../docs/anima-xdna-reproducibility.md).
+The compiled NPU artifacts are not included in this repository.
+
+MLP and QKV/output projections use symmetric W8A8 with INT32 accumulation.
+AIR QK, softmax, and AV remain BF16, and the VAE change is limited to
+`qwen_image_vae.safetensors`. This is experimental and not quality-equivalent
+to the standard BF16 pipeline, and this combined INT8 profile has no
+quality-equivalence claim. The earlier standalone AIR comparison recorded a
+29.035% fixed-seed latent NRMS versus control; that is not a measurement of the
+combined INT8 profile. The BF16 VAE layout fix also changes decoded pixels.
+Use the standard launcher for quality-sensitive work.
+
+The deployed ComfyUI integration completed a 512x512, 4-step generation with
+896 dispatches and passed 1,904 runtime boundary checks. The first checked
+generation took 17.93 s; a same-process repeat reproduced the latent bitwise
+and took 5.79 s for sampling plus 1.51 s for VAE decode (7.30 s total). These
+are single-run smoke measurements, not a controlled benchmark or a quality
+equivalence claim.
 For an F16 or F32 source, matching is performed after the same explicit BF16
 normalization used by the XDNA packed cache. Raw source hashes and dtypes still
 remain part of the cache identity.

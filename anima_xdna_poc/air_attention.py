@@ -42,7 +42,7 @@ class AttentionShape:
             or self.depth != 128
             or self.query_tile != 32
             or self.key_tile != 64
-            or self.query_cores != 4
+            or self.query_cores not in (4, 8)
             or self.parallel_heads not in (1, 2)
         ):
             raise ValueError("unsupported fixed Anima attention schedule")
@@ -152,9 +152,10 @@ class AIRAttentionBackend:
             raise
         LOGGER.warning(
             "[Anima XDNA] EXPERIMENTAL AIR attention ACTIVE: tiled QK/scale/softmax/AV, "
-            "17 dispatches/block with QKV chaining when AdaLN runs on XDNA; the default "
-            "host AdaLN removes its GEMV dispatches. Known fixed-seed latent NRMS "
-            "vs control 29.035%; not quality-equivalent. No silent fallback."
+            "17 dispatches/block in the BF16 projection path with QKV chaining when AdaLN "
+            "runs on XDNA; the optimized INT8 profile has a different dispatch count. "
+            "Known fixed-seed latent NRMS vs control 29.035%; not quality-equivalent. "
+            "No silent fallback."
         )
 
     def __call__(self, query, key, value):

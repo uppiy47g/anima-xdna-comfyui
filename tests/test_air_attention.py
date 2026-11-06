@@ -276,9 +276,12 @@ class AIRAttentionTests(unittest.TestCase):
             self.assertEqual(shape.d2h_bytes, 4 * 1024**2)
             self.assertEqual(shape.core_working_bytes, 53504)
             self.assertLess(shape.core_working_bytes + 4096, 64 * 1024)
+        nq8 = AttentionShape(1024, query_cores=8)
+        self.assertEqual(nq8.query_group, 256)
+        self.assertEqual(nq8.h2d_bytes, 12 * 1024**2)
         for kwargs in (
             {"keys": 256}, {"keys": 512, "depth": 64},
-            {"keys": 512, "parallel_heads": 4},
+            {"keys": 512, "parallel_heads": 4}, {"keys": 512, "query_cores": 16},
         ):
             with self.subTest(kwargs=kwargs):
                 with self.assertRaises(ValueError):
