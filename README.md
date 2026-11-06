@@ -35,12 +35,16 @@ Decoded RGB MAE (0–255)
 Cherry blossoms / 700755787614899
 36.24%
 18.240
-Blue-haired portrait / 42
-30.09%
-16.302
+
+![before INT8 output](docs/assets/0-before-image_int8-qk.png)
+![after INT8 output](docs/assets/0-after-image_int8-attn.png)
+
 Mountain village/lake / 314159265
 30.92%
 10.899
+
+![before INT8 output](docs/assets/1-before-image_int8-qk.png)
+![after INT8 output](docs/assets/1-after-image_int8-attn.png)
 
 These are substantial differences, not negligible rounding noise. The tested
 images were finite and reproducible, but visual inspection found changes in
@@ -94,6 +98,10 @@ runtime boundary checks; a same-seed repeat latent was bitwise identical.
 This was a single-run integration measurement, not a controlled benchmark
 median. User-observed ComfyUI console runs include Prompt executed times in
 the 6-second range; cache state was not controlled for those observations.
+
+![INT8 run1](docs/assets/int8_run_1.png)
+![INT8 run2](docs/assets/int8_run_2.png)
+![INT8 run3](docs/assets/int8_run_3.png)
 
 These results describe Anima on the tested AMD hardware. They are not a
 direct comparison with Qualcomm measurements that use different models,
