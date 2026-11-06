@@ -1984,6 +1984,542 @@ two `l2_k=1024` compile logs, the four retuned ELFs and the epilogue ELF. It
 extends the earlier `int8-attention-final\implementation.zip` rather than
 replacing it.
 
+## AIR attention schedule scale-out: K/V buffering and a 16-core column split (2026-11-06)
+
+The AIR attention stage is the largest block left in the INT8 sampler: its
+self- and cross-attention stage timers sum to 2.359 s of the 7.086 s pinned
+median in the matched A/B below (33.3%). This experiment changes only the
+**schedule** of the existing MLIR-AIR attention kernel: how many core buffers
+hold K/V, how Q reaches the cores, how many cores share a head, and how the
+memtile buffers are split. Every build links the same compiled kernel object
+(`kernel_sha256` `490249c8...`, MLIR-AIR `508ca731...`), so the arithmetic is
+unchanged by construction, and each working build is compared bitwise with
+the pinned production ELF. Softmax and the attention matmuls stay BF16 on the
+NPU; nothing here is quantized. Production defaults, the installed node,
+packed weights and deployed NPU binaries are unchanged, and **nothing in this
+section is deployed**.
+
+The compact machine-readable results are in
+[`evidence/air-attention-schedule-scaleout.json`](evidence/air-attention-schedule-scaleout.json).
+Sources, compiled artifacts, logs and the complete reports remain in the
+persistent session's `files\air` and `files\int8` directories
+(`int8-nq8-ab`).
+
+**Result.** In an in-process A/B of three AIR schedules (eight timed runs
+per mode, VAE excluded), the 16-core variant with separate K and V buffers
+(`nq8pp`) lowers the median sampler from 7.086 s to **6.056 s** (-1.030 s,
+-14.54%). All eight paired comparisons are faster (median paired delta
+-954 ms, -13.47%), and the latent and decoded PNG are bitwise identical to
+the pinned mode. Separate K and V buffers alone (`pp`) give 6.628 s (-6.46%).
+
+### Design space
+
+| Parameter | Production | Varied here |
+|---|---|---|
+| `kv_buffers` | 1: K and V alternate through one core buffer | 2: separate K and V core buffers ("ping-pong") |
+| `q_mode` | `pair`: a 64-row Q pair is broadcast to two cores, each copies its 32-row half | `direct`: one 32-row Q transfer per core |
+| `query_cores` | 4 (128 query rows per head group) | 8 (256 rows) |
+| `parallel_heads` | 2 (8 core tiles) | 2 (16 core tiles); 1 in some diagnostics |
+| Memtile (L2) buffers | split by the compiler | `air.alloc(split=False)` plus explicit per-column Q and output splits |
+
+Shapes are unchanged: 16 heads, 1024 queries, depth 128, a 32-query/64-key
+tile, 1024 keys for self-attention and 512 for cross-attention.
+
+**Core memory.** The explicit core buffers are the Q tile (8 KiB), the K tile
+(16 KiB), the score tile (4 KiB), the numerator (8 KiB), four 64-byte row-state
+vectors and, in `pair` mode, a 16 KiB Q-pair buffer. That is the 53,504 bytes
+recorded for the production schedule above, plus a 4 KiB stack, in the 64 KiB
+data memory of a compute tile. A second 16 KiB K/V buffer on top of the Q-pair
+buffer would need 69,888 bytes, more than 65,536, and no recorded build
+combines them. `direct` Q frees the 16 KiB pair buffer, so `direct` Q with two
+K/V buffers needs exactly the same 53,504 bytes. This is arithmetic from the
+builder's nominal allocations (no compiler padding), not a compiler trace.
+
+K/V are streamed once per query group, so raising the group from 128 to 256
+rows halves the number of K/V passes per head while using twice as many
+cores. That is a design-level explanation, not a measured traffic reduction.
+
+### Placement
+
+| Build | Shim / memory / core tiles |
+|---|---:|
+| Production schedule, `pp` (self and cross) | 6 / 8 / 8 |
+| `nq8-ns-os2`, `nq8-pp-colsplit` (self and cross) | 8 / 8 / 16 |
+
+The device model has 8 columns of 1 shim, 1 memory and 4 core tiles (8 / 8 / 32
+in total), and `aircc` runs with `merge-logical-tiles=false`, so every logical
+shim tile occupies a whole physical shim tile. The 16-core builds therefore use
+**all 8 shim tiles** and all 8 memory tiles. Larger variants fail at placement:
+four parallel heads (`pp4-k1024`) need 12 logical shim tiles and 8 memory
+tiles, and the 16-core build with Q and output split by row pair
+(`nq8-pp-qs2-os2-k1024`) needs 10 shim tiles. Scaling out along these axes
+(four heads, or 16 cores per head) is blocked by shim DMA capacity on this
+device.
+
+### Device-only launch time
+
+`air_state3.py` launches a resident ELF back to back and times one XRT run
+(create, start, wait) on already loaded buffers, so host staging is excluded.
+Device time depends on a second variable (next subsection), so each build
+alternates two controlled states: `none` (nothing else running; the fast
+state) and `spin:4` (four busy CPU processes; the slow state). Every phase is
+100 launches after a 0.6 s settle. The fast and slow values are the means of
+the per-phase medians (two or three `none` phases and one or two `spin:4`
+phases per build; the evidence file lists every phase).
+
+| Self-attention (1024 keys) | Fast state | Slow state | Slow / fast | Fast vs production | Slow vs production |
+|---|---:|---:|---:|---:|---:|
+| Production ELF | 7.471 ms | 10.244 ms | 1.371 | - | - |
+| `base` (rebuilt, byte-identical ELF) | 7.527 ms | 10.256 ms | 1.362 | +0.8% | +0.1% |
+| `comp` compute-only diagnostic | 5.647 ms | 7.506 ms | 1.329 | -24.4% | -26.7% |
+| `dma` DMA-only diagnostic | 5.367 ms | 7.280 ms | 1.357 | -28.2% | -28.9% |
+| `pp` (separate K/V buffers) | 6.013 ms | 7.251 ms | 1.206 | -19.5% | -29.2% |
+| `nq8-pp-colsplit` | **3.194 ms** | **4.269 ms** | 1.337 | **-57.2%** | **-58.3%** |
+
+| Cross-attention (512 keys) | Fast state | Slow state | Slow / fast | Fast vs production | Slow vs production |
+|---|---:|---:|---:|---:|---:|
+| Production ELF | 4.531 ms | 6.216 ms | 1.372 | - | - |
+| `pp` | 3.607 ms | 4.737 ms | 1.313 | -20.4% | -23.8% |
+| `nq8-pp-colsplit` | **2.315 ms** | **3.021 ms** | 1.305 | **-48.9%** | **-51.4%** |
+
+The `base` ELF is the production ELF, so its row shows the repeat noise of
+this method (+0.8% fast, +0.1% slow). The three fast phases of `pp-k1024`
+measured 5.317, 6.452 and 6.271 ms for no identified reason, so its fast-state
+saving is understated and its slow/fast ratio (1.21) is not comparable with
+the others.
+
+The two diagnostics are not functional kernels. `comp` loads K/V once and
+reuses them for every block (no per-block K/V traffic); `dma` streams K/V every
+block but replaces the compute with a small copy. Each takes 5.4-5.6 ms in the
+fast state, below the full `base` at 7.527 ms and above half of it, which
+suggests that the single shared K/V buffer lets compute and K/V transfer
+overlap only partly, and that separate buffers recover part of the gap. This is
+an interpretation of the timings, not a hardware trace.
+
+### Ablation
+
+Standalone `air_bench.py` medians without state control mix both device
+states, so only large differences are meaningful: the byte-identical
+production and `base` ELFs measured 8.423 ms (21 runs) and 7.634 ms (60 runs),
+a 9% difference caused by the state mix alone. Every working build below is
+bitwise equal to the production ELF output in this bench.
+
+| Build | Cores | K/V buffers | Q | Runs | Median | Min |
+|---|---:|---:|---|---:|---:|---:|
+| Self (1024 keys): production ELF | 8 | 1 | pair | 21 | 8.423 ms | 7.410 ms |
+| `base` | 8 | 1 | pair | 60 | 7.634 ms | 7.108 ms |
+| `direct` | 8 | 1 | direct | 60 | 7.644 ms | 7.140 ms |
+| `pp` | 8 | 2 | direct | 60 | 5.620 ms | 5.198 ms |
+| `nq8-ns-os2` | 16 | 1 | pair | 20 | 5.845 ms | 5.764 ms |
+| `nq8h1-ns-os2` (one head at a time) | 8 | 1 | pair | 20 | 10.287 ms | 7.364 ms |
+| `nq8-pp-colsplit` | 16 | 2 | direct | 20 | 4.220 ms | 4.144 ms |
+| Cross (512 keys): production ELF | 8 | 1 | pair | 21 | 6.060 ms | 5.110 ms |
+| `pp` | 8 | 2 | direct | 60 | 4.184 ms | 3.348 ms |
+| `nq8-pp-colsplit` | 16 | 2 | direct | 20 | 2.957 ms | 2.897 ms |
+
+`direct` Q alone changes nothing (7.644 against 7.634 ms). The gains come from
+separate K/V buffers (`pp`, -26.4% against `base`) and from the 16 cores
+(`nq8-ns-os2`, -23.4%), and they compound (`nq8-pp-colsplit`, -44.7%) rather
+than add. The 256-row group with only eight cores (`nq8h1-ns-os2`) is not
+faster than `base` (its median is noisy; the minimum is 7.364 ms), which is
+consistent with the gain coming from the 16 cores rather than from the larger
+group alone.
+
+### The slow device state
+
+Production self-attention launches, 100 per condition:
+
+| Condition during the launches | Median |
+|---|---:|
+| `none` | 7.305 ms |
+| `spin:1` (one busy process) | 7.731 ms |
+| `spin:4` / `spin:10` / `spin:20` | 10.244 / 10.159 / 11.808 ms |
+| `stream:64:1` (one process summing a 64 KiB array) | 8.804 ms |
+| `copy:4096:1` (one process copying a 4 MiB array) | 9.167 ms |
+| `inproc_sum:1` / `:4` / `:10` (the launching process sums a 4 MiB tensor after every launch with 1 / 4 / 10 threads) | 7.494 / 9.196 / 10.179 ms |
+
+Four or more busy CPU processes (pure ALU spin, no memory traffic) lift the
+launches from about 7.3-7.5 ms to 10.2 ms. One spinning process does not, one
+memory-heavy process lifts them partway, and so does multithreaded host work
+by the launching process itself, as in the sampler (ten torch threads). Across
+the builds in the tables above, slow over fast is 1.30-1.37 on 8 of 9 builds
+and 1.21 for `pp-k1024`. The near-constant ratio is what a lower NPU clock
+would produce, but no clock was read: attributing it to clock or power
+management is a hypothesis.
+
+The sampler most likely mixes both states. The per-call AIR runner times in
+the A/B below (pinned 9.271 ms self, 5.891 ms cross) lie between the
+fast-state and slow-state expectations (device time plus 0.78 ms of host
+staging for self and 0.54 ms for cross: 8.25-11.02 ms and 5.07-6.76 ms). The
+state during the sampler was not measured, so the tables above do not say
+which state a real run is in.
+
+### NPU power-mode probe
+
+Because the slow state resembles power management, the NPU power mode was
+temporarily changed with `xrt-smi configure --pmode`. This was an explicitly
+approved system change; the original `Default` mode was restored and
+re-measured. The production ELFs were timed in five alternating 40-launch
+phases, `none` and `other_sum` (the CPU sums an unrelated 4 MiB BF16 tensor
+after every launch). Values are the median of the last 20 launches of each
+phase:
+
+| Mode | Self `none` (3 phases) | Self `other_sum` (2 phases) | Cross `none` (3 phases) | Cross `other_sum` (2 phases) |
+|---|---|---|---|---|
+| Default | 7.683, 7.282, 7.599 ms | 10.071, 10.118 ms | 6.032, 6.115, 5.759 ms | 6.040, 6.178 ms |
+| Performance | 7.823, 7.422, 7.726 ms | 10.226, 10.168 ms | 6.059, 5.881, 5.948 ms | 6.146, 6.163 ms |
+| Turbo | 7.484, 8.800, 8.337 ms | 9.910, 9.907 ms | 5.825, 5.744, 5.706 ms | 5.890, 5.896 ms |
+| Default again (after restore) | 7.823, 7.439, 7.682 ms | 10.110, 10.097 ms | 6.081, 5.813, 5.860 ms | 6.136, 6.112 ms |
+
+No mode removes the slow state: on self-attention `other_sum` stays at
+9.9-10.2 ms in every mode against 7.3-8.8 ms for `none`. Turbo has the lowest
+`other_sum` values (self 9.910 and 9.907 ms against 10.071 and 10.118 ms for
+Default), but its self `none` phases were not lower (7.484, 8.800 and
+8.337 ms against 7.683, 7.282 and 7.599 ms). On cross-attention even the
+`none` phases measured 5.7-6.1 ms in this probe, so it cannot show a mode
+effect there. The probe is a negative result for the power mode as a lever, and
+the cause of the slow state remains unidentified.
+
+### 16-core hangs and the compiler cause
+
+Six 16-core builds compile but hang on the device: `nq8-k1024`, `nq8-dma-k1024`,
+`nq8-comp-k1024`, `nq8h1-k1024`, `nq8h1-comp-k1024` and `nq8h1-os2-k1024`. Each
+returns `ERT_CMD_STATE_TIMEOUT` with every `fatal_error` field zero (a plain
+bench returns after about 11 s, and the NPU recovers). The DMA-only and
+compute-only builds hang as well, so neither the kernel nor the K/V stream
+causes it. After reproducing hangs again, 20 launches of
+`nq8-pp-colsplit-k1024` gave a median of 4.211 ms (earlier 4.220 ms) and the
+same output hash, so the device was healthy.
+
+The placed IR differs between hanging and working builds in the shim-side
+output transfers:
+
+| Build | Result | Output gets | Transfer size | Distinct head offsets | Distinct row offsets |
+|---|---|---:|---|---:|---:|
+| `nq8-k1024` | hangs | 16 | [1,256,128] | 9 | 1 |
+| `nq8h1-k1024` | hangs | 8 | [1,256,128] | 8 | 1 |
+| `nq8h1-ns-os2` | works | 2 | [1,128,128] | 1 | 2 |
+| `nq8-ns-os2` | works | 4 | [1,128,128] | 2 | 2 |
+| `nq8-pp-colsplit` | works | 4 | [1,128,128] | 2 | 2 |
+
+**Observation.** In the hanging builds each shim-side output get requests
+[1,256,128] at a different offset per column in the head dimension and a single
+row offset. In the working builds it requests [1,128,128] with the head fixed
+per group and varying row offsets.
+
+**Inference (not traced on the device).** Pass `air-split-l2-memref` (`aircc`
+pass 024) applies its split offset to the head dimension instead of the row
+dimension and does not shrink the transfer, so the shim waits for data that is
+never sent.
+
+**Workaround.** Allocate every L2 buffer with `air.alloc(split=False)` and
+split the Q and output buffers explicitly per herd column (`--no-split
+--q-split 2 --out-split 2 --split-axis column`). An explicit split without
+`no_split` is split again by the compiler and still hangs
+(`nq8h1-os2-k1024`). No upstream fix was tested.
+
+Three further builds fail in `air-to-aie`; regenerating them reproduced the
+original logs and MLIR:
+
+| Build | Configuration | Error |
+|---|---|---|
+| `pp4-k1024` | 4 parallel heads, separate K/V buffers, direct Q (12 logical shim tiles) | `no ShimNOCTile has sufficient DMA capacity for 1 input/0 output channels` |
+| `nq8-pp-qs2-os2-k1024` | 16 cores, Q and output split by row pair (10 logical shim tiles) | the same message |
+| `nq8-pp-k1024` | 16 cores, separate K/V buffers, direct Q, no explicit splits | `'air.channel' op tile (?, ?) MM2S channel 0 streams to different destinations for two circuit-switched flows, so each would receive the other's data` |
+
+The first two exceed the shim-tile budget (8 physical shim tiles, no merging of
+logical tiles). The cause of the third was not investigated.
+
+### Matched in-process sampler A/B
+
+The harness `int8_e2e_air.py` switches the AIR attention backend inside one
+process, so the three modes share resident INT8 weights and differ only in the
+two AIR attention ELFs (self and cross): `int8-attn-l1k64` is the pinned
+production pair, `-pp` the separate K/V buffer pair at four query cores, and
+`-nq8pp` the 16-core pair. Conditions are Turbo V1.1, 512x512, four
+Euler/simple steps, CFG 1, seed `700755787614899`, the cherry-blossom prompt,
+ten threads, host AdaLN, and the INT8 projections and MLPs with the retuned
+schedules. After three verified warmups per mode, eight timed samples per mode
+rotate their order (A = pinned, B = `pp`, C = `nq8pp`: ABC, ACB, CAB, CBA, BCA,
+BAC, ABC, ACB). Loading, text encoding, VAE and saving are excluded.
+
+| Per four-step sampler | Pinned | `pp` | `nq8pp` |
+|---|---:|---:|---:|
+| Median | 7.0856 s | 6.6281 s | **6.0557 s** |
+| Difference of medians against pinned | - | -457.5 ms (-6.46%) | **-1030.0 ms (-14.54%)** |
+| Mean | 7.0264 s | 6.6621 s | 6.0310 s |
+| Min-max | 6.740-7.162 s | 6.356-7.046 s | 5.673-6.284 s |
+| Individual times, seconds | 7.143, 6.740, 6.840, 7.009, 7.162, 7.030, 7.141, 7.146 | 6.606, 6.356, 6.643, 6.613, 6.549, 6.699, 6.784, 7.046 | 5.862, 5.673, 5.913, 6.057, 6.054, 6.216, 6.284, 6.189 |
+| Dispatches / model forwards | 896 / 4 | 896 / 4 | 896 / 4 |
+
+| Paired comparison (same iteration) | Median delta | Mean delta | Faster pairs |
+|---|---:|---:|---:|
+| `pp` - pinned | -370.2 ms (-5.23%) | -364.3 ms | 8 / 8 |
+| `nq8pp` - pinned | **-954.2 ms (-13.47%)** | -995.4 ms | 8 / 8 |
+| `nq8pp` - `pp` | -619.4 ms (-9.34%) | -631.1 ms | 8 / 8 |
+
+The percentages are relative to the median of the first mode in each pair.
+Per-pair deltas in ms: `pp` - pinned -537, -384, -197, -395, -613, -332, -356
+and -100; `nq8pp` - pinned -1281, -1067, -928, -951, -1108, -815, -857 and
+-957; `nq8pp` - `pp` -744, -683, -730, -556, -495, -483, -501 and -857.
+
+The difference of medians (-14.54%) and the median of paired deltas (-13.47%)
+are different statistics; the paired one is the more conservative. The saving
+is larger in the first two iterations (-1281 and -1067 ms) than in the last
+three (-815, -857 and -957 ms); no cause was investigated. Absolute medians
+drift between sessions: the pinned mode measured 6.994 s in the retune A/B
+above, 7.189 s in the earlier two-mode A/B and 7.086 s here, so modes are
+compared only inside one A/B. There are eight runs per mode and no statistical
+test.
+
+The earlier two-mode A/B (`pp` against pinned; two warmups, eight runs) gave
+7.189 s against 6.720 s (-6.51%) with paired deltas of -575, -456, -437, -599,
+-300, -600, -369 and -555 ms (median -505.5 ms, 8 / 8 faster). It ran with a
+previous version of the harness, before the `nq8pp` mode was added, so the
+harness hash recorded in that report no longer matches the file; its other
+pinned hashes match.
+
+Median profile timers per sampler (ms; 112 self and 112 cross calls):
+
+| Timer | Pinned | `pp` | `nq8pp` |
+|---|---:|---:|---:|
+| AIR runner, self-attention (1024 keys) | 1038.4 | 784.0 | 521.0 |
+| AIR runner, cross-attention (512 keys) | 659.7 | 540.4 | 384.3 |
+| `attn1.air_attention` stage (self) | 1415.5 | 1153.4 | 882.4 |
+| `attn2.air_attention` stage (cross) | 943.3 | 825.8 | 653.8 |
+| Wrapper residual, self (stage - runner) | 366.5 | 362.8 | 354.3 |
+| Wrapper residual, cross (stage - runner) | 280.6 | 281.1 | 264.5 |
+| AIR attention stages as a share of the sampler median | 33.3% | 29.9% | 25.4% |
+
+Per call, the runner takes 9.271 / 7.000 / 4.652 ms for self-attention and
+5.891 / 4.825 / 3.431 ms for cross-attention (pinned / `pp` / `nq8pp`); the
+wrapper residual takes 3.272 / 3.239 / 3.164 ms and 2.505 / 2.510 / 2.362 ms.
+The two AIR stage timers fall by 822.6 ms (2358.8 to 1536.2 ms) of the
+1030.0 ms difference. The rest is spread over other timers, the largest being
+`block_overhead` (325.2 to 223.2 ms), and was not attributed. These are medians
+of components, so they are not additive.
+
+**Unexplained wrapper residual.** The residual is the stage timer minus the
+runner timer, that is the host work in `AIRAttention.run` around
+`MultiLaunchRunner.run`: the shape checks, a finite check of each of the three
+inputs, the contiguous copies and array views, the output allocation, the
+output clone and a finite check of the output. It does not depend on the
+schedule (0.65, 0.64 and 0.62 s per sampler), so it grows from 9.1% to 10.2% of
+the sampler as the kernel gets faster. It is about 2.3-2.8 times the
+non-runner overhead of a standalone wrapper bench with the `pp` artifacts
+(median of 60 runs, ten threads, each step timed separately):
+
+| Standalone wrapper bench | Self | Cross |
+|---|---:|---:|
+| Full wrapper call | 9.232 ms | 6.363 ms |
+| Inner runner | 8.065 ms | 5.316 ms |
+| Inner runner minus buffer copy and syncs | 7.286 ms | 4.776 ms |
+| Non-runner overhead (full - inner) | 1.167 ms | 1.047 ms |
+| Finite check, query / key (value not timed) | 0.408 / 0.171 ms | 0.381 / 0.161 ms |
+| Finite check, output | 0.122 ms | 0.125 ms |
+| Array preparation | 0.075 ms | 0.073 ms |
+| Output clone | 0.192 ms | 0.167 ms |
+
+The step medians do not add up exactly to the overhead. Why the real sampler
+spends more per call than the standalone bench is not explained; the bench
+feeds contiguous random inputs and does not run alongside the rest of the
+sampler.
+
+### Output identity
+
+The latent of every mode is bitwise identical to the pinned mode's, and so is
+the decoded PNG
+(`df4043656c71999b38324b5b048a6b337121ca9fa43981a8193351a61381a7cf`, the same
+hash as in the retune section above). Every timed sample reproduces its own
+warmup latent. All three modes passed the INT32 projection and fused host
+boundary checks during their warmups (51 check categories, 17 per mode, each
+covering all 112 calls). Those counters cover the INT8 projection and boundary
+kernels, not the AIR attention itself; its outputs enter the latent comparison
+above and the standalone checks below.
+
+- **Standalone benches.** Every working build reproduces the production ELF
+  output bit for bit on the bench input (seed 7, scale 1.0), except
+  `base-k512`, whose ELF is byte-identical to the production cross ELF.
+- **Six-condition sweep.** `nq8-pp-colsplit` was compared with the production
+  ELFs on three inputs per kernel (seed/scale 11/1.0, 12/6.0 and 13/0.05; 1024-
+  and 512-key kernels), three launches each. Every output is bitwise equal to
+  the production output on the same input (0 mismatched elements), and the
+  evidence generator also requires each launch to be finite and equal to its
+  repeats. Output hash prefixes: self `cb87e9fa7627`, `746d700166e8` and
+  `11eed08e7fe5`; cross `5bf23824915f`, `5ac7a5b53676` and `e471395f50bf`.
+- **Rebuild check.** The six working builds (`base`, `pp` and `nq8-pp-colsplit`,
+  1024 and 512 keys) were compiled again under other names. All six ELFs are
+  byte-identical to the originals, and the two `base` ELFs equal the production
+  ELFs. The module text is identical after normalizing the absolute kernel-object
+  path (`link_with`), which is the only reason the raw module hashes differ.
+
+Against the earlier INT8 MLP + BF16 attention-projection baseline latent, the
+NRMSE is 0.3624 (36.24%; max abs 3.853, MAE 0.2914) in all three modes. It
+equals the full-projection figure recorded for this prompt and seed in "Output
+changes and limits" above, so it reflects the INT8 projections and not the
+attention schedule. The schedules change data movement and core count, not
+arithmetic. This experiment makes **no new quality claim**, and the INT8/AIR
+approximation limits above still apply.
+
+**VAE and end-to-end (estimate).** A standalone VAE decode (`baseline` variant
+of the VAE bench, ten torch threads; the bench file does not record the
+precision) of a latent with the same 1x16x1x64x64 shape as the A/B outputs
+(512x512 image) took 3.085 s for the first decode and 4.280, 3.774, 3.921,
+3.520 and 3.877 s for five warm decodes (median 3.877 s). Adding the first
+decode and the warm median to the sampler medians gives **estimates** of
+10.17-10.96 s for the pinned mode and 9.14-9.93 s for `nq8pp`. These sums exclude
+model loading, text encoding and image saving, and no ComfyUI end-to-end run
+was timed with these artifacts. The single in-harness decode of this A/B
+(5.743 s; 4.487 s in the earlier two-mode A/B) is noisy and is not used.
+
+### Session-patched node
+
+The harness imports session-patched copies of `air_attention.py`, `chain.py`
+and `block.py` from the deployed node. Against the deployed node the diffs are
++15/-4, +6/-0 and +23/-1 lines; they carry the host AdaLN and lightweight
+finite-check changes documented in "Host AdaLN and lightweight AIR finite
+checks" above. The only change made for this experiment is in
+`air_attention.py`: `AttentionShape` accepts `query_cores` of 4 or 8, where the
+deployed check is `query_cores != 4`. The repository HEAD differs from the
+deployed node in other respects (for example it has no
+`ANIMA_XDNA_GEMM_LAYOUT_DIR` handling in `chain.py`), so its diff counts (+2/-3,
++7/-1 and +39/-19) include unrelated differences. Both diffs are in the
+implementation archive. The repository sources and the production install are
+unchanged.
+
+### Limits
+
+- Outputs equal the production ELF bit for bit on the tested inputs and across
+  the three sampler modes. This is not a claim about image quality against the
+  BF16 model, and the INT8 baseline already differs from it.
+- Absolute sampler medians drift between sessions (the pinned mode measured
+  6.994, 7.189 and 7.086 s in different runs), so modes are compared only inside
+  one A/B with rotated or alternating run order and paired deltas.
+- There are eight runs per mode, with eight of eight negative paired deltas; no
+  statistical test was run.
+- Sampler medians exclude the VAE, loading, text encoding and saving. Every
+  VAE-inclusive figure is an estimate from separate measurements, not a timed
+  end-to-end run.
+- The slow device state is measured, but its attribution to clock or power
+  management is a hypothesis, not a clock reading, and the state during the
+  sampler was not measured.
+- The `air-split-l2-memref` cause is read from the compiler output and the
+  working workaround. It was not traced on the device, and no upstream fix was
+  tested.
+- The `nq8pp` artifacts need the `AttentionShape.query_cores` change, which
+  exists only in the session-patched node copy.
+- The earlier two-mode `pp` A/B ran with a previous version of
+  `int8_e2e_air.py`; its recorded harness hash no longer matches the file.
+
+### Remaining levers
+
+All figures here are unmeasured estimates, not results.
+
+- **Wrapper trimming (host work only; the device arithmetic is untouched).**
+  The wrapper residual is 0.62 s per sampler in the `nq8pp` mode (354.3 +
+  264.5 ms, 10.2% of the sampler). Instrument the real sampler first to explain
+  the 2.3-2.8 times gap to the standalone bench, then trim the steps listed
+  above; the query finite check is the largest single standalone step.
+- **Cross-attention K/V reuse across the four steps.** The cross K/V
+  projections (512x2048x1024 each) are a third of the cross QKV chain's
+  multiply-accumulates by shape arithmetic (K and V: 2 x 1.07 G; Q: 4.29 G).
+  With CFG 1 the sampler makes one forward pass per step, so the text context
+  is the same in all four steps. The retuned chain timer is about 0.40 s per
+  sampler, so reusing K/V in three of four steps could save up to roughly
+  0.1 s if the chain time scales with the multiply-accumulates. It needs a
+  Q-only chain artifact and a guard that compares the context before reuse.
+- **Host load and the slow state.** A thread-count sweep inside the harness
+  needs no system change and would show whether the sampler's own ten torch
+  threads push the NPU into the slow state. CPU affinity or power-plan changes
+  would need explicit approval and a restore plan.
+- **A measured VAE-inclusive ComfyUI run** with the `nq8pp` artifacts.
+- **Productionizing `nq8pp`.** It needs the `query_cores` change in the
+  repository and the node, and the two variant ELFs with their manifests (self
+  and cross) in the production artifact directory. This needs explicit approval
+  and a rollback copy.
+- **Further core scale-out is blocked.** The 16-core kernel already uses all
+  eight shim tiles, and the two designs that asked for more shim capacity
+  failed placement.
+
+### Reproduction
+
+From the session `files\air` directory (variant builds and device benches) and
+`files\int8` directory (sampler harness and summary). Variant builds use the
+compiler environment of the earlier AIR work (`$compilerPython`); benches and
+the harness use the production Python venv (`$python`). `$airUpstream` holds the
+pinned upstream attention sources (`air_variant.py` checks the `attn_npu2.cc`
+and `zero.cc` digests), `$pinnedAir` the production AIR attention artifacts
+(`self\` and `cross\`, each with `aie.elf` and `manifest.json`), `$gemmLayoutDir`
+the precompiled `wide32` GEMM library directory used by the earlier INT8 runs,
+`$files` the session `files` directory, `$repo` this repository and
+`$deployedNode` the deployed `anima_xdna_poc` directory:
+
+```powershell
+$env:XRT_DEV_DIR = "<XRT_SDK_DIR>"
+$env:TRITON_CACHE_DIR = "$files\air\triton-cache"
+Set-Location "$files\air"
+$nq8 = @('--nq', '8', '--parallel-heads', '2', '--q-mode', 'direct', '--kv-buffers', '2',
+  '--q-split', '2', '--out-split', '2', '--no-split', '--split-axis', 'column')
+foreach ($keys in 1024, 512) {
+  & $compilerPython air_variant.py --keys $keys --source-dir $airUpstream `
+    --work-dir "build\base-k$keys"
+  & $compilerPython air_variant.py --keys $keys --kv-buffers 2 --q-mode direct `
+    --source-dir $airUpstream --work-dir "build\pp-k$keys"
+  & $compilerPython air_variant.py --keys $keys @nq8 --source-dir $airUpstream `
+    --work-dir "build\nq8-pp-colsplit-k$keys"
+}
+& $python air_bench.py --artifact "$pinnedAir\self" --save-output out\self-pinned.npy `
+  --out bench\pinned-self.json
+& $python air_bench.py --artifact build\nq8-pp-colsplit-k1024 --runs 20 `
+  --reference-output out\self-pinned.npy --out bench\var-nq8-pp-colsplit-k1024.json
+& $python air_state3.py --artifact build\nq8-pp-colsplit-k1024 --launches 100 `
+  --conds "none,spin:4,none,spin:4" --out bench\state3-nq8-pp-colsplit-k1024.json
+& $python make_air_dir.py --self-build build\pp-k1024 --cross-build build\pp-k512 `
+  --out pp-dir
+& $python make_air_dir.py --self-build build\nq8-pp-colsplit-k1024 `
+  --cross-build build\nq8-pp-colsplit-k512 --out nq8-dir
+
+Set-Location "$files\int8"
+$env:ANIMA_XDNA_ATTENTION_BACKEND = 'air'
+$env:ANIMA_XDNA_ADALN_DEVICE = 'host'
+$env:ANIMA_XDNA_GEMM_LAYOUT_DIR = $gemmLayoutDir
+$env:ANIMA_XDNA_AIR_ATTENTION_DIR = $pinnedAir
+& $python int8_e2e_air.py --out int8-nq8-ab --runs 8 `
+  --modes int8-attn-l1k64 int8-attn-l1k64-pp int8-attn-l1k64-nq8pp `
+  --air-pp-dir "$files\air\pp-dir" --air-nq8-dir "$files\air\nq8-dir" --verify-attention
+& $python air_scaleout_summary.py `
+  --out "$repo\docs\evidence\air-attention-schedule-scaleout.json" `
+  --repo $repo --deployed-node $deployedNode
+```
+
+The other variants in the ablation use the same command shapes with their own
+options, and the state bench ran the same phases for every build (see
+`air_variant.py --help`). Helper scripts in `files\air`:
+
+- `equiv_sweep.ps1 -Variant nq8-pp-colsplit -Tag <tag>` runs the six-condition
+  sweep against the production artifacts (three launches per input).
+- `rebuild_check.ps1` rebuilds the six working variants under `repro-` names
+  and compares ELF and module digests (about three minutes).
+- `regen_failed_builds.ps1` re-runs the three builds that fail in `air-to-aie`
+  and `regen_hang_logs.ps1` re-runs four of the six hanging builds (the other
+  two keep their original logs). The second script deliberately provokes four
+  device timeouts; the health check described above followed it.
+- `pmode_probe.ps1` changes the NPU power mode with `xrt-smi configure --pmode`,
+  so it needs explicit approval. It restores the original mode in a `finally`
+  block, and its phases use `air_state2.py`.
+
+The default harness reference is the earlier INT8 baseline latent. The summary
+script re-verifies the source, ELF, latent and PNG hashes, the bench
+equalities, the compile-failure and hang logs, the rebuild check, the sweep
+and both A/B reports before writing the evidence file.
+`int8-nq8-ab\implementation.zip` (250 members, SHA-256
+`8b15a442fd0f2bf93c90fa804a85b9495ce07853546f49c06d973fa5401f7679`, stored in
+the evidence file as `implementation_archive_sha256`) pins the builder, the
+bench, state, probe and helper scripts with their results, the built variants
+with compile and hang logs, the assembled `pp-dir` and `nq8-dir`, the sampler
+harnesses and both A/B reports, the standalone VAE bench, the evidence generator
+and the patched node files with their diffs. The archive is not committed.
+
 ## Public verification ladder
 
 Set placeholders only in the current shell; do not commit paths or captures.
