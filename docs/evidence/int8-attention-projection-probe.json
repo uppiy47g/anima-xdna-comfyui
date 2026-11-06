@@ -1,0 +1,390 @@
+{
+  "experiment": "Session-only native INT8 QKV and attention output projections",
+  "date": "2026-11-06",
+  "production_modified": false,
+  "configuration": {
+    "seed": 700755787614899,
+    "positive": "a cheerful anime girl under cherry blossoms, detailed illustration, soft daylight",
+    "negative": "worst quality, low quality, blurry, jpeg artifacts",
+    "steps": 4,
+    "resolution": [
+      512,
+      512
+    ],
+    "sampler": "euler",
+    "scheduler": "simple",
+    "cfg": 1.0,
+    "torch_threads": 10,
+    "torch_version": "2.14.1+cpu",
+    "torch_git_version": "5c4886908584029761b579af026dcfb627c84070",
+    "attention_quantization": {
+      "activations": "symmetric per token, max(absmax,1e-12)/127, round-to-nearest-even, [-127,127]",
+      "weights": "symmetric per output channel, same rounding/range",
+      "accumulator": "native INT32",
+      "dequantization": "bf16((float(accumulator) * row_scale) * weight_scale)",
+      "attention_core": "unchanged experimental BF16 AIR QK/softmax/AV"
+    }
+  },
+  "timing_scope": "Warmed ComfyUI sampler; excludes loading, text encoding, VAE and image saving",
+  "mode_order": [
+    "int8-qk",
+    "int8-attn-out",
+    "int8-attn",
+    "int8-qk",
+    "int8-attn",
+    "int8-attn-out",
+    "int8-attn",
+    "int8-qk",
+    "int8-attn-out",
+    "int8-attn",
+    "int8-attn-out",
+    "int8-qk",
+    "int8-attn-out",
+    "int8-attn",
+    "int8-qk",
+    "int8-attn-out",
+    "int8-qk",
+    "int8-attn"
+  ],
+  "samples_ms": {
+    "int8-qk": [
+      9371.80620000072,
+      9225.76669999944,
+      9266.746699999203,
+      9353.539600000659,
+      9319.084000000657,
+      10379.850600000282
+    ],
+    "int8-attn-out": [
+      8781.600500000422,
+      8590.531300000293,
+      8712.087300000348,
+      8646.01169999878,
+      8786.410899998373,
+      9467.46610000082
+    ],
+    "int8-attn": [
+      7407.070600000225,
+      7472.502599999643,
+      7519.93020000009,
+      7456.968599999527,
+      7476.346600000397,
+      8107.250000000931
+    ]
+  },
+  "median_ms": {
+    "int8-qk": 9336.311800000658,
+    "int8-attn-out": 8746.843900000385,
+    "int8-attn": 7474.42460000002
+  },
+  "savings_vs_baseline": {
+    "int8-qk": {
+      "ms": 0.0,
+      "percent": 0.0,
+      "paired_ms": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    "int8-attn-out": {
+      "ms": 589.4679000002725,
+      "percent": 6.313712658999149,
+      "paired_ms": [
+        590.2057000002969,
+        635.2353999991465,
+        554.6593999988545,
+        707.5279000018782,
+        532.6731000022846,
+        912.3844999994617
+      ]
+    },
+    "int8-attn": {
+      "ms": 1861.8872000006377,
+      "percent": 19.942427372664508,
+      "paired_ms": [
+        1964.7356000004947,
+        1753.2640999997966,
+        1746.8164999991131,
+        1896.5710000011313,
+        1842.73740000026,
+        2272.6005999993504
+      ]
+    }
+  },
+  "mean_profile_ms": {
+    "int8-qk": {
+      "qkv_chain": 2132.8003833374773,
+      "out_projection": 968.083483334946,
+      "qkv_prepare": 251.75041666170728,
+      "attention_norm_entry": 294.1654999973859,
+      "attention_out_layout_or_quantize": 69.1947333416465,
+      "attention_gated_residual": 183.40573333383267,
+      "air_attention": 2704.7103666648886,
+      "mlp": 1411.9299999953607,
+      "block_overhead": 657.3033166465999,
+      "air_runner": 2079.8345499979405,
+      "sampler": 9486.13230000016
+    },
+    "int8-attn-out": {
+      "qkv_chain": 2036.040600004526,
+      "out_projection": 551.4353999915329,
+      "qkv_prepare": 248.33091666945015,
+      "attention_norm_entry": 309.5250333329507,
+      "attention_out_layout_or_quantize": 88.03010000519862,
+      "attention_gated_residual": 158.72884999256107,
+      "air_attention": 2674.2212666737637,
+      "mlp": 1408.4995499909685,
+      "block_overhead": 533.1989166625135,
+      "air_runner": 2079.283166665846,
+      "sampler": 8830.684633333172
+    },
+    "int8-attn": {
+      "qkv_chain": 1142.9209833386267,
+      "out_projection": 547.0199333361355,
+      "qkv_prepare": 324.6751000045454,
+      "attention_norm_entry": 183.530783324386,
+      "attention_out_layout_or_quantize": 98.06741667004341,
+      "attention_gated_residual": 133.61881666727035,
+      "air_attention": 2662.4215166678673,
+      "mlp": 1399.1371999976157,
+      "block_overhead": 300.5838499966558,
+      "air_runner": 2070.309416663804,
+      "sampler": 7573.344766666803
+    }
+  },
+  "dispatches_per_sampler": 896,
+  "standalone_native_exact_cases": 33,
+  "standalone_host_cases": 82,
+  "warmup_verification": {
+    "native_sampled_rows": 3,
+    "native_sampled_columns": 32,
+    "native_sampled_projection_calls": 1120,
+    "all_new_boundary_and_projection_checks": {
+      "int8-attn-out/attn1.layout_quantize": 112,
+      "int8-attn-out/attn1.out": 112,
+      "int8-attn-out/attn1.dequant_residual": 112,
+      "int8-attn-out/attn2.layout_quantize": 112,
+      "int8-attn-out/attn2.out": 112,
+      "int8-attn-out/attn2.dequant_residual": 112,
+      "int8-attn/norm1.entry_quantize": 112,
+      "int8-attn/attn1.q": 112,
+      "int8-attn/attn1.k": 112,
+      "int8-attn/attn1.v": 112,
+      "int8-attn/attn1.prepare": 112,
+      "int8-attn/attn1.layout_quantize": 112,
+      "int8-attn/attn1.out": 112,
+      "int8-attn/attn1.dequant_residual": 112,
+      "int8-attn/norm2.entry_quantize": 112,
+      "int8-attn/attn2.q": 112,
+      "int8-attn/attn2.k": 112,
+      "int8-attn/attn2.v": 112,
+      "int8-attn/attn2.context_quantize": 112,
+      "int8-attn/attn2.prepare": 112,
+      "int8-attn/attn2.layout_quantize": 112,
+      "int8-attn/attn2.out": 112,
+      "int8-attn/attn2.dequant_residual": 112
+    },
+    "bf16_qk_reference_calls": {
+      "attn1": 224,
+      "attn2": 224
+    },
+    "timed_samples_repeat_warmup_bitwise": true,
+    "baseline_latent_and_png_match_previous": true
+  },
+  "quality_cases": [
+    {
+      "evidence_directory": "int8-attention-final",
+      "seed": 700755787614899,
+      "positive": "a cheerful anime girl under cherry blossoms, detailed illustration, soft daylight",
+      "latent_vs_baseline": {
+        "int8-qk": {
+          "bitwise_equal": true,
+          "nrmse": 0.0,
+          "max_abs": 0.0,
+          "mae": 0.0
+        },
+        "int8-attn-out": {
+          "bitwise_equal": false,
+          "nrmse": 0.4031593055423996,
+          "max_abs": 3.9944870471954346,
+          "mae": 0.3307527888404138
+        },
+        "int8-attn": {
+          "bitwise_equal": false,
+          "nrmse": 0.3624371793357813,
+          "max_abs": 3.8532304763793945,
+          "mae": 0.29136340841370156
+        }
+      },
+      "image_vs_baseline": {
+        "int8-qk": {
+          "mae_255": 0.0,
+          "max_abs_255": 0,
+          "rmse_255": 0.0,
+          "psnr_db": null
+        },
+        "int8-attn-out": {
+          "mae_255": 21.263809204101562,
+          "max_abs_255": 237,
+          "rmse_255": 38.46706814966862,
+          "psnr_db": 16.42902187107546
+        },
+        "int8-attn": {
+          "mae_255": 18.239967346191406,
+          "max_abs_255": 236,
+          "rmse_255": 34.34146268827687,
+          "psnr_db": 17.414427830667446
+        }
+      },
+      "png_sha256": {
+        "int8-qk": "4c8e7a59212a36a8e5bdfc317a62d5a0e9a59c0bae8b89a573cddfc615b53ab7",
+        "int8-attn-out": "dfb3e8a5bec9e58cad823ee987728682ec0e78482d06c8443135e3f1a62899e3",
+        "int8-attn": "df4043656c71999b38324b5b048a6b337121ca9fa43981a8193351a61381a7cf"
+      }
+    },
+    {
+      "evidence_directory": "int8-attention-quality-portrait",
+      "seed": 42,
+      "positive": "portrait of an anime woman with short blue hair and a red scarf, city at night, detailed illustration",
+      "latent_vs_baseline": {
+        "int8-qk": {
+          "bitwise_equal": true,
+          "nrmse": 0.0,
+          "max_abs": 0.0,
+          "mae": 0.0
+        },
+        "int8-attn-out": {
+          "bitwise_equal": false,
+          "nrmse": 0.32993778371090543,
+          "max_abs": 3.4633047580718994,
+          "mae": 0.24480311187795678
+        },
+        "int8-attn": {
+          "bitwise_equal": false,
+          "nrmse": 0.300855897888905,
+          "max_abs": 3.510767698287964,
+          "mae": 0.22974129860961057
+        }
+      },
+      "image_vs_baseline": {
+        "int8-qk": {
+          "mae_255": 0.0,
+          "max_abs_255": 0,
+          "rmse_255": 0.0,
+          "psnr_db": null
+        },
+        "int8-attn-out": {
+          "mae_255": 16.43266487121582,
+          "max_abs_255": 254,
+          "rmse_255": 36.281916176054565,
+          "psnr_db": 16.936999296314223
+        },
+        "int8-attn": {
+          "mae_255": 16.302085876464844,
+          "max_abs_255": 255,
+          "rmse_255": 36.09887003728441,
+          "psnr_db": 16.98093145103827
+        }
+      },
+      "png_sha256": {
+        "int8-qk": "4a5932c7ca8bc71f72cb5be6d2e603ba7113a8b1e3139d960e2c38ee642b0600",
+        "int8-attn-out": "a09216ec5ef6ac88433f2b7b4e532798b1a4fde1c8d634845d3ebd01e6ffc360",
+        "int8-attn": "786619a51948ecacb6d042febc824b823acc537334e9ab089595c42038ff1733"
+      }
+    },
+    {
+      "evidence_directory": "int8-attention-quality-landscape",
+      "seed": 314159265,
+      "positive": "a quiet mountain village beside a lake at sunrise, anime background art, detailed landscape",
+      "latent_vs_baseline": {
+        "int8-qk": {
+          "bitwise_equal": true,
+          "nrmse": 0.0,
+          "max_abs": 0.0,
+          "mae": 0.0
+        },
+        "int8-attn-out": {
+          "bitwise_equal": false,
+          "nrmse": 0.2024793953250627,
+          "max_abs": 2.8113364577293396,
+          "mae": 0.13639531309382846
+        },
+        "int8-attn": {
+          "bitwise_equal": false,
+          "nrmse": 0.30922390850253995,
+          "max_abs": 3.0706667304039,
+          "mae": 0.20836500665814128
+        }
+      },
+      "image_vs_baseline": {
+        "int8-qk": {
+          "mae_255": 0.0,
+          "max_abs_255": 0,
+          "rmse_255": 0.0,
+          "psnr_db": null
+        },
+        "int8-attn-out": {
+          "mae_255": 6.896181583404541,
+          "max_abs_255": 184,
+          "rmse_255": 13.399284207029202,
+          "psnr_db": 25.589171631294136
+        },
+        "int8-attn": {
+          "mae_255": 10.899478912353516,
+          "max_abs_255": 233,
+          "rmse_255": 20.764417672060194,
+          "psnr_db": 21.784408487873023
+        }
+      },
+      "png_sha256": {
+        "int8-qk": "fa21813ee0154d15bb5037a6c6880eb7a5254e77fcf486b5b5d34a2967df8f03",
+        "int8-attn-out": "ab3cf75322bbbbbd9a1da9b75acbe356c6814d0ae0214c35589c6bbd09364298",
+        "int8-attn": "171fc9ea3ce9298ec10f41304d21e2fd461fa37375ba2155b6a620e21ce17925"
+      }
+    }
+  ],
+  "vae_single_decode_ms": {
+    "int8-qk": 4669.917900000655,
+    "int8-attn-out": 4790.796400000545,
+    "int8-attn": 4761.712699999407
+  },
+  "source_sha256": {
+    "int8_e2e.py": "6b201c1386663848cc0d4efd5c8e001ff1bd238fb5903d8c6b5e41750941572f",
+    "fused_middle.cpp": "d0369ea98a80cbcba173a956e310079f7b656719012d9b43f5c4f23279b110f4",
+    "fused_middle.py": "a5695ecd0c669ce653660b85083ae93b66af5273cc0588e0106bdc777160b2cb",
+    "fused_io.cpp": "e48dfb80b115cc0d4eefb6c016ccebe45db122cb1a4f0afb72a9f6eaecdaed06",
+    "fused_io.py": "5a7f7d927fe8ad4903d1f2b38c173e9bd530c4a1f69d0a1a83c7ca5a649e5ce0",
+    "fused_qk.cpp": "19a1d41462c30685d283470f24b9f9f9645add6b31f9b262196e82818daff88e",
+    "fused_qk.py": "7a92a82e5f76f88cdf5dc9b8c21fef18db9ad01e32c80e3110a3941118e8788a",
+    "fused_attention.cpp": "2c6a8543b7bee9fbe92d0ba89b3ec927f6e43603d206b95ae9d70a41c690bc99",
+    "fused_attention.py": "74906f1695f328a3cd1e4fe408a916b8a3ab65f48d0b7a8e4ff8324d57c97e9a",
+    "int8_attention_runner.py": "e5b1a6cb4a8068adfef6108327b1273f8b0db77b3e4635b3529989a46372ee1b"
+  },
+  "dll_sha256": {
+    "fused_middle.dll": "81903a0651054183e903006c5b92c489e008845a5fd7ecf319b94078b14d4567",
+    "fused_io.dll": "42e716d184c91c1380223068fbd1b4b11f54b43bd7c4c11145406162a05a91fc",
+    "fused_qk.dll": "424290e3949b9d43e936fd7257e60088d2ae2bf99b689cbf4d3ec053c664806d",
+    "fused_attention.dll": "483384346264186177c97254b4d7106c48460dd9f8c7661aacca3da0529c293f"
+  },
+  "elf_sha256": {
+    "in": "b186675ae2886a241066d4a2dfec1f745ef0c14fd7d67268861c05fe7fc9180a",
+    "out": "2918de3dc81378607c67a2bacebb1d128c937ba46982a69c302687316c5a7a8c",
+    "attn-out": "da8db5e4db3dd66e6d8e64afb7c9220a8a41d7e58e56305a14647d4db446f2d8",
+    "qkv-self": "8af83cbe169cac94188b4d459a2abe872965b4242b7ffc3f25f00707255c5a37",
+    "qkv-cross": "a62880f68004a002e3e8f75c6fa791a5557e898f36824699c0b73848c166aeeb"
+  },
+  "limitations": [
+    "Three prompt/seed cases are not a general quality validation.",
+    "Quantization changes latents and visible details; error is not a perceptual quality score.",
+    "The baseline already includes experimental INT8 MLP and BF16 AIR approximation.",
+    "AIR QK/softmax/AV are unchanged and not INT8.",
+    "QKV runner time includes staging/sync; no pure device-time claim.",
+    "INT8 output projection alone does not isolate native GEMM gains from fused host boundaries.",
+    "Sampler median plus one VAE decode is not an end-to-end median."
+  ],
+  "implementation_archive_sha256": "3cc60bdae0d29bf2bd08fe5cc5fe64d4d6f5c9f43602b0061704004814f46616"
+}

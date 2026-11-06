@@ -1417,6 +1417,126 @@ class AnimaBlockUnitTests(unittest.TestCase):
         self.assertGreater(metric.avoided_h2d_bytes, 0)
         self.assertEqual(metric.avoided_d2h_bytes, metric.avoided_h2d_bytes * 2)
 
+    def test_host_adaln_matches_linear_path_without_dispatches(self):
+        from anima_xdna_poc.block import BlockResult, _BlockExecution, run_xdna_block
+
+        config = _tiny_block_config()
+        tensors = _block_tensors(config)
+        generator = torch.Generator().manual_seed(75)
+        for name in ("norm1.linear_1.weight", "norm1.linear_2.weight"):
+            tensors[name] = torch.randn(
+                tensors[name].shape, generator=generator, dtype=torch.bfloat16
+            )
+        weights = AnimaBlockWeights("transformer_blocks.0.", tensors)
+        inputs = deterministic_block_inputs(config, 4, 3, seed=76)
+        calls = []
+
+        def linear_runner(name, value, weight, _):
+            calls.append(name)
+            shape = value.shape
+            result = cpu_linear(
+                prepare_linear(value.reshape(-1, shape[-1]), weight)
+            )
+            return result.reshape(*shape[:-1], weight.shape[0])
+
+        with mock.patch(
+            "anima_xdna_poc.block._BlockExecution", autospec=True,
+        ) as execution:
+            execution.return_value.run.return_value = BlockResult(
+                inputs.hidden_states, (),
+            )
+            run_xdna_block(
+                config, weights, inputs, session=mock.Mock(), resident_key="block0",
+            )
+            self.assertIsNone(execution.call_args.kwargs["adaln_runner"])
+            run_xdna_block(
+                config,
+                weights,
+                inputs,
+                session=mock.Mock(),
+                resident_key="block0",
+                host_adaln=True,
+            )
+            adaln_runner = execution.call_args.kwargs["adaln_runner"]
+        self.assertTrue(callable(adaln_runner))
+
+        legacy = _BlockExecution(config, weights, linear_runner, "host")
+        host = _BlockExecution(
+            config, weights, linear_runner, "xdna2", adaln_runner=adaln_runner,
+        )
+        expected = legacy.adaln(
+            "norm1",
+            inputs.hidden_states,
+            inputs.embedded_timestep,
+            inputs.temb,
+        )
+        calls.clear()
+        actual = host.adaln(
+            "norm1",
+            inputs.hidden_states,
+            inputs.embedded_timestep,
+            inputs.temb,
+        )
+        self.assertEqual(calls, [])
+        for got, want in zip(actual, expected):
+            torch.testing.assert_close(
+                got.float(), want.float(), rtol=2e-2,
+                atol=2e-2 * want.float().abs().max().item(),
+            )
+        metric = next(
+            item for item in host.metrics if item.name == "norm1.adaln_linear_pair"
+        )
+        self.assertEqual((metric.device, metric.dispatches), ("host", 0))
+
+    def test_packed_cache_host_linear_unpacks_effective_weight(self):
+        from anima_xdna_poc.weight_cache import PackedWeightCache, _layout_shape
+
+        generator = torch.Generator().manual_seed(77)
+        weight = torch.randn(300, 2500, generator=generator).to(torch.bfloat16)
+        payload = bytearray()
+        records = []
+        for start in range(0, weight.shape[1], 2048):
+            end = min(start + 2048, weight.shape[1])
+            packed = torch.zeros(
+                _layout_shape(weight.shape[0], end - start), dtype=torch.bfloat16
+            )
+            packed[: end - start, : weight.shape[0]] = weight[:, start:end].T
+            raw = packed.view(torch.uint8).numpy().tobytes()
+            records.append(
+                {
+                    "id": f"0:ff.net.2.weight:k{start}",
+                    "source_shape": list(weight.shape),
+                    "logical_shape": [end - start, weight.shape[0]],
+                    "packed_shape": list(packed.shape),
+                    "offset": len(payload),
+                    "length": len(raw),
+                }
+            )
+            payload.extend(raw)
+        cache = PackedWeightCache.__new__(PackedWeightCache)
+        cache.manifest = {"tensors": records}
+        cache._mapped = payload
+        cache._host_linears = {}
+        actual = cache.host_linear(0, "ff.net.2.weight")
+        self.assertTrue(torch.equal(actual, weight))
+        self.assertTrue(actual.is_contiguous())
+        self.assertIs(cache.host_linear(0, "ff.net.2.weight"), actual)
+
+    def test_chain_runtime_selects_host_adaln_by_default(self):
+        with mock.patch("anima_xdna_poc.chain.load_checkpoint_config"), mock.patch.dict(
+            os.environ, {}, clear=True,
+        ):
+            runtime = AnimaXDNAChainRuntime(Path("unused"))
+            self.assertEqual(runtime.adaln_device, "host")
+            runtime.close()
+            os.environ["ANIMA_XDNA_ADALN_DEVICE"] = "xdna"
+            runtime = AnimaXDNAChainRuntime(Path("unused"))
+            self.assertEqual(runtime.adaln_device, "xdna")
+            runtime.close()
+            os.environ["ANIMA_XDNA_ADALN_DEVICE"] = "gpu"
+            with self.assertRaisesRegex(UnsupportedTensor, "unknown AdaLN device"):
+                AnimaXDNAChainRuntime(Path("unused"))
+
     def test_adaln_linear_pair_unsupported_layout_falls_back(self):
         from anima_xdna_poc.block import _BlockExecution
 

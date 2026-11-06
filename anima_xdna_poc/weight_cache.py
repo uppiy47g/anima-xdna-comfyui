@@ -918,6 +918,7 @@ class PackedWeightCache:
         self.status: Optional[CacheStatus] = None
         self._lease: Optional[_VerifiedPayloadLease] = None
         self._mapped = None
+        self._host_linears: dict[tuple[int, str], torch.Tensor] = {}
 
     def identify(self) -> tuple[str, dict[str, Any], CacheTimings]:
         key, descriptor, timings, provisional = self._identify(False)
@@ -1771,6 +1772,7 @@ class PackedWeightCache:
 
     def close(self) -> None:
         self._mapped = None
+        self._host_linears.clear()
         if self._lease is not None:
             self._lease.release()
             self._lease = None
@@ -1832,6 +1834,26 @@ class PackedWeightCache:
 
     def norm(self, block: int, name: str) -> torch.Tensor:
         return self.tensor(f"{block}:{name}").clone()
+
+    def host_linear(self, block: int, name: str) -> torch.Tensor:
+        """Return the packed (effective) BF16 weight as a host ``[out, in]`` tensor."""
+        key = (block, name)
+        weight = self._host_linears.get(key)
+        if weight is not None:
+            return weight
+        out_features, in_features = self._record(f"{block}:{name}:k0")["source_shape"]
+        chunks = []
+        for start in range(0, in_features, 2048):
+            record = self._record(f"{block}:{name}:k{start}")
+            rows, columns = record["logical_shape"]
+            chunks.append(self.tensor(record["id"])[:rows, :columns])
+        weight = torch.cat(chunks).T.contiguous()
+        if tuple(weight.shape) != (out_features, in_features):
+            raise CacheIntegrityError(
+                f"packed weight {block}:{name} unpacked to {tuple(weight.shape)}"
+            )
+        self._host_linears[key] = weight
+        return weight
 
     def block_weights(self, block: int) -> AnimaBlockWeights:
         if block not in self.blocks:

@@ -100,6 +100,10 @@ class AnimaXDNAChainRuntime:
         if backend == "air" and not air_directory:
             raise UnsupportedTensor("AIR attention requires ANIMA_XDNA_AIR_ATTENTION_DIR")
         self.attention_backend = "air_experimental" if backend == "air" else "baseline"
+        adaln_device = os.environ.get("ANIMA_XDNA_ADALN_DEVICE", "host").strip() or "host"
+        if adaln_device not in ("host", "xdna"):
+            raise UnsupportedTensor(f"unknown AdaLN device: {adaln_device!r}")
+        self.adaln_device = adaln_device
         self._air_attention = None
         if backend == "air":
             from .air_attention import AIRAttentionBackend
@@ -292,6 +296,7 @@ class AnimaXDNAChainRuntime:
                 qkv_chaining=self.qkv_chaining,
                 activation_chaining=self.activation_chaining,
                 attention_runner=self._air_attention,
+                host_adaln=self.adaln_device == "host",
             )
             wall_ms = (time.perf_counter() - started) * 1000
             hidden = result.output
@@ -359,6 +364,7 @@ class AnimaXDNAChainRuntime:
                 qkv_chaining=self.qkv_chaining,
                 activation_chaining=self.activation_chaining,
                 attention_runner=self._air_attention,
+                host_adaln=self.adaln_device == "host",
             )
             xdna_ms = (time.perf_counter() - started) * 1000
             cpu_hidden = cpu_result.output

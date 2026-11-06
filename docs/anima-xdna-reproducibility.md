@@ -1045,6 +1045,1770 @@ be presented as the measured speed of the deployed normal environment.
 The local launcher/configuration and generated images are retained outside
 the repository for the user's direct evaluation.
 
+### Host AdaLN and lightweight AIR finite checks
+
+A later profile of the deployed AIR route (Turbo V1.1, 512x512, four
+Euler/simple steps, CFG 1, seed `700755787614899`, ten CPU threads, three
+warmed sampler runs each) found two host-side costs:
+
+- `torch.isfinite(t).all()` on every AIR Q/K/V input and output cost about
+  1.2 s/sampler in elementwise ATen ops. The checks now reduce once in FP32
+  (`isfinite(t.sum(dtype=float32))`), which still rejects any NaN/Inf.
+- The six single-row AdaLN GEMV dispatches per block (that deployment's GEMM
+  layout cannot use pair chaining) were dominated by fixed dispatch cost.
+  `ANIMA_XDNA_ADALN_DEVICE=host` (the new default) runs them on the host in
+  BF16 from the packed, LoRA-effective weights; `xdna` restores the NPU path.
+
+| Measurement | Before | Finite check only | + host AdaLN |
+|---|---:|---:|---:|
+| Warm four-step sampler median | 12.658 s | 11.507 s | 10.881 s |
+| XRT dispatches/model evaluation | 476 | 476 | 308 |
+| Decoded image vs before (RGB MAE) | - | 0 (bitwise) | 11.91/255 |
+
+The finite-check change is output-identical. Host AdaLN is not: on real
+inputs its modulation differed from the NPU path by 0.25% relative L2
+(median), while its error against an FP32 computation from the same weights
+was 0.17% versus the NPU path's 0.21%. That bf16-rounding-level change is
+amplified by the four-step trajectory into a visibly different fixed-seed
+image; it is not a weight or layout error (the unpacked weights were
+bitwise equal to the loaded model's).
+
+These are three warmed runs per configuration in separate processes, not
+an interleaved paired benchmark. The modified configuration was measured
+on a session-local copy of the deployed node, which also includes local GEMM
+layout optimizations absent from this repository. The production node was
+not modified. Text encoding, loading, and VAE decoding are outside the
+sampler medians; default FP32 VAE decode separately took a 2.909 s median
+before the changes and 2.870 s with them.
+
+In the first instrumented before/after runs, sampler wall time was
+12.776 / 10.925 s and summed XRT `wait2` time was 5.629 / 5.082 s.
+Wait includes device execution and runtime waiting; it is **not** pure NPU
+compute, and the ratio to wall time is not NPU utilization. The remaining
+wall time cannot all be assigned to CPU arithmetic either.
+`ff.proj_out` still used four dispatches per block (448 per four-step
+sample), taking 1.954 s in the modified run including its host handling.
+Reducing that split is a dispatch-reduction candidate, not a demonstrated
+speedup or a reason to repeat the unsuccessful MLP/elementwise fusion.
+
+#### Actual-workload AVX-512 BF16 verification
+
+On 2026-11-05, separate diagnostic processes traced the real Qwen text
+encoding, warmed four-step sampler, and default VAE decode on an AMD Ryzen
+AI 9 365 (Zen 5), using PyTorch `2.14.1+cpu`, oneDNN `3.12.0`, and ten CPU
+threads. Both the unchanged production node and the modified copy completed
+normally; each traced sampler reproduced its own warmup latent bitwise.
+Verbose tracing was separate from the latency measurements above.
+
+The check used `torch.backends.mkldnn.verbose(torch.backends.mkldnn.VERBOSE_ON)`
+around each actual workflow phase, with additional markers around the host
+AdaLN pairs. The following are **executed primitive records**, not just
+CPU support flags or synthetic GEMM results:
+
+| Actual operation | Configuration | Executed oneDNN implementation | Data type | Calls |
+|---|---|---|---|---:|
+| MLP GELU, `1x1024x8192` | Both | `jit:avx512_core_bf16` | BF16 | 112 per sampler |
+| AdaLN first linear, `1x2048:2048x256` | Host AdaLN | `brg_matmul:avx512_core_bf16` | BF16 input/weight/output | 336 per sampler |
+| AdaLN second linear, `1x256:256x6144` | Host AdaLN | `brg_matmul:avx512_core_bf16` | BF16 input/weight/output | 336 per sampler |
+| Default VAE convolutions | Both | `jit:avx512_core` / `jit_1x1:avx512_core` | FP32 | 35 per decode |
+
+Representative raw execution lines (the last field is diagnostic time in
+milliseconds, not a benchmark):
+
+```text
+onednn_verbose,v1,primitive,exec,cpu,eltwise,jit:avx512_core_bf16,forward_training,data:bf16::blocked:abc::f0,attr-scratchpad:user,alg:eltwise_gelu_erf alpha:0 beta:0,1x1024x8192,1.0466
+onednn_verbose,v1,primitive,exec,cpu,matmul,brg_matmul:avx512_core_bf16,undef,src:bf16::blocked:ab::f0 wei:bf16::blocked:ba::f0 dst:bf16::blocked:ab::f0,attr-scratchpad:user,,1x2048:2048x256,0.0796
+onednn_verbose,v1,primitive,exec,cpu,matmul,brg_matmul:avx512_core_bf16,undef,src:bf16::blocked:ab::f0 wei:bf16::blocked:ba::f0 dst:bf16::blocked:ab::f0,attr-scratchpad:user,,1x256:256x6144,0.1314
+```
+
+**AVX-512 BF16 is being used:** the existing production sampler selects a
+BF16-capable GELU kernel, and the new host AdaLN path executes all 672
+linears with the native BF16 matmul implementation. The production trace
+did **not** contain those CPU matmuls: its AdaLN still runs on XDNA.
+GELU is not a BF16 dot product, and no claim is made that every host
+operation uses BF16 instructions. In particular, the VAE remains FP32,
+and no oneDNN execution records appeared during Qwen text encoding;
+oneDNN logging alone cannot identify the ISA of non-oneDNN operations.
+The trace also contains FP32 GELU records with the `_bf16` ISA suffix,
+so the data-type fields must be checked as well as the implementation name.
+The earlier synthetic-op check was insufficient to establish these
+real-workload distinctions.
+
+## Native INT8 GEMM feasibility (2026-11-05)
+
+This is a standalone hardware probe, not a production path. Production
+remains BF16 (`quantization_scheme="none"`). The probe used the same
+compiler stack as the deployed wide32 library: mlir-air
+`0.0.1.2026102020+508ca73`, mlir-aie `1.4.5.dev51+ge040370`, llvm-aie
+`22.0.0.2026101201+83ba9ea9`, Triton-XDNA `3.6.0.2026093004+75679dc`, and
+XRT `2.21.75`. Kernels used `tl.dot` on `int8` operands with
+`accum_type="i32"` and no contract input cast, which keeps the operands
+signed. The wide32 transform was reused (`l1_m=64`, `l1_n=128`, `l2_k=256`,
+`l1_k=32`, 512x512 blocks) unless noted otherwise.
+
+**INT8 is native:** the core LLVM IR loads raw `<64 x i8>` vectors directly
+into `llvm.aie2p.I512.I512.ACC2048.mac.conf`, and nothing converts them to
+BF16. Every INT8 run gave int32 output bitwise equal to the CPU integer
+matmul, with zero mismatches. This held for random data and for the real
+block-0 fixtures. Because of this, the quality of any INT8 scheme can be
+simulated exactly on the CPU.
+
+A whole-K load fails at `K=8192` with Triton's "Maximum allowed number of
+elements is 1048576" error. A K-loop kernel (`acc = tl.dot(a, b, acc)`,
+`k_loop=True`, `BLOCK_K == l2_k`) compiles and removes the production 4x
+`K=2048` split.
+
+Times are the median `kernel_sync` of 21 warm runs with the weight resident
+and no ComfyUI process running.
+
+| Shape (M,N,K) | BF16 kernel | INT8 kernel | INT8 schedule | Speedup |
+|---|---:|---:|---|---:|
+| MLP `proj_in` 1024,8192,2048 | 7.03 ms (production) | 3.79 ms | `l2_k=512`, `l1_k=64` | 1.85x |
+| Attention 1024,2048,2048 | 2.31 ms (production) | 1.54 ms | wide32 | 1.51x |
+| MLP `proj_out` 1024,2048,8192 | 5.42 ms (BF16 K-loop) / 4 x 2.31 ms (production split) | 3.76 ms | wide32 K-loop | 1.44x / 2.46x |
+
+On the same `proj_in` shape, the INT8 wide32 schedule took 4.95 ms and
+`l1_k=64` took 3.97 ms. A BF16 build with `l1_k=64` stayed at 6.99 ms. The
+best effective INT8 throughput is about 9 TOPS, well below the int8 peak,
+so the schedule is not yet tuned.
+
+A **BF16 K-loop** `proj_out` is a separate candidate. Its kernel time is
+5.42 ms against 9.25 ms for the production split. It also needs no host
+partial sums, and it reduces those dispatches from 448 to 112 per sampler.
+
+Numerical error on real block-0 inputs is the NRMSE against FP64
+computed from the same BF16 inputs. The W8A8 row uses int8 activations
+quantized per token and int8 weights quantized per output channel, run on
+the NPU. The other quantized rows are exact CPU simulations.
+
+| Layer | Production BF16/BFP16 | W8A8 per-token / per-channel | W8A8 per-tensor activation | W8-only |
+|---|---:|---:|---:|---:|
+| `attn1.q` | 0.57% | 1.55% | 2.78% | 0.80% |
+| `attn1.out` | 0.29% | 0.61% | 0.61% | 0.45% |
+| `attn2.out` | 0.20% | 0.47% | 0.57% | 0.20% |
+| `ff.proj_in` | 0.48% | 1.22% | 1.25% | 0.75% |
+| `ff.proj_out` | 0.40% | 1.26% | 2.12% | 0.67% |
+
+W8A8 error is about 2.5-3x the error of the current BFP16 path, and its
+cosine similarity stayed at or above 0.99988. This initial probe did not
+measure generated images; the follow-up below does.
+
+The initial synthetic host-cost probe used `approximate="tanh"` GELU,
+**not** the `approximate="none"` (erf) GELU in the actual block. With ten
+threads, its fp32 -> BF16 -> GELU step on the 1024x8192 MLP middle took 4.5 ms.
+Doing int32 dequantization, GELU, and per-row int8 requantization with
+stock PyTorch takes 13.4 ms. `torch.quantize_per_channel` is slower still,
+at 28 ms for the quantization step alone. Over 28 blocks and 4 steps, this
+extra host work would add about 1 s per sampler unless the dequantization
+and quantization are fused into one host kernel or moved to the NPU. The
+matched erf-GELU measurements below supersede these host-cost estimates.
+
+## ComfyUI BF16 K-loop and fused INT8 MLP experiments (2026-11-06)
+
+Both experiments ran the real ComfyUI loaders, text encoder, sampler and
+FP32 VAE through a Python harness, not a standalone GEMM simulation.
+An isolated copy of the deployed node included the host AdaLN and
+lightweight finite checks above. The production install, packed-weight
+format and defaults were not changed. The attention backend remained
+the existing **experimental AIR** implementation, with its previously
+documented quality limitations.
+
+Conditions: Anima Turbo V1.1, 512x512, four Euler/simple steps, CFG 1,
+seed `700755787614899`, ten PyTorch threads, Ryzen AI 9 365 / XDNA 2.
+The positive prompt was
+`a cheerful anime girl under cherry blossoms, detailed illustration, soft daylight`;
+the negative prompt was `worst quality, low quality, blurry, jpeg artifacts`.
+Each comparison warmed both modes, then alternated their execution order
+for five measured samples per mode. Sampler times **exclude model loading,
+text encoding and VAE decoding**. Every mode reproduced its own warmup
+latent bitwise across all five measured samples.
+
+### Single-dispatch BF16 proj_out
+
+Only `ff.proj_out` changed: the four `K=2048` dispatches plus host partial
+sum became one `K=8192` K-loop dispatch. Inputs and weights remained BF16,
+accumulation/output storage remained FP32, and the final output still
+rounded to BF16. Full weights were assembled from the same packed-cache
+chunks and retained in XRT BOs after warmup.
+
+| Metric per four-step sample | Four-way split | Single K-loop |
+|---|---:|---:|
+| Median sampler | 12.621 s | 11.113 s |
+| Median complete `proj_out` stage | 2.278 s | 0.883 s |
+| All NPU dispatches | 1,232 | 896 |
+| `proj_out` dispatches | 448 | 112 |
+| `proj_out` D2H bytes | 3,758,096,384 | 939,524,096 |
+
+This is **1.508 s / 11.95% less sampler time** in the matched comparison,
+not the standalone GEMM speedup extrapolated to the whole sampler.
+Do not compare this absolute baseline directly with earlier profiling
+runs under different process/thermal conditions.
+
+The images were valid but **not numerically or visually identical**.
+For the same block-0 `proj_out` input, the BF16 output NRMSE was only
+0.00292%, with maximum absolute difference 0.00390625. Across the complete
+sampler, however, latent NRMSE was 23.394%; RGB MAE was 10.618/255 and
+maximum pixel difference was 224/255. The fixed-seed images visibly
+differed in the hand, hair and blossoms. This is a demonstrated speedup,
+not evidence of quality equivalence or approval for automatic deployment.
+
+### Fused INT8 host middle
+
+The dedicated C++/AVX-512 host operation combines:
+
+1. INT32 accumulator dequantization using per-token activation scales
+   and per-output-channel weight scales.
+2. BF16 rounding, erf-GELU, and BF16 output rounding.
+3. Per-token absolute maximum, symmetric scale selection, and
+   round-to-nearest-even INT8 requantization to [-127, 127].
+
+It uses a 65,536-entry FP32 lookup table generated by the installed
+PyTorch BF16 `F.gelu(..., approximate="none")`. BF16 has only 65,536 bit
+patterns, so the lookup preserves that reference activation instead of
+substituting tanh-GELU. Each OpenMP worker keeps one row of intermediate
+values in scratch storage, avoiding multiple full-tensor temporaries.
+The table occupies 256 KiB; ten 8,192-element FP32 scratch rows occupy
+320 KiB. Weight quantization and table initialization are outside warm
+timings. Input activation quantization remains dynamic and is included
+in the complete MLP and sampler measurements.
+
+The fused quantized tensor **and scales were bitwise identical** to the
+unfused PyTorch reference on real block-0 NPU INT32 accumulators, random
+inputs, zero rows, large values and tiny values. Invalid scales and
+nonfinite intermediate values raised explicit errors. The two-NPU-GEMM
+MLP output also matched the unfused INT8 path bitwise.
+
+Interleaved microbenchmarks, 31 measured iterations, ten host threads:
+
+| Boundary | BF16 reference | Unfused W8A8 | Fused W8A8 |
+|---|---:|---:|---:|
+| Host middle, 1024x8192, actual erf-GELU | 2.244 ms | 14.200 ms | 1.327 ms |
+| Complete MLP: input handling, two resident NPU GEMMs, host middle, final BF16 output | 17.719 ms (BF16 K-loop) | 27.961 ms | 13.819 ms |
+
+Fusion reduced the quantized host-middle cost by **10.7x**. The complete
+quantized MLP was 22.0% faster than the BF16 K-loop MLP in this isolated
+real-data measurement. Its output NRMSE versus that BF16 MLP was 1.856%;
+this quantization difference is distinct from any fusion error.
+
+### Full ComfyUI sampler with fused W8A8 MLPs
+
+The second matched experiment quantized both MLP linears in all 28
+blocks, while leaving attention and AdaLN unchanged. INT8 inputs and
+weights ran on the NPU with INT32 accumulation; the fused middle ran on
+the CPU, and `proj_out` dequantized back to BF16 before the existing gated
+residual. No MLP was moved to a CPU matmul.
+
+| Median per four-step sample | BF16 K-loop | Fused W8A8 MLP |
+|---|---:|---:|
+| Sampler | 11.068 s | 10.817 s |
+| `ff.proj_in` stage | 1.232 s | 0.878 s |
+| `ff.gelu` stage (including dequant/requant in INT8) | 0.127 s | 0.169 s |
+| `ff.proj_out` stage | 0.887 s | 0.716 s |
+| All NPU dispatches | 896 | 896 |
+
+The additional whole-sampler improvement was only **0.251 s / 2.27%**
+in this run, much smaller than the isolated MLP improvement. Thus the
+quantization overhead problem is resolved for this probe, but a large
+end-to-end INT8 gain has **not** been established.
+
+A separate complete sampler pass using the unfused PyTorch INT8 middle
+produced a latent **bitwise identical** to the fused INT8 pass. Against
+the BF16 K-loop reference, the INT8 latent NRMSE was 26.735%, RGB MAE
+14.247/255 and maximum pixel difference 228/255. The images retained the
+prompt's subject but differed in fine details and pose. Only one
+prompt/seed was evaluated; these measurements are not a general image
+quality acceptance test.
+
+Persistent session-local evidence is under `files\int8`: `kloop_e2e.py`,
+`fused_middle.cpp`, `fused_middle.py`, `fused_middle_probe.py`,
+`fused_middle_report.json`, and the `kloop-e2e` / `int8-fused-e2e` directories
+containing reports, latents and PNGs. The native DLL was built with MSVC
+14.44 using `/LD /O2 /MD /std:c++17 /EHsc /arch:AVX512 /fp:strict /openmp`;
+the wrapper checks AVX-512 availability and tensor layouts before use.
+These remain experimental session artifacts, not a new production
+dependency or an enabled quantization mode.
+
+## INT8 full-section profile and fused MLP entry/exit (2026-11-06)
+
+Same real-ComfyUI conditions as the section above: Anima Turbo V1.1,
+512x512, four Euler/simple steps, CFG 1, the same seed and prompts, ten
+PyTorch threads, experimental AIR attention, host AdaLN, and W8A8 MLPs
+with the fused host middle. A new harness timed every stage the block
+executes, the NPU runner calls inside the AIR attention stage, and the
+time *between* stages, so the components below sum to the measured
+sampler time. After one warmup per mode, the two modes alternated
+(ABBAABBAAB) for five measured samples each. Sampler times **exclude
+model loading, text encoding and VAE decoding**. The stage timers are
+active in both modes, so absolute times include their (small) cost.
+
+### Where the INT8 sampler time goes
+
+Mean of five measured four-step samples. "Before" is the INT8 W8A8
+configuration from the previous section; "After" adds the fused MLP
+entry/exit described below. Before the change, the MLP stage timers also
+contain the host quantization (0.218 s) and dequantization (0.082 s).
+
+| Component | Before | After |
+|---|---:|---:|
+| NPU AIR attention stages (`attn1` + `attn2`) | 2.819 s (26.5%) | 2.807 s |
+| NPU Q/K/V chain stages | 1.971 s (18.5%) | 1.991 s |
+| NPU INT8 MLP stages (`proj_in` + `proj_out`) | 1.530 s (14.4%) | 1.209 s |
+| NPU attention out-projection (BF16) | 0.953 s (8.9%) | 0.956 s |
+| Host Q/K RMSNorm | 0.875 s (8.2%) | 0.875 s |
+| Host RoPE (self-attention only) | 0.540 s (5.1%) | 0.567 s |
+| Block time outside every stage timer | 0.474 s (4.5%) | 0.498 s |
+| Host LayerNorm + modulation | 0.329 s (3.1%) | 0.331 s |
+| Host gated residuals | 0.229 s (2.2%) | 0.232 s |
+| Host AdaLN (SiLU + two BF16 GEMVs) | 0.218 s (2.1%) | 0.217 s |
+| Host fused dequant + GELU + requant | 0.186 s (1.7%) | 0.187 s |
+| ComfyUI sampler outside the model forward | 0.179 s (1.7%) | 0.187 s |
+| Forward-call overhead (lock/validation) | 0.143 s (1.3%) | 0.148 s |
+| Host head layout | 0.099 s (0.9%) | 0.099 s |
+| Embedding, time embedding and final layer | 0.088 s (0.8%) | 0.094 s |
+| Chain overhead outside blocks | 0.017 s (0.2%) | 0.016 s |
+| **Sampler mean** | **10.650 s** | **10.413 s** |
+
+With the fused entry/exit, NPU stage walls total 6.96 s (67%), host-only
+stages 2.51 s (24%), and time outside every stage timer 0.94 s (9%).
+All 896 dispatches per sample are unchanged. The profile shows:
+
+- Only 2.07 s of the 2.81 s AIR attention stage is `runner.run`
+  (1.274 s for the 1024-token self-attention, 0.794 s for the 512-token
+  cross-attention). The remaining 0.74 s (26%) is host work around the
+  dispatches.
+- The BF16 out-projection stages take 0.956 s. The NPU kernel is 0.554 s
+  of that (2.47-2.48 ms per call) and the copy/H2D/D2H counters add
+  0.09 s. About 0.31 s is host work those counters do not cover; the
+  source shows a zero-filled padded input copy and an FP32-to-BF16 output
+  conversion on this path, but this has not been broken down yet.
+- Q/K RMSNorm, RoPE and head layout together take 1.54 s (14.8%). They
+  are eager PyTorch operations with several full-tensor FP32/BF16
+  temporaries (for example 2.6 ms for one self-attention Q RMSNorm).
+- The Q/K/V chain stages (1.99 s) have no sub-timers yet.
+
+The "before" sampler here (10.652 s median) is 0.165 s faster than the
+10.817 s of the previous section's run, inside the run-to-run variation
+of about 0.3 s. Compare absolute times only within one comparison.
+
+### Fused MLP entry and exit
+
+Two further OpenMP/AVX-512 host operations replace the unfused PyTorch
+steps around the INT8 MLP:
+
+- **Entry.** `F.layer_norm` stays in PyTorch (0.21 ms, and its reduction
+  order is not worth replicating). One kernel then applies the
+  BF16-rounded modulation, `bf16(bf16(ln * bf16(1 + scale)) + shift)`,
+  checks finiteness, finds each token's absolute maximum, and writes the
+  INT8 activation (round-to-nearest-even, [-127, 127]) and per-token
+  scale directly as the NPU input.
+- **Exit.** The `proj_out` INT32 accumulators are dequantized with the
+  per-token and per-output-channel scales, rounded to BF16, multiplied by
+  the gate, rounded, added to the residual and rounded again in a single
+  pass that writes the new hidden state. The intermediate BF16 MLP output
+  and gate product are never materialized.
+
+BF16 rounding uses an integer round-to-nearest-even implementation that
+matches PyTorch's conversion for finite values; `vcvtneps2bf16` was not
+used because its denormal handling differs. Isolated CPU-only
+microbenchmark, ten threads, median of 60 runs:
+
+| Operation | PyTorch reference | Fused |
+|---|---:|---:|
+| Modulation + INT8 quantization | 1.83 ms | 0.38 ms |
+| Dequantization + gated residual | 1.03 ms | 0.37 ms |
+
+A 22-case probe compared both kernels with the PyTorch reference. Outputs
+were **bitwise identical** for random data at several magnitudes, an
+outlier, a zero row, tiny (1e-30) values, all-zero input, strided
+gate/shift/scale views, accumulators spanning the full INT32 range and a
+zero gate. NaN/Inf inputs, a NaN modulation scale, zero or NaN
+dequantization scales, and wrong dtype or shape raised explicit errors
+instead of falling back.
+
+| Four-step sample, five alternating runs | INT8 | INT8 + fused entry/exit |
+|---|---:|---:|
+| Median sampler | 10.652 s | 10.418 s |
+| Per-pair sampler difference | - | -0.22, -0.18, -0.24, -0.30, -0.25 s |
+| MLP entry (`norm3` LayerNorm/modulation + `proj_in`) | 0.948 s | 0.684 s |
+| MLP exit (`proj_out` + `ff.gated_residual`) | 0.734 s | 0.657 s |
+| All NPU dispatches | 896 | 896 |
+
+The sampler improved by **0.234 s / 2.19%**, matching the roughly 0.24 s
+predicted from the microbenchmark (about 2.1 ms per block over 112
+blocks). The stage-level savings add up to 0.34 s, but about 0.1 s of it
+was offset by slightly slower unmodified stages in this run (largest:
+`norm1` LayerNorm/modulation +0.030 s, `attn1.q_rope` +0.027 s,
+`attn1.qkv_chain` +0.020 s). The cause was not investigated, so the
+sampler-level alternating comparison is the number to rely on.
+
+The final latent is **bitwise identical** to the earlier INT8 latent from
+a separate process (`torch.equal` true, NRMSE 0, maximum difference 0),
+and the decoded PNG has the same SHA-256. All ten measured samples also
+reproduced their mode's warmup latent bitwise. The fusion therefore
+changes speed only; the INT8 quality caveats above (26.7% latent NRMSE
+against the BF16 K-loop from one prompt/seed, and the AIR attention's
+29% NRMSE against control) are unchanged. With the FP32 VAE decode
+(single 3.42 s measurement) one image takes about 13.8 s, excluding text
+encoding and model loading.
+
+### Remaining host-side targets
+
+Candidates identified from this profile; the first is measured in the
+next section. The following estimates are not measured speedups.
+
+1. **Fused Q/K RMSNorm + RoPE writing the AIR input layout directly**
+   (1.54 s including head layout). The entry kernel moves the same 4 MB
+   tensors in 0.38 ms, so about 0.5 ms per call (roughly 0.2 s per
+   sampler) is a plausible target. Bitwise equality requires matching
+   PyTorch's `mean` reduction order; if that cannot be matched, the
+   kernel needs an explicit error bound and a new latent-quality
+   measurement.
+2. **Itemize the host work around NPU dispatches**: 0.74 s in the AIR
+   stages, about 0.31 s in the out-projection stages, 0.50 s of block
+   time outside every stage timer, and the Q/K/V chain (1.99 s with no
+   sub-timers). Finer instrumentation should come before kernel choices.
+3. **INT8 attention projections.** The out-projection kernel is 0.554 s
+   of its 0.956 s, so even a 2x faster kernel recovers under 0.3 s, and
+   quantizing attention carries more quality risk than the MLP.
+
+Persistent session-local evidence is under `files\int8`: `int8_e2e.py`
+(profile and A/B harness), `int8_profile_table.py`, `fused_io.cpp`,
+`fused_io.py`, `fused_io_probe.py`, `fused_io_report.json`, and the
+`int8-io-e2e` directory with the report, `profile.md`, latents and PNGs.
+`fused_io.dll` was built with the same MSVC toolchain and flags as
+`fused_middle.dll`; the wrapper checks AVX-512 availability, dtypes,
+shapes and contiguity before use. These remain experimental session
+artifacts. The production node, packed weights and defaults are
+unchanged, and no quantization mode is enabled.
+
+## Fused host Q/K RMSNorm, RoPE and AIR input layout (2026-11-06)
+
+The next experiment adds one dedicated CPU call per attention to the
+previous INT8 + fused MLP entry/exit configuration. It consumes the
+token-major BF16 Q/K/V projection outputs, normalizes Q and K, applies
+split-half RoPE for self-attention, and writes contiguous head-major
+Q/K/V tensors directly for AIR. Cross-attention omits RoPE. The V tensor
+is only rearranged; it is neither normalized nor quantized.
+
+This is **host fusion**, not a new NPU kernel or another quantization
+change. Attention GEMMs, AIR attention, MLPs, AdaLN, gated residuals and
+the AIR output layout operation are unchanged. Existing AIR input/output
+finite checks remain enabled. The native call uses OpenMP with ten
+threads and AVX-512, with newly owned output buffers rather than shared
+scratch outputs. It accepts both the actual 2-D QKV-chain outputs and
+batch-one 3-D tensors, for 16 heads, depth 128, 1024 queries and either
+1024 or 512 keys.
+
+### Matching the reference arithmetic
+
+The deployed PyTorch 2.14.1+cpu build
+(`5c4886908584029761b579af026dcfb627c84070`) uses an eight-lane FP32
+reduction order for the 128-element mean, despite the CPU supporting
+AVX-512. A sixteen-lane or tree reduction is not bitwise equivalent.
+The kernel therefore accumulates squared values in four eight-lane
+accumulators, combines them left-to-right, and sums the resulting eight
+lanes serially before dividing by 128. Reciprocal square root uses
+division by square root, not an approximate reciprocal instruction.
+
+The existing BF16 rounding after normalization, after multiplication by
+the learned weight, and after RoPE is preserved. RoPE uses separate FP32
+multiplications and addition, without FMA contraction. The DLL is built
+with `/LD /O2 /MD /std:c++17 /EHsc /arch:AVX512 /fp:strict /openmp`.
+The Python wrapper checks AVX-512 support and the installed PyTorch mean
+reduction contract at initialization; an incompatible reduction raises
+an error rather than selecting a silent fallback.
+
+The final CPU probe passed 61 checks, covering both key lengths,
+2-D/3-D inputs, storage offsets, signed zeros, BF16 subnormals, outliers,
+zero rows, zero/negative weights, identity/quarter-turn RoPE, and
+1/4/10 threads. It compares BF16 bit patterns, including signed zeros,
+and checks input immutability and independent output ownership.
+Invalid shapes/dtypes/strides, nonfinite inputs (including unusual NaN
+payloads), variance overflow and invalid thread counts are rejected.
+
+Interleaved CPU microbenchmarks, 60 measured calls per mode after warmup,
+including allocation and contiguous Q/K/V output preparation:
+
+| Complete attention-input preparation | PyTorch | Fused |
+|---|---:|---:|
+| Self-attention, 1024 queries/keys | 8.284 ms | 1.184 ms |
+| Cross-attention, 1024 queries / 512 keys | 3.404 ms | 0.639 ms |
+
+### Matched real-ComfyUI result
+
+Conditions remain Turbo V1.1, 512x512, four Euler/simple steps, CFG 1,
+seed `700755787614899`, the same prompts, host AdaLN and experimental
+AIR attention. The baseline is `int8-io`, not the original BF16 model.
+Both modes warm up, then run in alternating order (ABBAABBAAB), five
+samples each. During the fused warmup only, every prepared Q/K/V tensor
+is compared bitwise with the reference: 112 self-attention and 112
+cross-attention calls, covering all 28 blocks and all four steps.
+These extra comparisons are disabled for the timed samples.
+
+| Per four-step sampler | INT8 + fused MLP I/O | Plus fused Q/K preparation |
+|---|---:|---:|
+| Median sampler, excluding VAE | 10.493 s | 9.282 s |
+| Individual sampler times | 10.493, 10.433, 10.424, 10.804, 10.940 s | 9.214, 9.281, 9.282, 9.614, 9.478 s |
+| Self-attention input preparation, mean total | 1.116 s | 0.154 s |
+| Cross-attention input preparation, mean total | 0.391 s | 0.099 s |
+| Combined input preparation, mean total | 1.507 s | 0.253 s |
+| AIR attention stages, mean total | 2.854 s | 2.727 s |
+| Inner AIR `runner.run`, mean total | 2.071 s | 2.067 s |
+| NPU dispatches | 896 | 896 |
+
+The median sampler improvement is **1.210 s / 11.54%**. All five matched
+pairs improved, by 1.279, 1.152, 1.142, 1.190 and 1.462 s. The last two
+pairs were slower in absolute terms in both modes; they remain included.
+A preceding run before the final invalid-NaN-input guard gave a similar
+10.420 -> 9.212 s result (-11.60%); the table above uses the final DLL.
+
+Input preparation itself fell by 1.254 s (83.2%). In the baseline its
+stage sum includes Q/K layout views, RMSNorm and RoPE, while the
+remaining contiguous copies occur inside the AIR stage. The fused sum
+already includes all three contiguous input tensors, including V.
+Consequently the combined preparation + AIR boundary is the fair
+accounting comparison: 4.361 -> 2.981 s mean. The unchanged AIR output
+layout operation is excluded from that boundary. Some gains are offset
+elsewhere (for example QKV-chain time +0.063 s and block time outside
+stage timers +0.080 s), so use the sampler result for the overall gain.
+**`runner.run` includes copies and synchronization; it is not a pure
+device-kernel timer.** No NPU-kernel speedup is claimed here.
+
+The saved final FP32 latent is bitwise identical to the earlier
+`int8-io` latent, with NRMSE and maximum absolute difference both zero.
+All ten timed samples reproduce their mode's warmup latent. The FP32
+VAE decode produces the same PNG SHA-256 as the previous INT8 result;
+identical latents share that decode rather than decoding twice.
+The single VAE measurement was 3.777 s, giving an approximate
+sampler-plus-VAE time of **13.1 s**, excluding model loading, text
+encoding and image saving. This is a sum of the sampler median and one
+VAE measurement, not an independently measured end-to-end median.
+There is no added output difference for this prompt/seed; the previously
+documented INT8 and AIR quality limitations remain unchanged.
+
+Persistent session-local evidence under `files\int8`:
+`fused_qk.cpp`, `fused_qk.py`, `fused_qk_probe.py`,
+`fused_qk_report.json`, the extended `int8_e2e.py` and
+`int8_profile_table.py`, and `int8-qk-final` containing `report.json`,
+`profile.md`, latents and PNGs. The report records source and DLL hashes,
+PyTorch build identity, per-stage times and verification counts.
+The final `fused_qk.dll` SHA-256 is
+`424290e3949b9d43e936fd7257e60088d2ae2bf99b689cbf4d3ec053c664806d`.
+
+With the same Python environment and environment variables as the
+previous experiment, run from the session's `files\int8` directory:
+
+```powershell
+python fused_qk_probe.py
+python int8_e2e.py --out int8-qk-repeat --runs 5 `
+  --modes int8-io int8-qk `
+  --reference int8-io-e2e\latent_int8-io.pt --verify-qk
+```
+
+The harness fails if the real-input comparisons, reference latent or
+repeat latents change. This remains an isolated experiment: production
+files, defaults, packed weights and NPU binaries were not modified.
+
+## Native INT8 QKV and attention output projections (2026-11-06)
+
+The next isolated experiment extends W8A8 from the MLP to both
+self-attention and cross-attention projections. It retains the previous
+fused host Q/K preparation as its baseline (`int8-qk`) and compares two
+new modes: `int8-attn-out` quantizes only attention output projections;
+`int8-attn` also quantizes Q, K and V projections.
+**AIR QK/scale/softmax/AV remains the existing BF16 implementation.**
+Production defaults, the installed node, packed weights and deployed
+NPU binaries are unchanged.
+
+The compact machine-readable results are in
+[`evidence/int8-attention-projection-probe.json`](evidence/int8-attention-projection-probe.json).
+Implementation sources, compiled artifacts, complete profiles and images
+remain in the persistent session's `files\int8` directory.
+
+### Native projections and fused host boundaries
+
+Activations use symmetric per-token INT8 quantization and weights use
+symmetric per-output-channel quantization, both with
+`scale = max(absmax, 1e-12) / 127`, round-to-nearest-even and range
+`[-127, 127]`. Weights are quantized once and retained in XRT BOs after
+warmup. Matrix products accumulate in INT32. Dequantization preserves
+`bf16((float(accumulator) * row_scale) * weight_scale)` before subsequent
+BF16 operations.
+
+QKV chaining is retained: three INT8 GEMMs are compiled into one
+multi-launch ELF with **one XRT dispatch per attention**, not three
+separate host launches. Self-attention shares one quantized input across
+Q/K/V. Cross-attention uses one quantized query input and one quantized
+context shared by K/V. Shapes `(M,N,K)` are:
+
+| Projection | Shape |
+|---|---|
+| Self Q/K/V and cross Q | 1024, 2048, 2048 |
+| Cross K/V | 512, 2048, 1024 |
+| Self/cross output projection | 1024, 2048, 2048 |
+
+The new QKV ELFs reuse the native INT8 `tl.dot` kernel and wide32
+schedule: 512x512 blocks, 64x128 core tiles, `l2_k=256`, `l1_k=32`,
+`accum_type="i32"` and no contract input cast. Their lowered LLVM IR
+loads `<64 x i8>` vectors into the AIE2P integer MAC intrinsic. Output
+projections reuse the previously verified `i8-sq2048-wide32` ELF.
+Standalone repeated random/saturation checks cover 33 complete matrix
+outputs, all bitwise equal to the exact integer oracle.
+
+The integration avoids standalone PyTorch quantize/dequantize passes:
+
+- The existing fused modulation + quantization operation is reused for
+  `norm1` and `norm2`; LayerNorm and host AdaLN GEMVs remain unchanged.
+- A new native operation dequantizes INT32 Q/K/V, applies the validated
+  RMSNorm/RoPE arithmetic, and writes head-major BF16 AIR inputs. It
+  reuses `fused_qk.cpp` rather than implementing a second reduction order.
+- AIR output layout conversion and per-token quantization share one
+  native pass, without a separate full BF16 token-major tensor.
+- The existing fused dequantization + BF16 gate + residual operation is
+  reused for attention output projections.
+
+The fixed-shape wrappers reject invalid inputs rather than falling back.
+INT32 QKV outputs borrow shared BO storage only until the next dispatch;
+the host preparation consumes them synchronously and returns newly owned
+BF16 tensors. The new host probe passes 82 checks, including bit patterns,
+RNE ties, subnormals, storage offsets, output ownership, thread counts,
+invalid scales, NaN payloads, overflow and shape/dtype/stride rejection.
+The DLL uses the same strict-floating-point AVX-512/OpenMP build flags
+as the previous fusion.
+
+During each real warmup, every new host boundary is compared bitwise
+with its PyTorch reference. Every quantized projection also checks three
+spread-out rows and 32 output channels against an exact full-K integer
+oracle: 1,120 projection checks across the two new modes per comparison.
+These checks do not claim the quantized output matches BF16; they verify
+the chosen quantization scheme and its native implementation agree.
+All extra verification is disabled for timed samples.
+
+### Matched sampler performance
+
+Conditions remain Turbo V1.1, 512x512, four Euler/simple steps, CFG 1,
+seed `700755787614899`, the cherry-blossom prompt above and ten threads.
+After warming all three modes, six samples per mode use balanced orders
+`ABC, ACB, CAB, CBA, BCA, BAC`, where A is `int8-qk`, B is
+`int8-attn-out` and C is `int8-attn`. Each mode occupies each execution
+position twice. Loading, text encoding, VAE and saving are excluded.
+
+| Per four-step sampler | Previous INT8 MLP + fused Q/K | + INT8 attention output | + INT8 QKV and output |
+|---|---:|---:|---:|
+| Median sampler | 9.336 s | 8.747 s | **7.474 s** |
+| Reduction against matched baseline | - | 0.589 s / 6.31% | **1.862 s / 19.94%** |
+| Individual times, seconds | 9.372, 9.226, 9.267, 9.354, 9.319, 10.380 | 8.782, 8.591, 8.712, 8.646, 8.786, 9.467 | 7.407, 7.473, 7.520, 7.457, 7.476, 8.107 |
+| Dispatches | 896 | 896 | 896 |
+| Model forwards | 4 | 4 | 4 |
+
+Both candidates improve in all six paired comparisons. Full projection
+INT8 saves 1.965, 1.753, 1.747, 1.897, 1.843 and 2.273 s. The last
+iteration is slower for all modes and is retained, not discarded.
+The new baseline is measured alongside the candidates; do not use the
+previous experiment's 9.282 s as the denominator.
+
+Mean profile totals, not medians:
+
+| Component | Baseline | Output only | QKV + output |
+|---|---:|---:|---:|
+| QKV projection chains | 2.133 s | 2.036 s | 1.143 s |
+| Attention output projections | 0.968 s | 0.551 s | 0.547 s |
+| Q/K/V preparation, including dequantization when needed | 0.252 s | 0.248 s | 0.325 s |
+| Attention LayerNorm + modulation / quantization | 0.294 s | 0.310 s | 0.184 s |
+| AIR output layout / layout + quantization | 0.069 s | 0.088 s | 0.098 s |
+| Attention gated residual / fused dequantization + residual | 0.183 s | 0.159 s | 0.134 s |
+| AIR attention stages | 2.705 s | 2.674 s | 2.662 s |
+| Inner AIR runner | 2.080 s | 2.079 s | 2.070 s |
+| MLP projections + fused middle | 1.412 s | 1.408 s | 1.399 s |
+| Block overhead outside stages | 0.657 s | 0.533 s | 0.301 s |
+| Complete sampler mean | 9.486 s | 8.831 s | 7.573 s |
+
+This is the benefit of **INT8 projections plus fused host boundaries and
+their integration**, not a device-only GEMM speedup. QKV/output stage
+times include host work and transfers; block overhead also decreases.
+The AIR runner remains approximately 2.07 s and includes copies and
+synchronization, not only device execution. No Softmax or AIR-kernel
+acceleration is claimed, and dispatch count does not decrease.
+
+All 18 timed samples reproduce their own warmup latent bitwise. The
+baseline latent and decoded PNG also match the previous `int8-qk`
+experiment exactly. FP32 VAE single-decode measurements were 4.670,
+4.791 and 4.762 s respectively. The full projection variant therefore
+has an estimated sampler-plus-VAE time of **12.24 s** (7.474 + 4.762).
+This sum is **not an end-to-end median**, and still excludes loading,
+text encoding and saving.
+
+### Output changes and limits
+
+The speedup is not output-equivalent. Two additional prompt/seed cases
+were run through all three modes, with one timed repeat per mode and
+separate FP32 VAE decodes. They check reproducibility and output changes,
+not the six-sample performance estimate.
+
+| Prompt/seed case | Output-only latent NRMSE | Full projection latent NRMSE | Output-only RGB MAE / 255 | Full projection RGB MAE / 255 |
+|---|---:|---:|---:|---:|
+| Cherry blossoms, `700755787614899` | 40.32% | 36.24% | 21.264 | 18.240 |
+| Blue-haired portrait, `42` | 32.99% | 30.09% | 16.433 | 16.302 |
+| Mountain village/lake, `314159265` | 20.25% | 30.92% | 6.896 | 10.899 |
+
+Each comparison uses the corresponding **existing INT8 MLP + BF16
+attention-projection baseline**, not an original FP32/BF16 model.
+All outputs are finite, reproducible and decode to images, but visual
+inspection shows changed hair, clothing and flowers in the first case,
+portrait details in the second, and buildings/foreground in the
+landscape. NRMSE/MAE measure output difference, not perceptual quality.
+The smaller error of full projection INT8 in some cases does not show
+that quantizing more layers improves quality. Three cases do not
+establish general quality equivalence or justify automatic deployment.
+The baseline's existing experimental AIR and MLP quantization
+limitations also remain.
+
+### Persistent implementation and reproduction
+
+New session-local sources are `int8_attention_runner.py`,
+`int8_attention_probe.py`, `fused_attention.cpp`, `fused_attention.py`,
+`fused_attention_probe.py` and `int8_attention_summary.py`; the existing
+`int8_e2e.py` and profile formatter now support the two new modes.
+The authoritative measurement directory is `int8-attention-final`.
+The additional cases are in `int8-attention-quality-portrait` and
+`int8-attention-quality-landscape`. Each contains its report, FP32
+latents and PNGs. `int8-attention-final\implementation.zip` pins the
+experiment scripts, dependent host DLLs and five required INT8 ELFs;
+extract its contents back into a session `files\int8` directory with
+the existing node/model/environment setup, not into the production node.
+Source, DLL, ELF and archive hashes are recorded in the evidence JSON.
+
+With the earlier experiment's environment variables and artifacts, run
+from the session `files\int8` directory. Compile the QKV ELFs with the
+newer compiler environment used in the native INT8 feasibility probe;
+run the host probe and ComfyUI harness with the production Python venv:
+
+```powershell
+& $compilerPython int8_attention_probe.py
+# Build in this directory after setting the VS x64 environment in the same cmd.exe:
+# cl /nologo /LD /O2 /MD /std:c++17 /EHsc /arch:AVX512 /fp:strict /openmp fused_attention.cpp /Fe:fused_attention.dll
+& $python fused_attention_probe.py
+& $python int8_e2e.py --out int8-attention-repeat --runs 6 `
+  --modes int8-qk int8-attn-out int8-attn `
+  --reference int8-qk-final\latent_int8-qk.pt `
+  --verify-qk --verify-attention
+```
+
+For the supplementary cases, use the exact prompts/seeds in the evidence
+JSON, `--runs 1`, and omit `--reference` (the reference above belongs only
+to the original prompt/seed). The harness retains its original default
+modes, requires all modes to reproduce their own warmups, rejects missing
+or incomplete verification, and checks 896 dispatches/four forwards.
+The public runtime still rejects INT8 requests; this experiment does not
+add an installable production quantization mode.
+
+## Exact INT8 GEMM schedule retune (2026-11-06)
+
+After the native INT8 projections, four of the five INT8 GEMM artifacts
+still used the original wide32 schedule (`l2_k=256`, `l1_k=32`); only
+`proj_in` had been retuned to `l2_k=512`, `l1_k=64`. This experiment
+applies the same two schedule knobs to the remaining shapes. INT32
+accumulation is exact, so a schedule change must not change one output
+bit. Each new artifact is compared bitwise with the integer oracle, and
+the full ComfyUI latent and decoded PNG are compared bitwise with the
+previous schedule. Production defaults, the installed node, packed weights
+and deployed NPU binaries are unchanged.
+
+The compact machine-readable results are in
+[`evidence/int8-gemm-schedule-retune.json`](evidence/int8-gemm-schedule-retune.json).
+Sources, compiled artifacts and the complete report remain in the
+persistent session's `files\int8` directory (`int8-l1k64-ab`).
+
+### NPU-side ideas that did not pay off
+
+- **Shrinking the INT32 output is a small lever.** Reading the 33.5 MB INT32
+  `proj_in` output back costs 0.23 ms (`d2h_sync` median) after a 3.79 ms
+  kernel, so the readback is not the bottleneck. Writing it inside the kernel
+  may cost more: at every matched schedule in the sweep below, the `proj_out`
+  K-loop (the same 34.4 GOP, but an 8.4 MB output) is 0.64-1.19 ms faster than
+  `proj_in`. Output volume and loop structure (K=2048 against K=8192) are
+  confounded in these data. If the whole 0.74 ms gap at the best schedules
+  were output writes, removing it would save about 0.083 s per sampler
+  (112 calls), roughly 1.2% of the 6.99 s sampler. That is an estimate, not a
+  measurement.
+- **An in-kernel BF16 epilogue is slower, and it floors instead of rounding
+  to nearest.** A probe kernel stored
+  `(accumulator.to(float32) * SCALE).to(bfloat16)` for `proj_in` with scale
+  1.0. The output halves to 16.8 MB, but the kernel median is 13.19 ms against
+  3.79 ms for the INT32 output (about 3.5x slower, 2.60 TOPS; a rebuild with a
+  byte-identical ELF measured 12.30 ms). Only 50.27% of its outputs equal the
+  round-to-nearest-even BF16 reference, the NRMSE against FP64 is 0.33%, and
+  the maximum absolute error against the unrounded reference is 8,174. A
+  bit-level comparison of one device run on the probe's inputs (8,388,608
+  outputs, 99.5% of them inexact in BF16) found the output equal to a
+  round-toward-negative-infinity reference in every element (0 mismatches),
+  against 50.36% for round-toward-zero and 0.49% for round-toward-positive-
+  infinity. The largest accumulator is 1,290,372, below 2^24, so the
+  INT32-to-FP32 conversion is exact and the floor comes from the BF16
+  narrowing. The result reproduced on a second run. The behavior was measured
+  for this kernel and these inputs only. The epilogue is not used.
+
+### Standalone schedule sweep
+
+Every artifact is bitwise equal to the integer oracle. Times are the median
+`kernel_sync` of 21 warm runs of the standalone probe, under the same
+conditions as the feasibility probe above. All schedules use the 512x512 block
+and 64x128 core tile.
+
+| Shape (M,N,K) | `l2_k` / `l1_k` | Kernel median | Effective TOPS |
+|---|---|---:|---:|
+| Attention output 1024,2048,2048 | 256 / 32 (previous) | 1.536 ms | 5.59 |
+| | 256 / 64 | **1.197 ms** (-22.1%) | 7.18 |
+| | 512 / 64 | 1.232 ms | 6.97 |
+| `proj_out` K-loop 1024,2048,8192 | 256 / 32 (previous) | 3.759 ms | 9.14 |
+| | 256 / 64 | 3.324 ms | 10.34 |
+| | 512 / 64 | **3.055 ms** (-18.7%) | 11.25 |
+| `proj_in` 1024,8192,2048 (already used) | 256 / 32 | 4.953 ms | 6.94 |
+| | 256 / 64 | 3.966 ms | 8.66 |
+| | 512 / 64 | 3.794 ms | 9.06 |
+
+Rebuilding the attention-output and `proj_out` artifacts later gave
+byte-identical ELFs, and repeating the 21-run bench gave 1.255 ms (+4.9%) and
+2.868 ms (-6.1%). Standalone differences of about 5% between rows, such as 1.197
+against 1.232 ms, are therefore within run-to-run variation. The 19-22% gains
+of the best schedules over the previous one are well outside it, and the matched
+sampler A/B below confirms them.
+
+`l2_k=1024` does not compile for the 512x512 block. For both the
+attention-output and `proj_in` shapes, the `air-to-aie` pass fails with
+`'aie.dma_bd' op ... out of bounds access in buffer, for index 262143 in memref
+of length 131072`.
+
+QKV chains use three launches in one ELF and the `l2_k=256`, `l1_k=64`
+schedule chosen from the 1024,2048,2048 rows above (`l2_k=512` was within
+run-to-run variation). The two cross K/V
+launches (512,2048,1024) were not swept separately. The standalone runner
+medians below include host staging, synchronization, XRT launch/wait and
+output sync. The probe compared 33 output matrices with the integer oracle
+(15 for each chain, from three random repeats and two saturated repeats of
+three projections, plus 3 for the attention-output artifact), and all were
+bitwise exact:
+
+| Chain | Previous schedule | `l1_k=64` | Change |
+|---|---:|---:|---:|
+| Self Q/K/V, one dispatch | 5.409 ms | **4.399 ms** | -18.7% |
+| Cross Q/K/V, one dispatch | 3.844 ms | **3.119 ms** | -18.9% |
+
+### Matched sampler performance
+
+The harness gained an `int8-attn-l1k64` mode. It is identical to
+`int8-attn`, except that `proj_out`, attention output and both QKV chains
+load the retuned ELFs; `proj_in` is unchanged. Both modes keep independent
+resident weights in one process. Conditions are Turbo V1.1, 512x512, four
+Euler/simple steps, CFG 1, seed `700755787614899`, the cherry-blossom prompt,
+ten threads, host AdaLN and the pinned AIR attention ELFs. After one verified
+warmup per mode, six samples per mode alternate their order (`AB, BA, AB, BA,
+AB, BA`). Loading, text encoding, VAE and saving are excluded.
+
+| Per four-step sampler | Previous INT8 schedule | Retuned schedule |
+|---|---:|---:|
+| Median sampler | 7.392 s | **6.994 s** |
+| Reduction against the matched baseline | - | **0.398 s / 5.39%** |
+| Mean sampler | 7.408 s | 7.054 s (-4.77%) |
+| Individual times, seconds | 7.421, 7.361, 7.380, 7.504, 7.404, 7.375 | 6.953, 6.972, 7.148, 7.270, 7.015, 6.969 |
+| Dispatches / model forwards | 896 / 4 | 896 / 4 |
+
+All six paired comparisons improve: -469, -389, -233, -234, -389 and -406 ms.
+The earlier three-mode run measured 7.474 s for the same baseline schedule;
+this two-mode run measured 7.392 s (1.1% lower). The 5.39% figure uses the
+matched in-run baseline, not the earlier measurement.
+
+Mean profile timers show where the saving appears; AIR and `proj_in` are
+unchanged:
+
+| Per sampler (seconds) | Previous | Retuned |
+|---|---:|---:|
+| Self QKV chains | 0.627 | 0.515 |
+| Cross QKV chains | 0.445 | 0.397 |
+| Self / cross attention output | 0.263 / 0.260 | 0.228 / 0.225 |
+| `proj_out` | 0.583 | 0.472 |
+| `proj_in` | 0.593 | 0.593 |
+| AIR runner (1024 / 512 queries) | 1.266 / 0.788 | 1.267 / 0.789 |
+
+The five changed runner timers sum to a 0.341 s reduction, against a 0.353 s
+mean sampler reduction (unrounded 353.3 ms); the 12 ms difference is not
+attributed to a specific timer. These are real-flow runner timers including
+host staging, not pure device time.
+
+**Output identity.** The retuned latent and the decoded PNG
+(`df4043656c71999b38324b5b048a6b337121ca9fa43981a8193351a61381a7cf`)
+are bitwise identical to the previous schedule, and every timed sample
+reproduces its own warmup latent. Both modes passed all INT32 projection and
+fused host boundary checks during their warmups (34 check categories, 17 per
+mode, each covering all 112 calls). This run is therefore an exact speedup
+relative to the INT8 baseline. It makes **no new quality claim**, and the
+INT8/AIR approximation limits above still apply.
+
+**VAE and end-to-end.** One FP32 VAE decode in this run took 3.07 s. It is a
+single sample, and the FP32 decodes recorded elsewhere in this document range
+from 2.9 to 4.8 s. The retuned sampler plus this decode is about 10.06 s, and
+the same sampler plus the 2.9-4.8 s range is 9.9-11.8 s. Neither is an
+end-to-end median, and both still exclude loading, text encoding and saving.
+
+### Reproduction
+
+From the session `files\int8` directory. The first three commands use the
+compiler environment of the INT8 probes (`run_batch.ps1` selects it and sets
+`XRT_DEV_DIR` and `TRITON_CACHE_DIR`; set the same two variables for the
+rounding check). The last two use the production Python venv and the earlier
+experiment's environment variables:
+
+```powershell
+& $compilerPython int8_attention_probe.py --l2-k 256 --l1-k 64 "--tag=-l1k64" `
+  --out-artifact i8-sq2048-l1k64 --out int8_attention_kernel_report-l1k64.json
+.\run_batch.ps1 -ConfigList ('i8-sq2048-l1k64|--rows 1024 --columns 2048 --inner 2048 --l1-k 64;' +
+  'i8-proj_out-kloop-l2k512-l1k64|--rows 1024 --columns 2048 --inner 8192 --kloop --l2-k 512 --l1-k 64;' +
+  'i8bf16-proj_in-l2k512-l1k64|--rows 1024 --columns 8192 --inner 2048 --epilogue bf16 --scale 1.0 --l2-k 512 --l1-k 64')
+& $compilerPython int8_bf16_rounding_check.py --artifact build\i8bf16-proj_in-l2k512-l1k64 `
+  --out bench\i8bf16-rounding-check.json
+& $python int8_e2e.py --out int8-l1k64-ab --runs 6 `
+  --modes int8-attn int8-attn-l1k64 --verify-attention
+& $python int8_schedule_summary.py --out int8-gemm-schedule-retune.json
+```
+
+`run_batch.ps1` compiles a configuration only if its build directory has no
+ELF, then runs the 21-run bench. Building the same three configurations again
+under different artifact names gave ELFs byte-identical to the pinned ones
+(`rebuild_check` in the evidence file), and the repeated benches differed from
+the originals by 5-7% in kernel median. The summary script re-verifies source,
+ELF, latent and PNG hashes, the compile-failure logs, the rebuild check and
+the BF16 rounding check before writing the evidence.
+`int8-l1k64-ab\implementation.zip` pins the changed scripts, including the
+rounding check, the sweep, epilogue, rounding-check and rebuild results, the
+two `l2_k=1024` compile logs, the four retuned ELFs and the epilogue ELF. It
+extends the earlier `int8-attention-final\implementation.zip` rather than
+replacing it.
+
+## AIR attention schedule scale-out: K/V buffering and a 16-core column split (2026-11-06)
+
+The AIR attention stage is the largest block left in the INT8 sampler: its
+self- and cross-attention stage timers sum to 2.359 s of the 7.086 s pinned
+median in the matched A/B below (33.3%). This experiment changes only the
+**schedule** of the existing MLIR-AIR attention kernel: how many core buffers
+hold K/V, how Q reaches the cores, how many cores share a head, and how the
+memtile buffers are split. Every build links the same compiled kernel object
+(`kernel_sha256` `490249c8...`, MLIR-AIR `508ca731...`), so the arithmetic is
+unchanged by construction, and each working build is compared bitwise with
+the pinned production ELF. Softmax and the attention matmuls stay BF16 on the
+NPU; nothing here is quantized. Production defaults, the installed node,
+packed weights and deployed NPU binaries are unchanged, and **nothing in this
+section is deployed**.
+
+The compact machine-readable results are in
+[`evidence/air-attention-schedule-scaleout.json`](evidence/air-attention-schedule-scaleout.json).
+Sources, compiled artifacts, logs and the complete reports remain in the
+persistent session's `files\air` and `files\int8` directories
+(`int8-nq8-ab`).
+
+**Result.** In an in-process A/B of three AIR schedules (eight timed runs
+per mode, VAE excluded), the 16-core variant with separate K and V buffers
+(`nq8pp`) lowers the median sampler from 7.086 s to **6.056 s** (-1.030 s,
+-14.54%). All eight paired comparisons are faster (median paired delta
+-954 ms, -13.47%), and the latent and decoded PNG are bitwise identical to
+the pinned mode. Separate K and V buffers alone (`pp`) give 6.628 s (-6.46%).
+
+### Design space
+
+| Parameter | Production | Varied here |
+|---|---|---|
+| `kv_buffers` | 1: K and V alternate through one core buffer | 2: separate K and V core buffers ("ping-pong") |
+| `q_mode` | `pair`: a 64-row Q pair is broadcast to two cores, each copies its 32-row half | `direct`: one 32-row Q transfer per core |
+| `query_cores` | 4 (128 query rows per head group) | 8 (256 rows) |
+| `parallel_heads` | 2 (8 core tiles) | 2 (16 core tiles); 1 in some diagnostics |
+| Memtile (L2) buffers | split by the compiler | `air.alloc(split=False)` plus explicit per-column Q and output splits |
+
+Shapes are unchanged: 16 heads, 1024 queries, depth 128, a 32-query/64-key
+tile, 1024 keys for self-attention and 512 for cross-attention.
+
+**Core memory.** The explicit core buffers are the Q tile (8 KiB), the K tile
+(16 KiB), the score tile (4 KiB), the numerator (8 KiB), four 64-byte row-state
+vectors and, in `pair` mode, a 16 KiB Q-pair buffer. That is the 53,504 bytes
+recorded for the production schedule above, plus a 4 KiB stack, in the 64 KiB
+data memory of a compute tile. A second 16 KiB K/V buffer on top of the Q-pair
+buffer would need 69,888 bytes, more than 65,536, and no recorded build
+combines them. `direct` Q frees the 16 KiB pair buffer, so `direct` Q with two
+K/V buffers needs exactly the same 53,504 bytes. This is arithmetic from the
+builder's nominal allocations (no compiler padding), not a compiler trace.
+
+K/V are streamed once per query group, so raising the group from 128 to 256
+rows halves the number of K/V passes per head while using twice as many
+cores. That is a design-level explanation, not a measured traffic reduction.
+
+### Placement
+
+| Build | Shim / memory / core tiles |
+|---|---:|
+| Production schedule, `pp` (self and cross) | 6 / 8 / 8 |
+| `nq8-ns-os2`, `nq8-pp-colsplit` (self and cross) | 8 / 8 / 16 |
+
+The device model has 8 columns of 1 shim, 1 memory and 4 core tiles (8 / 8 / 32
+in total), and `aircc` runs with `merge-logical-tiles=false`, so every logical
+shim tile occupies a whole physical shim tile. The 16-core builds therefore use
+**all 8 shim tiles** and all 8 memory tiles. Larger variants fail at placement:
+four parallel heads (`pp4-k1024`) need 12 logical shim tiles and 8 memory
+tiles, and the 16-core build with Q and output split by row pair
+(`nq8-pp-qs2-os2-k1024`) needs 10 shim tiles. Scaling out along these axes
+(four heads, or 16 cores per head) is blocked by shim DMA capacity on this
+device.
+
+### Device-only launch time
+
+`air_state3.py` launches a resident ELF back to back and times one XRT run
+(create, start, wait) on already loaded buffers, so host staging is excluded.
+Device time depends on a second variable (next subsection), so each build
+alternates two controlled states: `none` (nothing else running; the fast
+state) and `spin:4` (four busy CPU processes; the slow state). Every phase is
+100 launches after a 0.6 s settle. The fast and slow values are the means of
+the per-phase medians (two or three `none` phases and one or two `spin:4`
+phases per build; the evidence file lists every phase).
+
+| Self-attention (1024 keys) | Fast state | Slow state | Slow / fast | Fast vs production | Slow vs production |
+|---|---:|---:|---:|---:|---:|
+| Production ELF | 7.471 ms | 10.244 ms | 1.371 | - | - |
+| `base` (rebuilt, byte-identical ELF) | 7.527 ms | 10.256 ms | 1.362 | +0.8% | +0.1% |
+| `comp` compute-only diagnostic | 5.647 ms | 7.506 ms | 1.329 | -24.4% | -26.7% |
+| `dma` DMA-only diagnostic | 5.367 ms | 7.280 ms | 1.357 | -28.2% | -28.9% |
+| `pp` (separate K/V buffers) | 6.013 ms | 7.251 ms | 1.206 | -19.5% | -29.2% |
+| `nq8-pp-colsplit` | **3.194 ms** | **4.269 ms** | 1.337 | **-57.2%** | **-58.3%** |
+
+| Cross-attention (512 keys) | Fast state | Slow state | Slow / fast | Fast vs production | Slow vs production |
+|---|---:|---:|---:|---:|---:|
+| Production ELF | 4.531 ms | 6.216 ms | 1.372 | - | - |
+| `pp` | 3.607 ms | 4.737 ms | 1.313 | -20.4% | -23.8% |
+| `nq8-pp-colsplit` | **2.315 ms** | **3.021 ms** | 1.305 | **-48.9%** | **-51.4%** |
+
+The `base` ELF is the production ELF, so its row shows the repeat noise of
+this method (+0.8% fast, +0.1% slow). The three fast phases of `pp-k1024`
+measured 5.317, 6.452 and 6.271 ms for no identified reason, so its fast-state
+saving is understated and its slow/fast ratio (1.21) is not comparable with
+the others.
+
+The two diagnostics are not functional kernels. `comp` loads K/V once and
+reuses them for every block (no per-block K/V traffic); `dma` streams K/V every
+block but replaces the compute with a small copy. Each takes 5.4-5.6 ms in the
+fast state, below the full `base` at 7.527 ms and above half of it, which
+suggests that the single shared K/V buffer lets compute and K/V transfer
+overlap only partly, and that separate buffers recover part of the gap. This is
+an interpretation of the timings, not a hardware trace.
+
+### Ablation
+
+Standalone `air_bench.py` medians without state control mix both device
+states, so only large differences are meaningful: the byte-identical
+production and `base` ELFs measured 8.423 ms (21 runs) and 7.634 ms (60 runs),
+a 9% difference caused by the state mix alone. Every working build below is
+bitwise equal to the production ELF output in this bench.
+
+| Build | Cores | K/V buffers | Q | Runs | Median | Min |
+|---|---:|---:|---|---:|---:|---:|
+| Self (1024 keys): production ELF | 8 | 1 | pair | 21 | 8.423 ms | 7.410 ms |
+| `base` | 8 | 1 | pair | 60 | 7.634 ms | 7.108 ms |
+| `direct` | 8 | 1 | direct | 60 | 7.644 ms | 7.140 ms |
+| `pp` | 8 | 2 | direct | 60 | 5.620 ms | 5.198 ms |
+| `nq8-ns-os2` | 16 | 1 | pair | 20 | 5.845 ms | 5.764 ms |
+| `nq8h1-ns-os2` (one head at a time) | 8 | 1 | pair | 20 | 10.287 ms | 7.364 ms |
+| `nq8-pp-colsplit` | 16 | 2 | direct | 20 | 4.220 ms | 4.144 ms |
+| Cross (512 keys): production ELF | 8 | 1 | pair | 21 | 6.060 ms | 5.110 ms |
+| `pp` | 8 | 2 | direct | 60 | 4.184 ms | 3.348 ms |
+| `nq8-pp-colsplit` | 16 | 2 | direct | 20 | 2.957 ms | 2.897 ms |
+
+`direct` Q alone changes nothing (7.644 against 7.634 ms). The gains come from
+separate K/V buffers (`pp`, -26.4% against `base`) and from the 16 cores
+(`nq8-ns-os2`, -23.4%), and they compound (`nq8-pp-colsplit`, -44.7%) rather
+than add. The 256-row group with only eight cores (`nq8h1-ns-os2`) is not
+faster than `base` (its median is noisy; the minimum is 7.364 ms), which is
+consistent with the gain coming from the 16 cores rather than from the larger
+group alone.
+
+### The slow device state
+
+Production self-attention launches, 100 per condition:
+
+| Condition during the launches | Median |
+|---|---:|
+| `none` | 7.305 ms |
+| `spin:1` (one busy process) | 7.731 ms |
+| `spin:4` / `spin:10` / `spin:20` | 10.244 / 10.159 / 11.808 ms |
+| `stream:64:1` (one process summing a 64 KiB array) | 8.804 ms |
+| `copy:4096:1` (one process copying a 4 MiB array) | 9.167 ms |
+| `inproc_sum:1` / `:4` / `:10` (the launching process sums a 4 MiB tensor after every launch with 1 / 4 / 10 threads) | 7.494 / 9.196 / 10.179 ms |
+
+Four or more busy CPU processes (pure ALU spin, no memory traffic) lift the
+launches from about 7.3-7.5 ms to 10.2 ms. One spinning process does not, one
+memory-heavy process lifts them partway, and so does multithreaded host work
+by the launching process itself, as in the sampler (ten torch threads). Across
+the builds in the tables above, slow over fast is 1.30-1.37 on 8 of 9 builds
+and 1.21 for `pp-k1024`. The near-constant ratio is what a lower NPU clock
+would produce, but no clock was read: attributing it to clock or power
+management is a hypothesis.
+
+The sampler most likely mixes both states. The per-call AIR runner times in
+the A/B below (pinned 9.271 ms self, 5.891 ms cross) lie between the
+fast-state and slow-state expectations (device time plus 0.78 ms of host
+staging for self and 0.54 ms for cross: 8.25-11.02 ms and 5.07-6.76 ms). The
+state during the sampler was not measured, so the tables above do not say
+which state a real run is in.
+
+### NPU power-mode probe
+
+Because the slow state resembles power management, the NPU power mode was
+temporarily changed with `xrt-smi configure --pmode`. This was an explicitly
+approved system change; the original `Default` mode was restored and
+re-measured. The production ELFs were timed in five alternating 40-launch
+phases, `none` and `other_sum` (the CPU sums an unrelated 4 MiB BF16 tensor
+after every launch). Values are the median of the last 20 launches of each
+phase:
+
+| Mode | Self `none` (3 phases) | Self `other_sum` (2 phases) | Cross `none` (3 phases) | Cross `other_sum` (2 phases) |
+|---|---|---|---|---|
+| Default | 7.683, 7.282, 7.599 ms | 10.071, 10.118 ms | 6.032, 6.115, 5.759 ms | 6.040, 6.178 ms |
+| Performance | 7.823, 7.422, 7.726 ms | 10.226, 10.168 ms | 6.059, 5.881, 5.948 ms | 6.146, 6.163 ms |
+| Turbo | 7.484, 8.800, 8.337 ms | 9.910, 9.907 ms | 5.825, 5.744, 5.706 ms | 5.890, 5.896 ms |
+| Default again (after restore) | 7.823, 7.439, 7.682 ms | 10.110, 10.097 ms | 6.081, 5.813, 5.860 ms | 6.136, 6.112 ms |
+
+No mode removes the slow state: on self-attention `other_sum` stays at
+9.9-10.2 ms in every mode against 7.3-8.8 ms for `none`. Turbo has the lowest
+`other_sum` values (self 9.910 and 9.907 ms against 10.071 and 10.118 ms for
+Default), but its self `none` phases were not lower (7.484, 8.800 and
+8.337 ms against 7.683, 7.282 and 7.599 ms). On cross-attention even the
+`none` phases measured 5.7-6.1 ms in this probe, so it cannot show a mode
+effect there. The probe is a negative result for the power mode as a lever, and
+the cause of the slow state remains unidentified.
+
+### 16-core hangs and the compiler cause
+
+Six 16-core builds compile but hang on the device: `nq8-k1024`, `nq8-dma-k1024`,
+`nq8-comp-k1024`, `nq8h1-k1024`, `nq8h1-comp-k1024` and `nq8h1-os2-k1024`. Each
+returns `ERT_CMD_STATE_TIMEOUT` with every `fatal_error` field zero (a plain
+bench returns after about 11 s, and the NPU recovers). The DMA-only and
+compute-only builds hang as well, so neither the kernel nor the K/V stream
+causes it. After reproducing hangs again, 20 launches of
+`nq8-pp-colsplit-k1024` gave a median of 4.211 ms (earlier 4.220 ms) and the
+same output hash, so the device was healthy.
+
+The placed IR differs between hanging and working builds in the shim-side
+output transfers:
+
+| Build | Result | Output gets | Transfer size | Distinct head offsets | Distinct row offsets |
+|---|---|---:|---|---:|---:|
+| `nq8-k1024` | hangs | 16 | [1,256,128] | 9 | 1 |
+| `nq8h1-k1024` | hangs | 8 | [1,256,128] | 8 | 1 |
+| `nq8h1-ns-os2` | works | 2 | [1,128,128] | 1 | 2 |
+| `nq8-ns-os2` | works | 4 | [1,128,128] | 2 | 2 |
+| `nq8-pp-colsplit` | works | 4 | [1,128,128] | 2 | 2 |
+
+**Observation.** In the hanging builds each shim-side output get requests
+[1,256,128] at a different offset per column in the head dimension and a single
+row offset. In the working builds it requests [1,128,128] with the head fixed
+per group and varying row offsets.
+
+**Inference (not traced on the device).** Pass `air-split-l2-memref` (`aircc`
+pass 024) applies its split offset to the head dimension instead of the row
+dimension and does not shrink the transfer, so the shim waits for data that is
+never sent.
+
+**Workaround.** Allocate every L2 buffer with `air.alloc(split=False)` and
+split the Q and output buffers explicitly per herd column (`--no-split
+--q-split 2 --out-split 2 --split-axis column`). An explicit split without
+`no_split` is split again by the compiler and still hangs
+(`nq8h1-os2-k1024`). No upstream fix was tested.
+
+Three further builds fail in `air-to-aie`; regenerating them reproduced the
+original logs and MLIR:
+
+| Build | Configuration | Error |
+|---|---|---|
+| `pp4-k1024` | 4 parallel heads, separate K/V buffers, direct Q (12 logical shim tiles) | `no ShimNOCTile has sufficient DMA capacity for 1 input/0 output channels` |
+| `nq8-pp-qs2-os2-k1024` | 16 cores, Q and output split by row pair (10 logical shim tiles) | the same message |
+| `nq8-pp-k1024` | 16 cores, separate K/V buffers, direct Q, no explicit splits | `'air.channel' op tile (?, ?) MM2S channel 0 streams to different destinations for two circuit-switched flows, so each would receive the other's data` |
+
+The first two exceed the shim-tile budget (8 physical shim tiles, no merging of
+logical tiles). The cause of the third was not investigated.
+
+### Matched in-process sampler A/B
+
+The harness `int8_e2e_air.py` switches the AIR attention backend inside one
+process, so the three modes share resident INT8 weights and differ only in the
+two AIR attention ELFs (self and cross): `int8-attn-l1k64` is the pinned
+production pair, `-pp` the separate K/V buffer pair at four query cores, and
+`-nq8pp` the 16-core pair. Conditions are Turbo V1.1, 512x512, four
+Euler/simple steps, CFG 1, seed `700755787614899`, the cherry-blossom prompt,
+ten threads, host AdaLN, and the INT8 projections and MLPs with the retuned
+schedules. After three verified warmups per mode, eight timed samples per mode
+rotate their order (A = pinned, B = `pp`, C = `nq8pp`: ABC, ACB, CAB, CBA, BCA,
+BAC, ABC, ACB). Loading, text encoding, VAE and saving are excluded.
+
+| Per four-step sampler | Pinned | `pp` | `nq8pp` |
+|---|---:|---:|---:|
+| Median | 7.0856 s | 6.6281 s | **6.0557 s** |
+| Difference of medians against pinned | - | -457.5 ms (-6.46%) | **-1030.0 ms (-14.54%)** |
+| Mean | 7.0264 s | 6.6621 s | 6.0310 s |
+| Min-max | 6.740-7.162 s | 6.356-7.046 s | 5.673-6.284 s |
+| Individual times, seconds | 7.143, 6.740, 6.840, 7.009, 7.162, 7.030, 7.141, 7.146 | 6.606, 6.356, 6.643, 6.613, 6.549, 6.699, 6.784, 7.046 | 5.862, 5.673, 5.913, 6.057, 6.054, 6.216, 6.284, 6.189 |
+| Dispatches / model forwards | 896 / 4 | 896 / 4 | 896 / 4 |
+
+| Paired comparison (same iteration) | Median delta | Mean delta | Faster pairs |
+|---|---:|---:|---:|
+| `pp` - pinned | -370.2 ms (-5.23%) | -364.3 ms | 8 / 8 |
+| `nq8pp` - pinned | **-954.2 ms (-13.47%)** | -995.4 ms | 8 / 8 |
+| `nq8pp` - `pp` | -619.4 ms (-9.34%) | -631.1 ms | 8 / 8 |
+
+The percentages are relative to the median of the first mode in each pair.
+Per-pair deltas in ms: `pp` - pinned -537, -384, -197, -395, -613, -332, -356
+and -100; `nq8pp` - pinned -1281, -1067, -928, -951, -1108, -815, -857 and
+-957; `nq8pp` - `pp` -744, -683, -730, -556, -495, -483, -501 and -857.
+
+The difference of medians (-14.54%) and the median of paired deltas (-13.47%)
+are different statistics; the paired one is the more conservative. The saving
+is larger in the first two iterations (-1281 and -1067 ms) than in the last
+three (-815, -857 and -957 ms); no cause was investigated. Absolute medians
+drift between sessions: the pinned mode measured 6.994 s in the retune A/B
+above, 7.189 s in the earlier two-mode A/B and 7.086 s here, so modes are
+compared only inside one A/B. There are eight runs per mode and no statistical
+test.
+
+The earlier two-mode A/B (`pp` against pinned; two warmups, eight runs) gave
+7.189 s against 6.720 s (-6.51%) with paired deltas of -575, -456, -437, -599,
+-300, -600, -369 and -555 ms (median -505.5 ms, 8 / 8 faster). It ran with a
+previous version of the harness, before the `nq8pp` mode was added, so the
+harness hash recorded in that report no longer matches the file; its other
+pinned hashes match.
+
+Median profile timers per sampler (ms; 112 self and 112 cross calls):
+
+| Timer | Pinned | `pp` | `nq8pp` |
+|---|---:|---:|---:|
+| AIR runner, self-attention (1024 keys) | 1038.4 | 784.0 | 521.0 |
+| AIR runner, cross-attention (512 keys) | 659.7 | 540.4 | 384.3 |
+| `attn1.air_attention` stage (self) | 1415.5 | 1153.4 | 882.4 |
+| `attn2.air_attention` stage (cross) | 943.3 | 825.8 | 653.8 |
+| Wrapper residual, self (stage - runner) | 366.5 | 362.8 | 354.3 |
+| Wrapper residual, cross (stage - runner) | 280.6 | 281.1 | 264.5 |
+| AIR attention stages as a share of the sampler median | 33.3% | 29.9% | 25.4% |
+
+Per call, the runner takes 9.271 / 7.000 / 4.652 ms for self-attention and
+5.891 / 4.825 / 3.431 ms for cross-attention (pinned / `pp` / `nq8pp`); the
+wrapper residual takes 3.272 / 3.239 / 3.164 ms and 2.505 / 2.510 / 2.362 ms.
+The two AIR stage timers fall by 822.6 ms (2358.8 to 1536.2 ms) of the
+1030.0 ms difference. The rest is spread over other timers, the largest being
+`block_overhead` (325.2 to 223.2 ms), and was not attributed. These are medians
+of components, so they are not additive.
+
+**Unexplained wrapper residual.** The residual is the stage timer minus the
+runner timer, that is the host work in `AIRAttention.run` around
+`MultiLaunchRunner.run`: the shape checks, a finite check of each of the three
+inputs, the contiguous copies and array views, the output allocation, the
+output clone and a finite check of the output. It does not depend on the
+schedule (0.65, 0.64 and 0.62 s per sampler), so it grows from 9.1% to 10.2% of
+the sampler as the kernel gets faster. It is about 2.3-2.8 times the
+non-runner overhead of a standalone wrapper bench with the `pp` artifacts
+(median of 60 runs, ten threads, each step timed separately):
+
+| Standalone wrapper bench | Self | Cross |
+|---|---:|---:|
+| Full wrapper call | 9.232 ms | 6.363 ms |
+| Inner runner | 8.065 ms | 5.316 ms |
+| Inner runner minus buffer copy and syncs | 7.286 ms | 4.776 ms |
+| Non-runner overhead (full - inner) | 1.167 ms | 1.047 ms |
+| Finite check, query / key (value not timed) | 0.408 / 0.171 ms | 0.381 / 0.161 ms |
+| Finite check, output | 0.122 ms | 0.125 ms |
+| Array preparation | 0.075 ms | 0.073 ms |
+| Output clone | 0.192 ms | 0.167 ms |
+
+The step medians do not add up exactly to the overhead. Why the real sampler
+spends more per call than the standalone bench is not explained; the bench
+feeds contiguous random inputs and does not run alongside the rest of the
+sampler.
+
+### Output identity
+
+The latent of every mode is bitwise identical to the pinned mode's, and so is
+the decoded PNG
+(`df4043656c71999b38324b5b048a6b337121ca9fa43981a8193351a61381a7cf`, the same
+hash as in the retune section above). Every timed sample reproduces its own
+warmup latent. All three modes passed the INT32 projection and fused host
+boundary checks during their warmups (51 check categories, 17 per mode, each
+covering all 112 calls). Those counters cover the INT8 projection and boundary
+kernels, not the AIR attention itself; its outputs enter the latent comparison
+above and the standalone checks below.
+
+- **Standalone benches.** Every working build reproduces the production ELF
+  output bit for bit on the bench input (seed 7, scale 1.0), except
+  `base-k512`, whose ELF is byte-identical to the production cross ELF.
+- **Six-condition sweep.** `nq8-pp-colsplit` was compared with the production
+  ELFs on three inputs per kernel (seed/scale 11/1.0, 12/6.0 and 13/0.05; 1024-
+  and 512-key kernels), three launches each. Every output is bitwise equal to
+  the production output on the same input (0 mismatched elements), and the
+  evidence generator also requires each launch to be finite and equal to its
+  repeats. Output hash prefixes: self `cb87e9fa7627`, `746d700166e8` and
+  `11eed08e7fe5`; cross `5bf23824915f`, `5ac7a5b53676` and `e471395f50bf`.
+- **Rebuild check.** The six working builds (`base`, `pp` and `nq8-pp-colsplit`,
+  1024 and 512 keys) were compiled again under other names. All six ELFs are
+  byte-identical to the originals, and the two `base` ELFs equal the production
+  ELFs. The module text is identical after normalizing the absolute kernel-object
+  path (`link_with`), which is the only reason the raw module hashes differ.
+
+Against the earlier INT8 MLP + BF16 attention-projection baseline latent, the
+NRMSE is 0.3624 (36.24%; max abs 3.853, MAE 0.2914) in all three modes. It
+equals the full-projection figure recorded for this prompt and seed in "Output
+changes and limits" above, so it reflects the INT8 projections and not the
+attention schedule. The schedules change data movement and core count, not
+arithmetic. This experiment makes **no new quality claim**, and the INT8/AIR
+approximation limits above still apply.
+
+**VAE and end-to-end (estimate).** A standalone VAE decode (`baseline` variant
+of the VAE bench, ten torch threads; the bench file does not record the
+precision) of a latent with the same 1x16x1x64x64 shape as the A/B outputs
+(512x512 image) took 3.085 s for the first decode and 4.280, 3.774, 3.921,
+3.520 and 3.877 s for five warm decodes (median 3.877 s). Adding the first
+decode and the warm median to the sampler medians gives **estimates** of
+10.17-10.96 s for the pinned mode and 9.14-9.93 s for `nq8pp`. These sums exclude
+model loading, text encoding and image saving, and no ComfyUI end-to-end run
+was timed with these artifacts. The single in-harness decode of this A/B
+(5.743 s; 4.487 s in the earlier two-mode A/B) is noisy and is not used.
+
+### Session-patched node
+
+The harness imports session-patched copies of `air_attention.py`, `chain.py`
+and `block.py` from the deployed node. Against the deployed node the diffs are
++15/-4, +6/-0 and +23/-1 lines; they carry the host AdaLN and lightweight
+finite-check changes documented in "Host AdaLN and lightweight AIR finite
+checks" above. The only change made for this experiment is in
+`air_attention.py`: `AttentionShape` accepts `query_cores` of 4 or 8, where the
+deployed check is `query_cores != 4`. The repository HEAD differs from the
+deployed node in other respects (for example it has no
+`ANIMA_XDNA_GEMM_LAYOUT_DIR` handling in `chain.py`), so its diff counts (+2/-3,
++7/-1 and +39/-19) include unrelated differences. Both diffs are in the
+implementation archive. The repository sources and the production install are
+unchanged.
+
+### Limits
+
+- Outputs equal the production ELF bit for bit on the tested inputs and across
+  the three sampler modes. This is not a claim about image quality against the
+  BF16 model, and the INT8 baseline already differs from it.
+- Absolute sampler medians drift between sessions (the pinned mode measured
+  6.994, 7.189 and 7.086 s in different runs), so modes are compared only inside
+  one A/B with rotated or alternating run order and paired deltas.
+- There are eight runs per mode, with eight of eight negative paired deltas; no
+  statistical test was run.
+- Sampler medians exclude the VAE, loading, text encoding and saving. Every
+  VAE-inclusive figure is an estimate from separate measurements, not a timed
+  end-to-end run.
+- The slow device state is measured, but its attribution to clock or power
+  management is a hypothesis, not a clock reading, and the state during the
+  sampler was not measured.
+- The `air-split-l2-memref` cause is read from the compiler output and the
+  working workaround. It was not traced on the device, and no upstream fix was
+  tested.
+- The `nq8pp` artifacts need the `AttentionShape.query_cores` change, which
+  exists only in the session-patched node copy.
+- The earlier two-mode `pp` A/B ran with a previous version of
+  `int8_e2e_air.py`; its recorded harness hash no longer matches the file.
+
+### Remaining levers
+
+All figures here are unmeasured estimates, not results.
+
+- **Wrapper trimming (host work only; the device arithmetic is untouched).**
+  The wrapper residual is 0.62 s per sampler in the `nq8pp` mode (354.3 +
+  264.5 ms, 10.2% of the sampler). Instrument the real sampler first to explain
+  the 2.3-2.8 times gap to the standalone bench, then trim the steps listed
+  above; the query finite check is the largest single standalone step.
+- **Cross-attention K/V reuse across the four steps.** The cross K/V
+  projections (512x2048x1024 each) are a third of the cross QKV chain's
+  multiply-accumulates by shape arithmetic (K and V: 2 x 1.07 G; Q: 4.29 G).
+  With CFG 1 the sampler makes one forward pass per step, so the text context
+  is the same in all four steps. The retuned chain timer is about 0.40 s per
+  sampler, so reusing K/V in three of four steps could save up to roughly
+  0.1 s if the chain time scales with the multiply-accumulates. It needs a
+  Q-only chain artifact and a guard that compares the context before reuse.
+- **Host load and the slow state.** A thread-count sweep inside the harness
+  needs no system change and would show whether the sampler's own ten torch
+  threads push the NPU into the slow state. CPU affinity or power-plan changes
+  would need explicit approval and a restore plan.
+- **A measured VAE-inclusive ComfyUI run** with the `nq8pp` artifacts.
+- **Productionizing `nq8pp`.** It needs the `query_cores` change in the
+  repository and the node, and the two variant ELFs with their manifests (self
+  and cross) in the production artifact directory. This needs explicit approval
+  and a rollback copy.
+- **Further core scale-out is blocked.** The 16-core kernel already uses all
+  eight shim tiles, and the two designs that asked for more shim capacity
+  failed placement.
+
+### Reproduction
+
+From the session `files\air` directory (variant builds and device benches) and
+`files\int8` directory (sampler harness and summary). Variant builds use the
+compiler environment of the earlier AIR work (`$compilerPython`); benches and
+the harness use the production Python venv (`$python`). `$airUpstream` holds the
+pinned upstream attention sources (`air_variant.py` checks the `attn_npu2.cc`
+and `zero.cc` digests), `$pinnedAir` the production AIR attention artifacts
+(`self\` and `cross\`, each with `aie.elf` and `manifest.json`), `$gemmLayoutDir`
+the precompiled `wide32` GEMM library directory used by the earlier INT8 runs,
+`$files` the session `files` directory, `$repo` this repository and
+`$deployedNode` the deployed `anima_xdna_poc` directory:
+
+```powershell
+$env:XRT_DEV_DIR = "<XRT_SDK_DIR>"
+$env:TRITON_CACHE_DIR = "$files\air\triton-cache"
+Set-Location "$files\air"
+$nq8 = @('--nq', '8', '--parallel-heads', '2', '--q-mode', 'direct', '--kv-buffers', '2',
+  '--q-split', '2', '--out-split', '2', '--no-split', '--split-axis', 'column')
+foreach ($keys in 1024, 512) {
+  & $compilerPython air_variant.py --keys $keys --source-dir $airUpstream `
+    --work-dir "build\base-k$keys"
+  & $compilerPython air_variant.py --keys $keys --kv-buffers 2 --q-mode direct `
+    --source-dir $airUpstream --work-dir "build\pp-k$keys"
+  & $compilerPython air_variant.py --keys $keys @nq8 --source-dir $airUpstream `
+    --work-dir "build\nq8-pp-colsplit-k$keys"
+}
+& $python air_bench.py --artifact "$pinnedAir\self" --save-output out\self-pinned.npy `
+  --out bench\pinned-self.json
+& $python air_bench.py --artifact build\nq8-pp-colsplit-k1024 --runs 20 `
+  --reference-output out\self-pinned.npy --out bench\var-nq8-pp-colsplit-k1024.json
+& $python air_state3.py --artifact build\nq8-pp-colsplit-k1024 --launches 100 `
+  --conds "none,spin:4,none,spin:4" --out bench\state3-nq8-pp-colsplit-k1024.json
+& $python make_air_dir.py --self-build build\pp-k1024 --cross-build build\pp-k512 `
+  --out pp-dir
+& $python make_air_dir.py --self-build build\nq8-pp-colsplit-k1024 `
+  --cross-build build\nq8-pp-colsplit-k512 --out nq8-dir
+
+Set-Location "$files\int8"
+$env:ANIMA_XDNA_ATTENTION_BACKEND = 'air'
+$env:ANIMA_XDNA_ADALN_DEVICE = 'host'
+$env:ANIMA_XDNA_GEMM_LAYOUT_DIR = $gemmLayoutDir
+$env:ANIMA_XDNA_AIR_ATTENTION_DIR = $pinnedAir
+& $python int8_e2e_air.py --out int8-nq8-ab --runs 8 `
+  --modes int8-attn-l1k64 int8-attn-l1k64-pp int8-attn-l1k64-nq8pp `
+  --air-pp-dir "$files\air\pp-dir" --air-nq8-dir "$files\air\nq8-dir" --verify-attention
+& $python air_scaleout_summary.py `
+  --out "$repo\docs\evidence\air-attention-schedule-scaleout.json" `
+  --repo $repo --deployed-node $deployedNode
+```
+
+The other variants in the ablation use the same command shapes with their own
+options, and the state bench ran the same phases for every build (see
+`air_variant.py --help`). Helper scripts in `files\air`:
+
+- `equiv_sweep.ps1 -Variant nq8-pp-colsplit -Tag <tag>` runs the six-condition
+  sweep against the production artifacts (three launches per input).
+- `rebuild_check.ps1` rebuilds the six working variants under `repro-` names
+  and compares ELF and module digests (about three minutes).
+- `regen_failed_builds.ps1` re-runs the three builds that fail in `air-to-aie`
+  and `regen_hang_logs.ps1` re-runs four of the six hanging builds (the other
+  two keep their original logs). The second script deliberately provokes four
+  device timeouts; the health check described above followed it.
+- `pmode_probe.ps1` changes the NPU power mode with `xrt-smi configure --pmode`,
+  so it needs explicit approval. It restores the original mode in a `finally`
+  block, and its phases use `air_state2.py`.
+
+The default harness reference is the earlier INT8 baseline latent. The summary
+script re-verifies the source, ELF, latent and PNG hashes, the bench
+equalities, the compile-failure and hang logs, the rebuild check, the sweep
+and both A/B reports before writing the evidence file.
+`int8-nq8-ab\implementation.zip` (250 members, SHA-256
+`8b15a442fd0f2bf93c90fa804a85b9495ce07853546f49c06d973fa5401f7679`, stored in
+the evidence file as `implementation_archive_sha256`) pins the builder, the
+bench, state, probe and helper scripts with their results, the built variants
+with compile and hang logs, the assembled `pp-dir` and `nq8-dir`, the sampler
+harnesses and both A/B reports, the standalone VAE bench, the evidence generator
+and the patched node files with their diffs. The archive is not committed.
+
+## VAE decode: BF16, channels_last and an upsample stride fix (2026-11-06)
+
+After the AIR scale-out the warmed sampler takes about 6.1 s, and the default
+FP32 VAE decode of its 512x512 latent adds about 2.8 s on the CPU. This
+experiment checks three things: whether the decode can use the AVX-512 BF16
+fast paths, whether BF16 adds data-type conversion work, and how much it
+changes the output. Every run builds its own `comfy.sd.VAE` instance in a
+session process. ComfyUI, its launch flags, the node, the model files and the
+production defaults are unchanged, and **nothing in this section is
+deployed**.
+
+The compact machine-readable results are in
+[`evidence/vae-bf16-channels-last.json`](evidence/vae-bf16-channels-last.json).
+Scripts, oneDNN and profiler logs, PNGs and the full reports remain in the
+persistent session's `files\vae` and `files\int8` (`int8-vae-e2e`)
+directories.
+
+**Result.** The A/B ran in the INT8 sampler harness: the `nq8pp` mode, eight
+timed runs, both VAEs decoding the same sampled latent in rotated order.
+
+- The median of sampler plus VAE decode falls from 8.832 s with the FP32 VAE to
+  **7.322 s** with BF16+clfix: a median paired delta of -1.541 s (8 of 8 runs
+  faster) and -17.1% on the medians.
+- The decode alone falls from 2.762 s to 1.219 s (-55.9%).
+- This is the first **measured** VAE-inclusive figure for these artifacts. It
+  still excludes model loading, text encoding and image saving.
+- BF16 is not bitwise equal to the FP32 VAE. On this image the PSNR is 49.0 dB,
+  23% of pixels differ, and the largest difference is 40 levels.
+
+### Variants
+
+| Variant | Change |
+|---|---|
+| `fp32` | `comfy.sd.VAE(dtype=float32)`, the ComfyUI default on this CPU |
+| `bf16` | `comfy.sd.VAE(dtype=bfloat16)`, what `--bf16-vae` selects |
+| `fp32-cl`, `bf16-cl` | adds `channels_last(_3d)` Conv3d/Conv2d weights and a `channels_last_3d` decoder input |
+| `fp32-clfix`, `bf16-clfix` | adds an `nn.Upsample` forward wrapper that restrides a `channels_last` N=1 input to `(c*h*w, 1, w*c, c)` with `as_strided`: zero copy, same values |
+
+### Code path
+
+These findings come from reading ComfyUI 0.38.0 (`170594057a22`); it was not
+modified.
+
+- **Causal convolutions.** A single-frame latent is decoded without
+  `feat_cache`, so every `CausalConv3d` takes the `causal_zero` path in
+  `comfy/ops.py`. The weight is sliced to the input depth (kd=1), and
+  `conv3d` runs on a one-frame input.
+- **Upsample layout.** `Resample` rearranges `b c t h w -> (b t) c h w` for
+  `nn.Upsample(nearest-exact)` and `Conv2d`. With T=1 and a
+  `channels_last_3d` tensor, the size-1 batch dimension keeps the channel
+  stride. `suggest_memory_format()` therefore reports a contiguous tensor, and
+  the upsample allocates an NCHW output (see the stride table below).
+- **RMS norm.** `RMS_norm` is `F.normalize(x, dim=1) * scale * gamma`. Its
+  channel reduction (`linalg_vector_norm`) is strided in NCDHW and contiguous
+  in `channels_last`.
+
+### oneDNN execution trace (one decode per variant)
+
+The trace comes from `torch.backends.mkldnn.verbose` around one warm decode,
+with oneDNN v3.12.0, ISA "Intel AVX-512 with Intel DL Boost and bfloat16
+support" and ten OpenMP threads. Times are diagnostic per-primitive exec
+times, not benchmarks.
+
+| Variant | Convolution implementations (calls) | Conv ms | Reorders (calls / ms) | Data-type-changing reorders | oneDNN total ms |
+|---|---|---:|---:|---:|---:|
+| `fp32` | `jit:avx512_core` (32), `jit_1x1:avx512_core` (3) | 2102.6 | 105 / 556.0 | 0 | 2658.5 |
+| `fp32-cl` | `brg_conv_fwd:avx512_core` (32), `jit_1x1:avx512_core` (3) | 1685.6 | 41 / 17.5 | 0 | 1703.0 |
+| `bf16` | `jit_bf16:avx512_core_bf16` (33), `jit_bf16_1x1:avx512_core_bf16` (4) | 864.9 | 111 / 123.7 | 0 | 1012.2 |
+| `bf16-cl` | `brg_conv_fwd:avx512_core_bf16` (33), 1x1 BF16 (4) | 884.9 | 43 / 9.0 | 0 | 920.1 |
+
+- **BF16 path.** With `--bf16-vae` semantics the VAE convolutions run the
+  native AVX-512 BF16 kernels. The mid-block attention runs
+  `brg_matmul:avx512_core_bf16` (2 calls, 23.7 ms). The FP32 trace has no
+  oneDNN matmul records.
+- **Conversions.** All BF16 primitives are bf16 to bf16, and no reorder in any
+  trace changes the data type. BF16 adds **no conversion work** inside oneDNN.
+  In the profiler, `aten::_to_copy` is about 1 ms per decode in every
+  variant.
+- **Layout reorders.** The overhead is layout reorders. The default NCDHW
+  activations are reordered into and out of the blocked `nChw16c` layout
+  around every convolution: 556 ms in FP32 and 124 ms in BF16.
+  `channels_last` removes them (17.5 ms and 9.0 ms), and it also lets FP32 use
+  the faster `brg_conv_fwd` kernels.
+- **FP32 call counts.** In FP32, two small convolutions take PyTorch's
+  `slow_conv3d` path (2.6 ms) instead of oneDNN, so the convolution counts
+  differ.
+
+### Profiler (one warm decode, self CPU ms)
+
+| Operator | `fp32` | `bf16` | `bf16-cl` | `bf16-clfix` |
+|---|---:|---:|---:|---:|
+| Profiled decode | 3086.7 | 1778.3 | 1524.0 | 1378.7 |
+| `mkldnn_convolution` | 2251.3 | 1209.1 | 976.8 | 1056.8 |
+| `linalg_vector_norm` (RMS norm) | 262.2 | 259.5 | 14.4 | 13.2 |
+| `copy_` | 13.7 | 8.6 | 184.9 | 8.6 |
+| `_upsample_nearest_exact2d` | 21.6 | 33.7 | 66.0 | 6.5 |
+| `mul` | 132.2 | 61.8 | 62.7 | 63.5 |
+| `add` | 105.6 | 53.4 | 63.1 | 64.3 |
+| `silu` | 59.5 | 51.6 | 53.2 | 52.4 |
+| `_to_copy` | 0.9 | 0.7 | 0.8 | 1.2 |
+
+Profiled times include profiler overhead.
+
+- `channels_last` turns the strided RMS-norm reduction into a contiguous one
+  (260 ms to 14 ms).
+- It also exposes the upsample problem: `copy_` jumps to 185 ms.
+
+### Upsample stride fix
+
+Input and output strides of the three decoder upsamples, as logged by
+`vae_probe.py --mode strides`:
+
+| Upsample | Variant | Input stride | Output stride | Output `channels_last` |
+|---|---|---|---|---|
+| 64 -> 128 (384 ch) | `bf16-cl` | (384, 1, 24576, 384) | (6291456, 16384, 128, 1) | no |
+| 64 -> 128 (384 ch) | `bf16-clfix` | (1572864, 1, 24576, 384) | (6291456, 1, 49152, 384) | yes |
+| 128 -> 256 (384 ch) | `bf16-cl` | (384, 1, 49152, 384) | (25165824, 65536, 256, 1) | no |
+| 128 -> 256 (384 ch) | `bf16-clfix` | (6291456, 1, 49152, 384) | (25165824, 1, 98304, 384) | yes |
+| 256 -> 512 (192 ch) | `bf16-cl` | (192, 1, 49152, 192) | (50331648, 262144, 512, 1) | no |
+| 256 -> 512 (192 ch) | `bf16-clfix` | (12582912, 1, 49152, 192) | (50331648, 1, 98304, 192) | yes |
+
+- **The cause.** The batch stride of 384 or 192 on a size-1 dimension is
+  harmless for addressing, but it makes the layout heuristic choose NCHW. The
+  following `Conv2d` then receives NCHW and returns `channels_last`, so copies
+  run in both directions.
+- **The fix.** Restriding only the size-1 dimension addresses the same
+  elements, so values are unchanged. The upsample then keeps `channels_last`:
+  `copy_` falls from 184.9 ms to 8.6 ms, and the upsample, including its
+  internal copies, from 198.7 ms to 6.5 ms.
+- **Limit.** The wrapper assumes N=1 after the rearrange.
+
+### Standalone in-process A/B
+
+This A/B decodes the `nq8pp` latent with all four VAEs resident in one
+process: ten threads, two warm decodes each, then eight rounds in rotated
+order.
+
+| Variant | Median ms | Min ms | Median paired delta vs `fp32` | Ratio of medians |
+|---|---:|---:|---:|---:|
+| `fp32` | 2937.2 | 2851.3 | - | - |
+| `fp32-clfix` | 2478.1 | 2396.8 | -472.3 ms | 0.844 |
+| `bf16` | 1933.8 | 1793.5 | -1045.1 ms | 0.658 |
+| `bf16-clfix` | **1622.3** | 1543.4 | **-1363.3 ms** | **0.552** |
+
+Every variant produced one pixel hash across the eight rounds.
+
+### Output difference against the FP32 VAE
+
+The comparison uses three INT8 latents: the `nq8pp` sampler output, and the
+portrait and landscape latents of the earlier attention-quality runs. Pixels
+are converted to uint8 with round-to-nearest.
+
+| Latent | Variant | MAE (/255) | Max | PSNR dB | Pixels >= 1 level | > 2 | > 8 |
+|---|---|---:|---:|---:|---:|---:|---:|
+| `nq8pp` | `bf16` | 0.303 | 41 | 48.98 | 23.12% | 1.31% | 0.17% |
+| `nq8pp` | `bf16-clfix` | 0.300 | 40 | 49.03 | 22.97% | 1.28% | 0.17% |
+| portrait | `bf16` | 0.309 | 50 | 49.13 | 23.60% | 1.42% | 0.14% |
+| portrait | `bf16-clfix` | 0.308 | 41 | 49.15 | 23.49% | 1.43% | 0.15% |
+| landscape | `bf16` | 0.362 | 39 | 46.76 | 22.64% | 2.60% | 0.36% |
+| landscape | `bf16-clfix` | 0.358 | 58 | 46.90 | 22.50% | 2.60% | 0.34% |
+
+- **FP32 baselines.** A repeated FP32 decode is bitwise identical. A 20-thread
+  FP32 decode differs from the 10-thread one by at most one level in
+  0.001-0.002% of pixels.
+- **`fp32-clfix`** is in the same range: at most one level, in 0.005-0.007% of
+  pixels.
+- **BF16** changes the output well beyond thread-order noise.
+- **The ?8 difference images.** The differences concentrate in high-frequency
+  detail (foliage and buildings in the landscape). This is a visual
+  observation, not a metric. No perceptual or quality-equivalence claim is
+  made.
+
+### End-to-end in the sampler harness
+
+`int8_e2e_vae.py` is `int8_e2e_air.py` with in-loop VAE decodes. Each timed
+`nq8pp` sample (one warmup, eight runs) is decoded once by the FP32 VAE
+and once by the BF16+clfix VAE, in rotated order, after two warm decodes per
+VAE. Pixels are converted by truncation, as in ComfyUI's `SaveImage`.
+
+| | FP32 VAE | BF16+clfix VAE |
+|---|---:|---:|
+| Sampler median (shared) | 6.116 s | 6.116 s |
+| VAE decode median (min-max) | 2.762 s (2.676-2.862) | **1.219 s** (1.194-1.240) |
+| Sampler + VAE median | 8.832 s | **7.322 s** |
+| Median paired delta (range) | - | **-1.541 s** (-1.625 to -1.458), 8 of 8 negative |
+| Image vs FP32 VAE | - | MAE 0.302, max 40, PSNR 49.03 dB, 23.06% of pixels differ |
+
+**Integrity checks.**
+
+- Every sampler made 896 NPU dispatches.
+- Every timed sample was bitwise equal to its warmup.
+- The latent is bitwise equal to the `int8-nq8-ab` latent of the AIR
+  scale-out above.
+- The FP32 PNG is byte-identical to that A/B's image.
+- Each VAE produced a single pixel hash across the eight runs.
+
+**Comparison with earlier figures.**
+
+- The sampler median (6.116 s) comes from a different process than the 6.056 s
+  of the AIR A/B, and the two are not compared.
+- The measured 8.83 s with the FP32 VAE replaces the earlier **estimate** of
+  9.14-9.93 s, which was built from separate standalone decodes.
+
+### Reproduction
+
+From the session `files\vae` and `files\int8` directories. The placeholders
+are as in the AIR scale-out reproduction above. In addition:
+
+- `$comfyRoot` is the ComfyUI checkout.
+- `$vaeFile` is `qwen_image_vae.safetensors`.
+- The ComfyUI root and the extra model-path file are set at the top of
+  `vae_probe.py`.
+
+```powershell
+Set-Location "$files\vae"
+foreach ($variant in 'fp32', 'bf16', 'fp32-cl', 'bf16-cl') {
+  cmd /c "`"$python`" vae_probe.py --mode onednn --variant $variant > onednn-$variant.log 2>&1"
+}
+& $python parse_onednn.py onednn-fp32.log onednn-bf16.log onednn-bf16-cl.log onednn-fp32-cl.log
+foreach ($variant in 'fp32', 'bf16', 'bf16-cl', 'bf16-clfix') {
+  cmd /c "`"$python`" vae_probe.py --mode profile --variant $variant --out profile-$variant.json > profile-$variant.log 2>&1"
+}
+foreach ($variant in 'bf16-cl', 'bf16-clfix') {
+  cmd /c "`"$python`" vae_probe.py --mode strides --variant $variant > strides-$variant.log 2>&1"
+}
+& $python vae_probe.py --mode ab --variants fp32,fp32-clfix,bf16,bf16-clfix --out ab-t10.json
+& $python vae_probe.py --mode quality --variants fp32,fp32-clfix,bf16,bf16-clfix `
+  --latent "$files\int8\int8-nq8-ab\latent_int8-attn-l1k64-nq8pp.pt" `
+  --latent "$files\int8\int8-attention-quality-portrait\latent_int8-attn.pt" `
+  --latent "$files\int8\int8-attention-quality-landscape\latent_int8-attn.pt" `
+  --out quality\quality.json
+
+Set-Location "$files\int8"
+$env:ANIMA_XDNA_ATTENTION_BACKEND = 'air'
+$env:ANIMA_XDNA_ADALN_DEVICE = 'host'
+$env:ANIMA_XDNA_GEMM_LAYOUT_DIR = $gemmLayoutDir
+$env:ANIMA_XDNA_AIR_ATTENTION_DIR = $pinnedAir
+& $python int8_e2e_vae.py --out int8-vae-e2e --runs 8 --modes int8-attn-l1k64-nq8pp `
+  --air-nq8-dir "$files\air\nq8-dir" --verify-attention
+& $python "$files\vae\vae_summary.py" --out "$repo\docs\evidence\vae-bf16-channels-last.json" `
+  --repo $repo --comfy $comfyRoot --vae-file $vaeFile
+```
+
+**What the summary script checks.** It re-verifies the following before
+writing the evidence file:
+
+- the recorded harness hash;
+- the eight runs (896 dispatches, bitwise warmup repeats);
+- one pixel hash per VAE;
+- the latent and FP32 PNG against `int8-nq8-ab`;
+- the stride logs;
+- the absence of data-type-changing reorders.
+
+It also writes `files\vae\implementation.zip` with fixed member timestamps:
+49 members, SHA-256
+`6516996eb0da340fb6c12b6fa1139c772f3cde445198baa34a1bff5ab53d0c73`, stored
+in the evidence file. The archive holds the probe, parser, summary and
+harness scripts, every log, report and PNG of this section, and the
+end-to-end latent. It is not committed.
+
+The `vae_probe.py` docstring was extended (with the `strides` mode and the
+`-clfix` variants) after the oneDNN, profile, A/B and quality runs. The code
+is unchanged, so the recorded source hash is that of the documented file.
+
+### Limits
+
+- **Scope.** One machine, one 512x512 single-frame latent shape, ten torch
+  threads. Other resolutions, thread counts and video latents were not
+  measured.
+- **Timing scope.** The end-to-end figures cover the warmed sampler and the
+  VAE decode in one process. Loading, text encoding and saving are excluded.
+- **Statistics.** There are eight runs per variant, all with negative paired
+  deltas; no statistical test was run.
+- **Absolute decode times.** These depend on the process and on how many VAEs
+  are resident. For `bf16-clfix`:
+  - 1.22 s median in the harness, with two VAEs resident;
+  - 1.62 s in the standalone A/B, with four resident;
+  - 1.30-1.41 s for standalone warm decodes.
+
+  Compare variants only inside one run.
+- **Output difference.** BF16 changes the output (PSNR 46.8-49.2 dB on three
+  latents). `fp32-clfix` keeps FP32 precision and gives a smaller speedup
+  (-472 ms in the standalone A/B); it was not timed end to end.
+- **Production adoption.** It would need the `--bf16-vae` launch flag, which
+  is a production change needing approval. It would also need a node-side
+  patch that applies the `channels_last` weights, the decoder-input layout and
+  the upsample restride when the VAE loads. Neither exists in the repository or
+  the install.
+
 ## Public verification ladder
 
 Set placeholders only in the current shell; do not commit paths or captures.

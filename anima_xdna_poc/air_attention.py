@@ -12,6 +12,17 @@ from .errors import UnsupportedTensor
 LOGGER = logging.getLogger(__name__)
 
 
+def _all_finite(tensor):
+    """Reject NaN/Inf with one FP32 reduction instead of four elementwise passes.
+
+    Any NaN or Inf propagates into the sum. A finite tensor whose FP32 sum
+    overflows is also rejected, which fails loudly rather than silently.
+    """
+    import torch
+
+    return bool(torch.isfinite(tensor.sum(dtype=torch.float32)))
+
+
 @dataclass(frozen=True)
 class AttentionShape:
     keys: int
@@ -31,7 +42,7 @@ class AttentionShape:
             or self.depth != 128
             or self.query_tile != 32
             or self.key_tile != 64
-            or self.query_cores != 4
+            or self.query_cores not in (4, 8)
             or self.parallel_heads not in (1, 2)
         ):
             raise ValueError("unsupported fixed Anima attention schedule")
@@ -89,7 +100,7 @@ class AIRAttention:
         ):
             if tensor.shape != (s.heads, rows, s.depth) or tensor.dtype != torch.bfloat16:
                 raise ValueError(f"unexpected {name} shape/dtype: {tensor.shape}, {tensor.dtype}")
-            if tensor.device.type != "cpu" or not bool(torch.isfinite(tensor).all()):
+            if tensor.device.type != "cpu" or not _all_finite(tensor):
                 raise ValueError(f"{name} must be finite CPU BF16")
         arrays = [
             tensor.contiguous().view(torch.uint16).numpy().view(ml_dtypes.bfloat16)
@@ -99,7 +110,7 @@ class AIRAttention:
             arrays, bo_key="attention", intermediate_indices={3}, output_indices={3},
         )[3]
         output = torch.from_numpy(got.view(np.uint16)).view(torch.bfloat16).clone()
-        if not bool(torch.isfinite(output).all()):
+        if not _all_finite(output):
             raise RuntimeError("AIR attention returned nonfinite output")
         return output
 
@@ -141,8 +152,10 @@ class AIRAttentionBackend:
             raise
         LOGGER.warning(
             "[Anima XDNA] EXPERIMENTAL AIR attention ACTIVE: tiled QK/scale/softmax/AV, "
-            "17 dispatches/block with QKV chaining. Known fixed-seed latent NRMS "
-            "vs control 29.035%; not quality-equivalent. No silent fallback."
+            "17 dispatches/block in the BF16 projection path with QKV chaining when AdaLN "
+            "runs on XDNA; the optimized INT8 profile has a different dispatch count. "
+            "Known fixed-seed latent NRMS vs control 29.035%; not quality-equivalent. "
+            "No silent fallback."
         )
 
     def __call__(self, query, key, value):
