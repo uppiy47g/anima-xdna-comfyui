@@ -1,73 +1,191 @@
-# Experimental ComfyUI Image Generation on AMD XDNA 2
+# Anima XDNA 2 for ComfyUI
 
-This project explores image generation in ComfyUI on AMD XDNA 2 NPUs through
-Triton-XDNA and XRT, without conversion pipelines such as ONNX or Vitis AI EP.
-Its long-term goal is to broaden native safetensors support so more models can
-be loaded directly. Current support covers Anima Base v1.0, Turbo V1.1, the
-structurally compatible WAI Nova Anima Turbo LoRA Ver V1.0 full checkpoint,
-and the F16 Radiance Turbo Anima v2.0 checkpoint. Runtime failures are
-explicit, with no silent CPU fallback.
+An experimental ComfyUI custom node that runs Anima transformer blocks on
+AMD XDNA 2 NPUs using Triton-XDNA and XRT. It works with native model files
+and does not require ONNX or Vitis AI EP conversion.
 
-Compatible F16 or F32 Anima sources are converted to the BF16 execution format
-when the local packed cache is built. The original checkpoint remains
-unchanged. Runtime status and the ComfyUI log state whether the verified BF16
-cache was created or reused; MODEL/source matching uses the normalized BF16
-execution weights while raw source identity still isolates and verifies each
-cache entry.
+The project has two distinct execution paths:
 
-This is an experimental **CPU-hybrid** implementation, not NPU-only image
-generation. XDNA executes Linear and attention QK/AV GEMMs. Qwen, patch/time
-embeddings, normalization, RoPE, softmax, GELU, residuals, sampling, final
-projection, and VAE decoding remain on CPU in the default path.
+- **Standard BF16 path:** the default resident XDNA path. It supports the
+  validated Anima models and LoRA cases described below. Experimental AIR
+  attention can be enabled separately.
+- **Experimental INT8/AIR profile:** an explicit opt-in, fixed-shape
+  optimization for Anima Turbo V1.1. It combines INT8 projections, fused CPU
+  boundaries, a retuned AIR attention schedule and an optional BF16 VAE path.
+  It changes generated outputs and is not a quality-equivalent replacement
+  for the standard path.
 
-## 0.2.0-alpha.1: experimental AIR attention
+This is a **CPU/NPU hybrid**, not an all-NPU pipeline. Runtime failures are
+explicit; the node does not silently fall back to CPU execution.
 
-The default remains the existing baseline. This prerelease adds an **explicitly
-opt-in** direct MLIR-AIR path fusing tiled QK -> scale -> online softmax -> AV,
-without returning full score/probability matrices to the CPU. It is not a
-quality-equivalent replacement: fixed-seed final latent NRMS versus baseline
-was **29.035%**, with decoded RGB MAE **15.975/255**.
+## Important: quality and numerical limits
 
-In the isolated paired experiment, the warmed four-step sampler median fell
-from 27.095 s to 18.765 s and dispatches from 2,128 to 1,904. Normal ComfyUI
-operational checks instead measured about 24.1 s sampling / 28.98 s total on
-one resident request; user-observed generation is approximately 25 seconds.
-These are different timing scopes, not a 12-second result or a quality pass.
+> **The experimental INT8 profile is not numerically or visually equivalent
+> to the original BF16/FP32 pipeline.** Use it when throughput or latency is
+> more important than reproducing the standard-path output. Keep the standard
+> BF16 path for quality-sensitive work.
 
-Use the [release notes](docs/releases/0.2.0-alpha.1.md) and
-[AIR build/runtime instructions](anima_xdna_poc/README.md#native-comfyui-air-execution)
-to compile the fixed-shape artifacts and deliberately select AIR. Merely
-configuring an artifact directory does not enable it. Model weights, private
-captures and compiled vendor/device binaries are not included.
+The full-projection INT8 comparison below is against a previous experimental
+baseline that already used INT8 MLPs and BF16 attention projections. It is
+**not** a comparison against the original BF16/FP32 model:
 
-## Development log
+| Prompt and seed | Final latent NRMSE | Decoded RGB MAE (0–255) |
+|---|---:|---:|
+| Cherry blossoms / `700755787614899` | 36.24% | 18.240 |
+| Blue-haired portrait / `42` | 30.09% | 16.302 |
+| Mountain village/lake / `314159265` | 30.92% | 10.899 |
 
-Development notes, experiment history, and progress reports are published on
-https://note.com/loyal_owl5720/m/m79af97ed02e5
+### Example image comparisons
+
+Cherry blossoms, seed `700755787614899`:
+
+| Previous experimental path | Full INT8 profile |
+|---|---|
+| ![Cherry blossoms before full INT8](docs/assets/0-before-image_int8-qk.png) | ![Cherry blossoms after full INT8](docs/assets/0-after-image_int8-attn.png) |
+
+Mountain village/lake, seed `314159265`:
+
+| Previous experimental path | Full INT8 profile |
+|---|---|
+| ![Mountain village before full INT8](docs/assets/1-before-image_int8-qk.png) | ![Mountain village after full INT8](docs/assets/1-after-image_int8-attn.png) |
+
+These are substantial differences, not negligible rounding noise. The tested
+images were finite and reproducible, but visual inspection found changes in
+details such as hair, clothing, flowers, buildings and foreground. NRMSE and
+pixel MAE quantify difference from a reference; they are not perceptual
+quality scores and do not mean perceived quality fell by the same percentage.
+Three prompt/seed cases do not establish general image quality.
+
+The VAE comparison is separate. For three fixed sampler latents, BF16+clfix
+versus the FP32 VAE produced RGB MAE of about 0.30–0.36/255 and PSNR of
+46.90–49.15 dB; about 22.50–23.49% of pixels differed by at least one 8-bit
+level. This is not a measurement of the cumulative quality difference between
+the complete optimized profile and the original pipeline.
+
+Bitwise repeatability and boundary checks demonstrate consistency within the
+tested optimized path. **They do not establish equivalence to the original
+BF16/FP32 pipeline.** The combined profile has not been evaluated against that
+pipeline across a broad prompt/seed set.
+
+## Performance and measurement scope
+
+The changes below were measured in **separate matched experiments with
+different baselines and experiment series**. Do not add the savings together
+or interpret them as one cumulative A/B test. The sampler timings exclude VAE
+decoding unless the table says otherwise.
+
+| Change tested | Four-step sampler median |
+|---|---:|
+| Fuse Q/K RMSNorm, RoPE and head-major layout preparation | 10.493 → 9.282 s |
+| Add INT8 QKV/output projections and host-boundary integration | 9.336 → 7.474 s |
+| Retune INT8 GEMM schedules | 7.392 → 6.994 s |
+| Retune AIR K/V buffering and query-core schedule | 7.086 → 6.056 s |
+
+These sampler comparisons retain 896 NPU dispatches per four-step sample.
+The improvements therefore come from work per dispatch, CPU-side boundaries,
+and data movement/layout as well as the NPU kernels—not simply from reducing
+the number of launches.
+
+In a separate eight-run VAE comparison, median decode time changed from
+2.762 s to 1.219 s, and median sampler-plus-VAE time changed from 8.832 s to
+7.322 s. These harness timings exclude model loading, text encoding and image
+saving.
+
+A production-node integration smoke run measured 5.787 s for sampling plus
+1.512 s for VAE decode (7.299 s total). It completed 896 dispatches and 1,904
+runtime boundary checks; a same-seed repeat latent was bitwise identical.
+This was a single-run integration measurement, not a controlled benchmark
+median. User-observed ComfyUI console runs include `Prompt executed` times in
+the 6-second range; cache state was not controlled for those observations.
+
+![INT8 generation run 1](docs/assets/int8_run_1.png)
+![INT8 generation run 2](docs/assets/int8_run_2.png)
+![INT8 generation run 3](docs/assets/int8_run_3.png)
+
+These results describe Anima on the tested AMD hardware. They are not a
+direct comparison with Qualcomm measurements that use different models,
+devices and timing scopes.
+
+Detailed experiment methods, individual runs, caveats and machine-readable
+evidence are in the [reproducibility report](docs/anima-xdna-reproducibility.md)
+and [`docs/evidence/`](docs/evidence/).
+
+## How the execution paths work
+
+### Standard BF16 path
+
+The custom node replaces only the 28 Anima `transformer_blocks` with the
+resident XDNA runtime. ComfyUI continues to run Qwen tokenization and the Anima
+LLM adapter, latent and timestep embeddings, normalization, RoPE, softmax,
+GELU, residual operations, sampling, final projection and VAE decoding on the
+host.
+
+With the default host AdaLN configuration, the standard path runs the
+Q/K/V projection groups and supported Linear/attention GEMMs on XDNA. Weights,
+contexts and XRT buffers remain resident across denoising steps. The regular
+launcher uses baseline attention by default. Direct AIR attention is a
+separate experimental opt-in.
+
+### Experimental INT8/AIR profile
+
+The `int8-attn-l1k64-nq8pp` profile is deliberately separate from the standard
+path and is selected only through explicit configuration. It includes:
+
+- Symmetric W8A8 INT8 MLP, QKV and attention output projections with INT32
+  accumulation.
+- Fused CPU processing around quantization/dequantization, modulation,
+  gated residuals, and Q/K RMSNorm, RoPE and head-major layout conversion.
+- Fixed-shape INT8 GEMM schedules tuned for the validated matrix dimensions.
+- A direct MLIR-AIR attention kernel using the tested 8-query-core,
+  K/V ping-pong schedule. Attention QK, softmax and AV remain BF16; this
+  attention kernel is authored in MLIR-AIR, not lowered by Triton.
+- An opt-in BF16/channels-last/clfix path for
+  `qwen_image_vae.safetensors`.
+
+The runtime validates required artifacts and settings, checks attention
+boundaries on the first four forwards, and raises errors instead of silently
+falling back on unsupported cases. This fixed-shape experimental profile is
+not a general quantization mode.
 
 ## Supported configuration
 
-- Windows x64, AMD XDNA 2 / AIE2P (`npu2`), current AMD NPU driver.
+The validated configuration is:
+
+- Windows x64, AMD XDNA 2 / AIE2P (`npu2`) with a compatible AMD NPU driver.
+- XRT SDK 2.21.75 and Triton-XDNA
+  `3.6.0.2026093004+75679dc`.
 - Python 3.13 for the validated Windows `pyxrt` ABI; CPU tests support Python
   3.10 and newer.
-- XRT SDK 2.21.75 and Triton-XDNA `3.6.0.2026093004+75679dc` were validated.
-- ComfyUI commit `170594057a22673349ddf0a3d88624b7fa5865bb`.
+- ComfyUI API validated at commit
+  `170594057a22673349ddf0a3d88624b7fa5865bb`.
 - Anima Base v1.0, Turbo V1.1, the validated WAI Nova Anima Turbo LoRA
-  Ver V1.0 full checkpoint, or Radiance Turbo Anima v2.0; BF16 execution
-  weights, batch 1, 512x512, 1024 image tokens and 512x1024 adapted Qwen
-  context.
+  Ver V1.0 full checkpoint, or Radiance Turbo Anima v2.0.
+- Batch 1, 512×512 output, 1024 image tokens and adapted Qwen context
+  `[1, 512, 1024]`.
+- BF16 execution weights and block activations; the sampler latent is FP32.
 
-Model weights, packed caches, captured tensors and vendor binaries are not
-distributed. Obtain models from their authorized sources and review their
-separate licenses. Ordinary additive Anima LoRAs and the narrowly scoped
-hybrid Turbo LoRA Q/K norm `.diff` patches described below are supported.
-LLLite, LoHa/LoKr/OFT/DoRA, quantization, training, and other shapes or patch
-formats are unsupported.
+Compatible F16 or F32 Anima sources are normalized to BF16 when the local
+packed cache is built. The source checkpoint remains unchanged. Cache identity
+retains the raw source hash and dtype while the MODEL/source comparison uses
+the normalized BF16 execution weights.
+
+The standard path supports ordinary additive Anima LoRAs and the narrowly
+scoped hybrid Turbo LoRA Q/K norm `.diff` patches described below. Preview and
+Aesthetic checkpoints, LLLite, LoHa/LoKr/OFT/DoRA, other patch formats,
+training and other shapes are unsupported. INT8 is supported **only** by the
+separate experimental profile described above.
+
+Model weights, packed caches and captured tensors are not distributed. The
+INT8 profile's fixed-shape XDNA runtime artifacts and four host-kernel DLLs
+are available as a versioned Windows x64 release bundle; they are not
+included in the Python wheel or source archive. Obtain model files from their
+authorized sources and review their licenses separately.
 
 ## Installation
 
-Use an isolated ComfyUI installation and its Python environment. Clone with
-the exact custom-node directory name:
+Use an isolated ComfyUI installation and install the node into the same Python
+environment that starts ComfyUI. Clone the repository using the expected
+custom-node directory name:
 
 ```powershell
 git clone https://github.com/uppiy47g/anima-xdna-comfyui.git `
@@ -75,10 +193,10 @@ git clone https://github.com/uppiy47g/anima-xdna-comfyui.git `
 cd "<COMFYUI_ROOT>\custom_nodes\anima-xdna-comfyui"
 ```
 
-Install the ABI-matching Windows XRT `pyxrt`, official Triton-XDNA/MLIR/LLVM-AIE
-wheels and CPU PyTorch first, following
-[the runtime prerequisites](anima_xdna_poc/README.md#windows-prerequisites).
-Then use the **same interpreter that launches ComfyUI**:
+Install the ABI-matching Windows XRT `pyxrt`, Triton-XDNA/MLIR/LLVM-AIE
+wheels and CPU PyTorch first, following the
+[Windows runtime prerequisites](anima_xdna_poc/README.md#windows-prerequisites).
+Then install the package using the ComfyUI interpreter:
 
 ```powershell
 & "<XDNA_VENV>\Scripts\python.exe" -m pip install -e .
@@ -86,10 +204,13 @@ $env:XRT_DEV_DIR = "<XRT_SDK_DIR>"
 & "<XDNA_VENV>\Scripts\anima-xdna-probe.exe"
 ```
 
-The probe must report target `npu2` and runtime `xrt`; missing hardware or
-dependencies are errors, not successful fallback. Do not set `XILINX_XRT`
-on Windows. Copy the [model-path template](examples/extra_model_paths_anima_xdna.yaml)
-outside the repository, replace placeholders locally, then start ComfyUI:
+The probe must report target `npu2` and runtime `xrt`. Missing hardware or
+dependencies are errors, not successful fallback. Do not set `XILINX_XRT` on
+Windows.
+
+Copy the [model-path template](examples/extra_model_paths_anima_xdna.yaml)
+outside the repository and replace its placeholders locally. Start the
+standard ComfyUI path with:
 
 ```powershell
 .\examples\run_comfyui_xdna.ps1 `
@@ -99,49 +220,124 @@ outside the repository, replace placeholders locally, then start ComfyUI:
   -ModelPathsConfig "<USER_MODEL_PATHS_YAML>"
 ```
 
-The launcher binds to localhost and uses `--cpu` for the host pipeline.
-The repository root registers only XDNA nodes; it needs no LoRA Bridge
-converter or activation-capture package.
+This launcher binds to localhost and uses `--cpu` for the host pipeline. The
+repository registers only Anima XDNA nodes; no LoRA Bridge converter or
+activation-capture package is needed.
 
-## Usage and evidence
+## Using the standard path
 
-Load the native checkpoint with **Load Anima (BF16)**, connect its MODEL to
-**Load/Attach Anima XDNA Model**, and leave `checkpoint` at
-**Auto (from MODEL)**. The loader carries the exact read-only source into the
-attach node, so it only needs to be selected once. Then connect the wrapped
-MODEL to the normal sampler. **Anima XDNA Runtime
-Status** reports residency, dispatches and transfers; **Unload Anima XDNA
-Runtime** releases the attachment. See the
-[node guide](comfyui_xdna_nodes/README.md) and
-[API insertion fragment](examples/anima_xdna_512_api.json).
+1. Load a native Anima model with **Load Anima (BF16)**. The loader supports
+   `diffusion_models:` transformer files and `checkpoints:` full checkpoints.
+   The standard ComfyUI `UNETLoader` does not expose the same explicit BF16
+   contract on the validated CPU setup.
+2. Connect it to **Load/Attach Anima XDNA Model**. For a supported Anima LoRA,
+   place standard **Load LoRA** or **Load LoRA Model Only** nodes before the
+   attach node.
+3. Keep `checkpoint` set to **Auto (from MODEL)**. The BF16 loader records the
+   exact source and the attach node reuses it. A manually selected source must
+   contain matching block weights.
+4. Connect the returned MODEL to the normal sampler.
+5. Use **Anima XDNA Runtime Status** to inspect cache state, timings,
+   dispatches, transfers, BO population, allocations and resident reuse.
+6. Use **Unload Anima XDNA Runtime** when an immediate runtime release is
+   needed.
 
-Standard ComfyUI **Load LoRA** or **Load LoRA Model Only** nodes may be placed
-between **Load Anima (BF16)** and the XDNA attach node. Ordinary additive
-Anima LoRAs are materialized non-destructively into exact BF16 effective
-weights. Each distinct effective 560-tensor fingerprint gets a separately
-verified packed cache; identical weights reuse it. Base checkpoints and LoRA
-files remain read-only. The attach node uses ComfyUI's managed model-loading
-lifecycle, so switching from a LoRA workflow back to the base MODEL restores
+The MODEL is cloned and not modified. Before XRT opens, the wrapper computes a
+canonical digest over all 560 block tensors and rejects source mismatches
+before buffer population or dispatch. If the source is F16 or F32, a verified
+BF16 packed cache is created or reused without modifying the checkpoint.
+
+The validated WAI Nova file is a full ComfyUI checkpoint containing Anima,
+Qwen and VAE tensors, not a standalone LoRA delta. The BF16 loader extracts
+its `model.diffusion_model.*` Anima component; use normal Qwen and VAE workflow
+nodes for the remaining components, and reference the same full checkpoint as
+the XDNA source.
+
+`qkv_chaining` defaults to enabled and groups the three Q/K/V projection
+launches within each attention module. It does not fuse LayerNorm/AdaLN,
+RMSNorm, RoPE, softmax, GELU, gates or residual operations; those remain on
+CPU in the standard path. `rebuild_cache=true` recreates the packed cache when
+the attach node executes. ComfyUI caches node results for unchanged inputs;
+toggle the option back before requesting a later rebuild. `cache_dir` may
+point to another user-writable ASCII path, but not into the model directory.
+
+Supported additive LoRAs are materialized non-destructively into exact BF16
+effective weights, with a separately verified packed cache for each distinct
+560-tensor fingerprint. The attach node follows ComfyUI's model-management
+lifecycle so switching from a LoRA workflow back to the base model restores
 the correct shared weights before verification. Hybrid Turbo LoRAs may also
-carry exact additive `.diff` tensors for the 28 blocks' self/cross-attention
-Q/K norm weights; those narrowly scoped patches are supported with the same
-shape, finite-value, fingerprint, and cache checks.
+contain exact additive `.diff` tensors for self/cross-attention Q/K norm
+weights. LoHa, LoKr, OFT, DoRA, reshape/mid-weight LoRA, other block diff/bias
+patches and runtime transformer patches stop before NPU dispatch rather than
+being silently ignored.
 
-The default resident Q/K/V-chained path executes 19 XRT dispatches per block,
-532 per 28-block denoising step. `qkv_chaining=false` selects the 23/644 control.
-Historical measurements, metadata-free output images, exact gates, and
-reproduction instructions are in the
-[public report](docs/anima-xdna-reproducibility.md) and
-[schema-backed evidence](docs/evidence/anima-xdna-validated.json).
-These measurements were collected before this repository migration, not
-rerun on migration hardware.
+## Enabling the experimental INT8 profile
 
-**Known numerical limitations:** the captured Base chain exceeds its strict
-5% intermediate CPU-oracle gate (7.828% worst, 0.8407% final). Turbo uses a
-separate 10% intermediate / 2% final captured-fixture gate. Its BF16+XDNA
-8-step latent differs from the stock-FP32 CPU reference by about 25.55%
-normalized RMS, despite reproducing the prior validated XDNA image exactly.
-No blanket equivalence or NPU-only speed claim is made.
+First install the custom node and the ABI-matched Windows XRT, `pyxrt`,
+Triton-XDNA/MLIR/LLVM-AIE dependencies as described above. The profile bundle
+does not install ComfyUI, Python, the AMD driver/XRT stack, model weights, or
+the Python dependencies. It supplies the fixed-shape INT8/AIR artifacts, the
+four prebuilt host-kernel DLLs, and the profile launcher.
+
+Stop ComfyUI, open PowerShell in the custom-node checkout, and run:
+
+```powershell
+.\tools\install_int8_runtime.ps1 -ComfyUIRoot "<COMFYUI_ROOT>"
+```
+
+The installer downloads the version-pinned bundle from the
+[GitHub prerelease](https://github.com/uppiy47g/anima-xdna-comfyui/releases/tag/v0.2.0-alpha.2),
+checks its GitHub SHA-256 digest and every payload file, then installs the
+runtime under `<COMFYUI_ROOT>\xdna-runtime`, copies the DLLs into this node,
+and places `run-xdna-int8.ps1` beside the existing `run-xdna.ps1`. Replaced
+files are backed up in a timestamped folder. No model or user configuration
+files are touched.
+
+Launch with:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass `
+  -File "<COMFYUI_ROOT>\run-xdna-int8.ps1"
+```
+
+The bundle is specific to the validated Windows x64 / AMD XDNA 2 configuration
+and does not broaden the profile's fixed-shape constraints. For quality-
+sensitive generation, use the standard launcher instead. Missing, mismatched
+or corrupted runtime assets fail explicitly; there is no silent baseline
+fallback. The installer does not change standard launchers.
+
+To build the four host DLLs locally instead, use an x64 Visual Studio developer
+PowerShell with MSVC and OpenMP support:
+
+```powershell
+.\examples\build_fused_host.ps1
+```
+
+The host requires OS-enabled AVX-512 F/DQ/BW/VL and the validated PyTorch
+reduction behavior; it is not a portable CPU fallback. Artifact provenance
+and reproduction details are in the
+[reproducibility report](docs/anima-xdna-reproducibility.md).
+
+## Historical baseline and evidence
+
+The default resident Q/K/V-chained path historically executed 19 XRT
+dispatches per block (532 per 28-block denoising step). Disabling
+`qkv_chaining` selected the 23-dispatch control (644 per step). These figures
+describe the standard BF16-era path and should not be confused with the
+experimental INT8 profile's 896 dispatches per four-step sample.
+
+The validated BF16+XDNA Turbo 8-step Euler/simple/CFG-1/seed-424242 workflow
+reproduced the previous validated XDNA image pixelwise. Its latent differed
+from the stock-FP32 CPU reference by 25.55% normalized RMS. The captured Base
+chain also exceeded its strict 5% intermediate CPU-oracle gate (7.828% worst,
+0.8407% final); Turbo uses a separate 10% intermediate / 2% final
+captured-fixture gate. These are specific fixture comparisons, not blanket
+quality-equivalence claims.
+
+Development notes and experiment history are published in the
+[reproducibility report](docs/anima-xdna-reproducibility.md), its
+[schema-backed evidence](docs/evidence/anima-xdna-validated.json), and the
+[development log](https://note.com/loyal_owl5720/m/m79af97ed02e5).
 
 ## Development checks
 
@@ -153,11 +349,11 @@ python -m build
 git diff --check
 ```
 
-The suite validates public-artifact privacy, PNG digests/metadata, the evidence
-JSON schema, packaging identity and custom-node registration alongside CPU
-unit tests. Hardware tests explicitly skip when Triton-XDNA or local
+The tests cover CPU functionality, evidence schemas, package behavior and
+public-artifact privacy. Hardware tests skip when Triton-XDNA or the local
 `ANIMA_XDNA_CHECKPOINT` / `ANIMA_XDNA_CHAIN_FIXTURE` inputs are unavailable;
-skips are not hardware passes. Never commit fixtures, checkpoints or caches.
+a skip is not a hardware pass. Never commit model files, captures, packed
+caches or generated binaries.
 
 ## License and provenance
 
@@ -165,4 +361,5 @@ MIT, with the original copyright notice preserved in [LICENSE](LICENSE).
 This standalone project was extracted from the XDNA work in
 `uppiy47g/anima-lora-style-bridge`, without its git history or LoRA conversion
 functionality. See [provenance and migration scope](docs/provenance.md) for
-source revisions, attribution, exclusions and the historical evidence boundary.
+source revisions, attribution, exclusions and the historical evidence
+boundary.

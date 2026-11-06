@@ -1,0 +1,36 @@
+Third-party notices for the optional INT8/AIR runtime bundle
+
+The device artifacts were generated using AMD Triton-XDNA and MLIR-AIR. The
+AIR attention artifacts use AIE microkernels from MLIR-AIR commit
+508ca731ef0384fd3729ac1688e0b5d9a0ef5efe.
+
+Triton-XDNA is licensed under the MIT License:
+Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
+
+The MLIR-AIR source and its AIE microkernels are licensed under the MIT
+License:
+Copyright (C) 2018-2022, Xilinx Inc. All rights reserved.
+Copyright (c) 2022, Advanced Micro Devices, Inc. All rights reserved.
+The AIE microkernel attribution also records Copyright (C) 2025 Advanced
+Micro Devices, Inc.
+
+The following MIT license terms apply to these notices:
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice (including the next
+paragraph) shall be included in all copies or substantial portions of the
+Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
