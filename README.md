@@ -126,6 +126,28 @@ contexts and XRT buffers remain resident across denoising steps. The regular
 launcher uses baseline attention by default. Direct AIR attention is a
 separate experimental opt-in.
 
+#### 1024×1024 output
+
+The standard path also accepts a 1024×1024 latent (`[1,16,1,128,128]`, 4096
+image tokens). Every XDNA dispatch is split into the 1024-row and 1024-key
+kernel shapes that are validated at 512×512, so both resolutions share the
+resident weights and the compiled kernels. A block uses 76 dispatches. Row
+counts that do not tile evenly raise an error; there is no CPU fallback.
+
+- **Attention backend.** Use baseline attention: leave
+  `ANIMA_XDNA_ATTENTION_BACKEND` unset or set it to `baseline`. AIR attention
+  and the INT8 profile remain 512×512-only and reject 4096 tokens with an
+  explicit error.
+- **Speed.** On the test machine, one 28-block pass takes about 54 s. A
+  sampler step therefore takes about 55 s with CFG 1 and roughly twice as long
+  with CFG > 1. A 4-step Turbo V1.1 prompt took 251 s, including loading and
+  VAE decoding.
+- **Memory.** Host memory use is much higher than at 512×512. On a 24 GB
+  system, about 1 GB remained free during sampling.
+
+See the [1024×1024 tiling section](docs/anima-xdna-reproducibility.md#anima-1024x1024-by-tiling-xdna-dispatches-2026-11-16)
+of the reproducibility report.
+
 ### Experimental INT8/AIR profile
 
 The `int8-attn-l1k64-nq8pp` profile is deliberately separate from the standard
@@ -160,8 +182,9 @@ The validated configuration is:
   `170594057a22673349ddf0a3d88624b7fa5865bb`.
 - Anima Base v1.0, Turbo V1.1, the validated WAI Nova Anima Turbo LoRA
   Ver V1.0 full checkpoint, or Radiance Turbo Anima v2.0.
-- Batch 1, 512×512 output, 1024 image tokens and adapted Qwen context
-  `[1, 512, 1024]`.
+- Batch 1 and adapted Qwen context `[1, 512, 1024]`, with either 512×512
+  output (1024 image tokens) or, on the standard BF16 path with baseline
+  attention only, 1024×1024 output (4096 image tokens).
 - BF16 execution weights and block activations; the sampler latent is FP32.
 
 Compatible F16 or F32 Anima sources are normalized to BF16 when the local

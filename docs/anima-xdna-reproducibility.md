@@ -34,7 +34,7 @@ This dated, non-exhaustive search is not an absolute novelty claim.
 | ComfyUI | `170594057a22673349ddf0a3d88624b7fa5865bb` |
 | Wrapper source | `737338d76bf2a7dcf9806aaba5d6d936499b95ab` |
 | Models | Anima Base v1.0, Turbo V1.1, and WAI Nova Anima Turbo LoRA Ver V1.0, BF16 transformer |
-| Shape | batch 1, latent `[1,16,1,64,64]`, 512×512, context `[1,512,1024]` |
+| Shape | batch 1, latent `[1,16,1,64,64]`, 512×512, context `[1,512,1024]`; 1024×1024 (`[1,16,1,128,128]`) with baseline attention, see the 2026-11-16 section |
 
 The exact structured measurements and artifact digests are in
 [`evidence/anima-xdna-validated.json`](evidence/anima-xdna-validated.json).
@@ -2809,6 +2809,121 @@ is unchanged, so the recorded source hash is that of the documented file.
   the upsample restride when the VAE loads. Neither exists in the repository or
   the install.
 
+## Anima 1024x1024 by tiling XDNA dispatches (2026-11-16)
+
+This change makes the standard BF16 path generate 1024×1024 images: latent
+`[1,16,1,128,128]`, a 64×64 patch grid and 4096 image tokens. AIR attention
+and the INT8 profile are unchanged and remain 512×512-only.
+
+The compact results are in
+[`evidence/anima-1024-tiling.json`](evidence/anima-1024-tiling.json).
+
+**Result.**
+
+- **Numerics.** Base v1.0 on the deterministic synthetic 4096-token input
+  passes the strict 5% chain gate over 28 blocks. The worst block NRMS is
+  1.41% (block 13) and the final NRMS is 0.97%.
+- **ComfyUI.** A real ComfyUI Turbo V1.1 prompt produced a correct
+  1024×1024 image without fallback.
+- **Speed.** One 28-block pass takes 54.3 s, so a CFG 1 sampler step takes
+  about 55 s.
+- **512×512 behaviour.** The 1024-token path is bit-for-bit unchanged.
+
+### Design
+
+A direct 4096-token attention kernel crashes `aircc` (0xC0000005). Larger
+kernels would also need separate resident weight sets. Instead, every XDNA
+dispatch is split into 1024-token tiles:
+
+| Operation | 4096-token execution |
+|---|---|
+| Linear and Q/K/V projections | 4 row tiles of 1024 against the same resident weights |
+| Self-attention QK | per query tile, 1024 × 1024 per key tile |
+| Self-attention AV | per query tile, 4 key tiles summed in FP32 on the host |
+| Cross-attention | per query tile against the 512 context keys |
+| Query tiles | concatenated by a host operation before the output projection |
+
+Each tile uses a kernel shape that the 512×512 path already compiles and
+validates, so both resolutions share one weight cache and one kernel cache.
+A block takes 76 dispatches (2,128 per 28-block pass).
+
+Several invariants keep this safe:
+
+- Each tile's output is materialized before the next dispatch, because
+  resident output buffers are reused.
+- Row counts above 1024 must be a multiple of 1024; anything else raises
+  `UnsupportedTensor`.
+- At 4096 tokens, AIR attention raises an error that recommends
+  `ANIMA_XDNA_ATTENTION_BACKEND=baseline`. The INT8 profile requires AIR and
+  its fused host kernels accept at most 1024 rows, so it cannot run at 4096
+  tokens either.
+- With one tile, the dispatch sequence is the one used before this change.
+
+The ComfyUI wrapper accepts both latent shapes and derives the patch grid,
+token count, RoPE and the residual reshape from the latent.
+
+### Hardware chain validation (Base v1.0, synthetic input)
+
+| Blocks | Dispatches | Cached run | Worst block NRMS | Final NRMS | Gate |
+|---|---:|---:|---:|---:|---|
+| 0-1 | 76 | 2.04 s | 0.19% | 0.19% | match |
+| 0-4 | 304 | 6.86 s | 0.93% | 0.93% | match |
+| 0-28 | 2,128 | 54.27 s | 1.41% (block 13) | 0.97% | match |
+
+**Timing breakdown.** In the 28-block run:
+
+- Blocks take 1.80-2.10 s each.
+- Kernel execution and waits account for 20.5 s, and host operations for
+  11.7 s.
+- Every weight was a resident hit: 2,576 hits, with no allocation and no
+  weight population.
+- The one-time populate/validate step took 176 s, and the CPU oracle 107 s.
+
+**512×512 regression.** The same synthetic Base 28-block chain at 1024 tokens
+stops at block 21 under the strict 5% transient gate (NRMS 0.0715185,
+max_abs 189.5). An export of the unmodified repository head gives the
+identical failure. It is a pre-existing Base transient-gate behaviour, like
+the real-fixture Base failure documented above, and this change did not
+introduce it.
+
+### ComfyUI generation (Turbo V1.1)
+
+- **Software.** ComfyUI `170594057a22` with `--cpu`, an isolated base
+  directory and the repository worktree, with attention backend `baseline`
+  and host AdaLN.
+- **Workflow.** Load Anima (BF16) → Load/Attach XDNA (`Auto (from MODEL)`) →
+  KSampler, followed by the default FP32 VAE decode.
+- **Settings.** Euler/simple, 4 steps, CFG 1, seed 700755787614899,
+  `EmptyCosmosLatentVideo` at 1024×1024 with length 1, and the
+  `qwen_3_06b_base` text encoder.
+
+Results:
+
+- The prompt executed in **250.8 s**. That includes model loading, cache
+  verification, the first-use setup and the VAE decode.
+- The first sampler step took 66.6 s and later steps 53-54 s; tqdm reported
+  an average of 55.8 s/it.
+- The image is a correct 1024×1024 RGB image, and runtime status reported a
+  verified weight-cache hit.
+- Free system memory dropped to about 1.1 GB of 23.6 GB during sampling.
+
+**Using it in an existing install.** In a ComfyUI install, Python must import
+the updated `anima_xdna_poc`. An editable install or a `.pth` file that puts
+an older copy first on `sys.path` silently keeps the 512×512-only runtime;
+`PYTHONPATH` does not override a `.pth` insertion. Update the deployed custom
+node copy before starting ComfyUI.
+
+### Limits
+
+- **Scope.** One machine and one run per measurement; there is no
+  statistical claim.
+- **Base with CFG > 1.** Not run end to end. Two passes per step imply about
+  110 s per step.
+- **Inputs.** The chain gate used the synthetic input. No real captured
+  4096-token fixture exists.
+- **Memory.** The memory headroom on 24 GB systems is small. Close other
+  applications before generating at 1024×1024.
+
 ## Public verification ladder
 
 Set placeholders only in the current shell; do not commit paths or captures.
@@ -2851,10 +2966,11 @@ $env:ANIMA_XDNA_CHAIN_FIXTURE = "<CAPTURED_REAL_BLOCK_INPUT_PT>"
 ## Limitations and troubleshooting
 
 Only Base v1.0, Turbo V1.1, WAI Nova Anima Turbo LoRA Ver V1.0, Radiance
-Turbo Anima v2.0, and the fixed shape above are validated. Other Preview/Aesthetic
+Turbo Anima v2.0, and the fixed shapes above are validated. Other Preview/Aesthetic
 checkpoints, LoRA/LLLite/ModelPatcher transformer patches, INT8, training,
-other resolutions, other context sizes, and user batches above one are
-rejected. CFG batch 2 is executed sequentially on the single-tenant NPU.
+resolutions other than 512×512 and 1024×1024 (baseline attention only), other
+context sizes, and user batches above one are rejected. CFG batch 2 is
+executed sequentially on the single-tenant NPU.
 
 ## WAI Nova Anima Turbo LoRA Ver V1.0
 

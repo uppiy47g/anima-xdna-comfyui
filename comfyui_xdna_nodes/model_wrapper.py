@@ -33,6 +33,8 @@ ATTACHMENT_KEY = "anima_xdna2_runtime"
 SOURCE_PROVENANCE_KEY = "anima_xdna2_source_provenance"
 AUTO_CHECKPOINT = "Auto (from MODEL)"
 SUPPORTED_SHAPE = (1, 16, 1, 64, 64)
+# 512x512 and 1024x1024 latents; larger grids are tiled into 1024-token NPU dispatches.
+SUPPORTED_SHAPES = (SUPPORTED_SHAPE, (1, 16, 1, 128, 128))
 
 
 @dataclass
@@ -350,7 +352,7 @@ class SharedRuntime:
                     "last_d2h_host_visible_bytes": (
                         self.diagnostics.last_d2h_bytes
                     ),
-                    "supported_shape": list(SUPPORTED_SHAPE),
+                    "supported_shapes": [list(shape) for shape in SUPPORTED_SHAPES],
                     "replacement_boundary": (
                         "after ComfyUI patch/time/Qwen/RoPE preprocessing; "
                         "before final_layer/unpatchify"
@@ -381,10 +383,15 @@ class SharedRuntime:
                 "Anima XDNA wrapper requires ComfyUI's comfy.ldm.anima.model.Anima; "
                 f"received {module}.{class_name}"
             )
-        if x.ndim != 5 or tuple(x.shape[1:]) != SUPPORTED_SHAPE[1:] or x.shape[0] not in (1, 2):
+        if (
+            x.ndim != 5
+            or x.shape[0] not in (1, 2)
+            or (1, *x.shape[1:]) not in SUPPORTED_SHAPES
+        ):
             raise UnsupportedTensor(
                 "Anima XDNA currently supports a batch-1 latent (or the "
-                "sampler's two-way CFG batch) with shape [B,16,1,64,64], "
+                "sampler's two-way CFG batch) with shape [B,16,1,64,64] "
+                "(512x512) or [B,16,1,128,128] (1024x1024), "
                 f"got {tuple(x.shape)}"
             )
         if tuple(context.shape) != (x.shape[0], 512, 1024):
@@ -435,7 +442,7 @@ class SharedRuntime:
         orig_shape = list(x.shape)
 
         pre_started = time.perf_counter()
-        # The fixed 512x512 image shape is already divisible by [1,2,2].
+        # The supported latent shapes are already divisible by [1,2,2].
         embedded, _comfy_rope, extra_position = model.prepare_embedded_sequence(
             x,
             fps=fps,
@@ -452,13 +459,15 @@ class SharedRuntime:
         embedded_timestep = model.t_embedding_norm(embedded_timestep)
         if temb is None:
             raise UnsupportedTensor("Anima XDNA requires AdaLN-LoRA timestep modulation")
-        grid_shape = embedded.shape[1:4]
-        if tuple(grid_shape) != (1, 32, 32):
+        grid_shape = tuple(embedded.shape[1:4])
+        expected_grid = (1, x.shape[-2] // 2, x.shape[-1] // 2)
+        if grid_shape != expected_grid:
             raise UnsupportedTensor(
-                f"expected patch grid [1,32,32], got {tuple(grid_shape)}"
+                f"expected patch grid {list(expected_grid)}, got {list(grid_shape)}"
             )
         batch = x.shape[0]
-        hidden = embedded.reshape(batch, 1024, 2048).to(
+        tokens = grid_shape[1] * grid_shape[2]
+        hidden = embedded.reshape(batch, tokens, 2048).to(
             device="cpu", dtype=torch.bfloat16
         ).contiguous()
         cpu_context = context.to(
@@ -470,7 +479,7 @@ class SharedRuntime:
         cpu_temb = temb.reshape(batch, 6144).to(
             device="cpu", dtype=torch.bfloat16
         ).contiguous()
-        rope = rotary_embedding(self.open().config, 1024)
+        rope = rotary_embedding(self.open().config, tokens)
         preprocess_ms = (time.perf_counter() - pre_started) * 1000
 
         self._interrupt()
@@ -492,7 +501,7 @@ class SharedRuntime:
 
         post_started = time.perf_counter()
         chain_output = torch.cat([chain.output for chain in chains], dim=0)
-        residual = chain_output.reshape(batch, 1, 32, 32, 2048).to(
+        residual = chain_output.reshape(batch, *grid_shape, 2048).to(
             device=original_device,
             dtype=context.dtype,
         )

@@ -838,6 +838,74 @@ class ComfyUIXDNAWrapperTests(unittest.TestCase):
         ):
             LoadAnimaBF16().load("anima.safetensors")
 
+    def test_forward_maps_1024_latent_to_4096_token_chain(self):
+        from types import SimpleNamespace
+
+        from anima_xdna_poc.block import rotary_embedding
+        from anima_xdna_poc.errors import UnsupportedTensor
+
+        seen = {}
+
+        class FakeAnima:
+            blocks = [None] * 28
+            t_embedding_norm = staticmethod(lambda value: value)
+            t_embedder = (
+                lambda tokens: tokens.float().unsqueeze(-1).expand(-1, -1, 2048),
+                lambda value: (value, torch.zeros(*value.shape[:2], 6144)),
+            )
+
+            def prepare_embedded_sequence(self, x, fps=None, padding_mask=None):
+                grid = (x.shape[0], 1, x.shape[-2] // 2, x.shape[-1] // 2, 2048)
+                return torch.randn(grid), None, None
+
+            def final_layer(self, residual, embedded_timestep, adaln_lora_B_T_3D):
+                seen["residual"] = residual
+                return residual
+
+            def unpatchify(self, patches):
+                batch, _, height, width, _ = patches.shape
+                return torch.zeros(batch, 16, 1, 2 * height, 2 * width)
+
+        FakeAnima.__name__ = "Anima"
+        FakeAnima.__module__ = "comfy.ldm.anima.model"
+        config = SimpleNamespace(head_dim=128, rope_scale=(1.0, 4.0, 4.0))
+        chain_runtime = mock.Mock(config=config, cache_status=None)
+        chain_runtime.run_range.side_effect = lambda inputs: SimpleNamespace(
+            output=inputs.hidden_states + 1,
+            blocks=(),
+            wall_ms=0.0,
+            dispatch_count=0,
+        )
+        runtime = SharedRuntime(Path("fixture.safetensors"))
+        model = FakeAnima()
+        context = torch.zeros(2, 512, 1024)
+        with mock.patch.object(
+            runtime, "open", return_value=chain_runtime
+        ), mock.patch.object(runtime, "_interrupt"):
+            output = runtime.forward(
+                model, torch.zeros(2, 16, 1, 128, 128), torch.ones(2), context
+            )
+            with self.assertRaisesRegex(UnsupportedTensor, "1024x1024"):
+                runtime.forward(
+                    model, torch.zeros(1, 16, 1, 96, 96), torch.ones(1), context[:1]
+                )
+        self.assertEqual(tuple(output.shape), (2, 16, 1, 128, 128))
+        calls = chain_runtime.run_range.call_args_list
+        self.assertEqual(len(calls), 2)
+        inputs = calls[0].args[0]
+        self.assertEqual(tuple(inputs.hidden_states.shape), (1, 4096, 2048))
+        expected_cos, expected_sin = rotary_embedding(config, 4096)
+        self.assertTrue(torch.equal(inputs.image_rotary_emb[0], expected_cos))
+        self.assertTrue(torch.equal(inputs.image_rotary_emb[1], expected_sin))
+        residual = seen["residual"]
+        self.assertEqual(tuple(residual.shape), (2, 1, 64, 64, 2048))
+        self.assertTrue(
+            torch.equal(
+                residual[0].reshape(1, 4096, 2048).to(torch.bfloat16),
+                inputs.hidden_states + 1,
+            )
+        )
+
     def test_rejects_non_anima_model(self):
         patcher = FakePatcher()
         patcher.model.diffusion_model = object()

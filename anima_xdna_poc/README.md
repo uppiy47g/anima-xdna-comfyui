@@ -78,7 +78,14 @@ are reported; there is no silent CPU fallback. Parameterized GEMMs account for
 137,451,536,384 logical FLOPs per block and are all on the NPU.
 
 The supported 512x512 path is batch 1, 1024 image tokens, hidden size 2048,
-512 context tokens, and context width 1024. The deterministic default input is
+512 context tokens, and context width 1024. With baseline attention, 4096
+image tokens (1024x1024) are also supported; `anima-xdna-chain` validates
+them with `--image-tokens 4096`. Linear
+rows, attention queries and attention keys are split into 1024-token tiles.
+Each tile dispatches the same kernel shape as the 512x512 path, and AV partial
+products over key tiles are summed in FP32 on the host. A block takes 76
+dispatches. Row counts above 1024 must be a multiple of 1024; anything else
+raises `UnsupportedTensor`. The deterministic default input is
 synthetic. The current Base and Turbo hardware chain fixtures were captured
 read-only before block 0 during standalone ComfyUI prompt generation with the
 Qwen encoder, model patch/time embeddings, and Cosmos RoPE; fixture files are
@@ -577,7 +584,7 @@ CPU-versus-NPU chain validation use the selected NPU backend; the CPU oracle
 never uses AIR.
 
 AIR is fixed to batch 1, 1024 image tokens, 512 context tokens and 16 heads
-of depth 128. Masks, unsupported shapes, missing/corrupt artifacts and device
+of depth 128. Use baseline attention for 1024x1024 (4096 tokens). Masks, unsupported shapes, missing/corrupt artifacts and device
 failures raise errors; there is no silent baseline/CPU fallback. Runners
 remain resident across sampler steps and close on runtime unload.
 

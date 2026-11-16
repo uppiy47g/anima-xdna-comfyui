@@ -46,9 +46,19 @@ back to CPU.
   **Load Anima (BF16)** (explicit ComfyUI `dtype=torch.bfloat16`)
 - matching read-only XDNA source: validated Diffusers/native Base for Base,
   or the same native Turbo checkpoint for Turbo
-- batch 1, latent `[1,16,1,64,64]`, 512x512 output
+- batch 1, latent `[1,16,1,64,64]` (512x512 output) or `[1,16,1,128,128]`
+  (1024x1024 output, baseline attention only)
 - adapted Qwen context `[1,512,1024]`
 - BF16 model weights and block activations, FP32 sampler latent
+
+At 1024x1024 the wrapper derives the 64x64 patch grid, 4096 image tokens and
+RoPE from the latent. The runtime splits every XDNA dispatch into the
+1024-token kernel shapes used at 512x512. Start ComfyUI with
+`ANIMA_XDNA_ATTENTION_BACKEND` unset or set to `baseline`; AIR attention and
+the INT8 profile reject 4096 tokens with an explicit error. A 4-step,
+CFG 1 Turbo V1.1 1024x1024 prompt completed in 251 s (about 55 s per step).
+Expect roughly twice the step time with CFG > 1, and much higher host memory
+use than at 512x512.
 
 Preview/Aesthetic checkpoints, LoRA patches, LLLite, other
 batch/resolution/context sizes, and training are rejected. The normal ComfyUI

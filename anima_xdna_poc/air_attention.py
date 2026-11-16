@@ -132,8 +132,11 @@ class AIRAttentionBackend:
             or inputs.encoder_hidden_states.shape[1] != 512
         ):
             raise UnsupportedTensor(
-                "AIR attention requires batch 1, 1024 image tokens, "
-                "512 context tokens and 16 heads of depth 128"
+                "AIR attention requires batch 1, 1024 image tokens (512x512), "
+                "512 context tokens and 16 heads of depth 128; got "
+                f"{inputs.hidden_states.shape[1]} image tokens. Use "
+                "ANIMA_XDNA_ATTENTION_BACKEND=baseline for other resolutions "
+                "such as 1024x1024"
             )
         if inputs.attention_mask is not None:
             raise UnsupportedTensor("AIR attention does not support masks; no fallback")
