@@ -465,7 +465,8 @@ class _BlockExecution:
             h2d = (query.numel() + key.numel() + value.numel()) * 2
             d2h = output.numel() * 2
             self.metrics.append(StageMetric(
-                prefix + ".air_attention", self.runner_device, elapsed, 1,
+                prefix + ".air_attention", self.runner_device, elapsed,
+                len(_tile_ranges(query.shape[2])),
                 4 * cfg.num_heads * query.shape[2] * key.shape[2] * cfg.head_dim,
                 h2d + d2h, h2d, d2h,
             ))

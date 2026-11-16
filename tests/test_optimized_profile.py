@@ -11,7 +11,9 @@ from anima_xdna_poc.int8_runtime import (
     bitwise_equal,
     install_profile,
     quant_rows,
+    require_int8_tokens,
 )
+from anima_xdna_poc.errors import UnsupportedTensor
 from anima_xdna_poc.vae_optimization import _restrided_upsample_forward, optimize_vae
 
 
@@ -44,6 +46,11 @@ class OptimizedProfileTests(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=True):
             with self.assertRaisesRegex(RuntimeError, "ATTENTION_BACKEND=air"):
                 install_profile(PROFILE)
+
+    def test_profile_rejects_other_resolutions_explicitly(self):
+        require_int8_tokens(SimpleNamespace(hidden_states=torch.empty(1, 1024, 1)))
+        with self.assertRaisesRegex(UnsupportedTensor, "1024 image tokens"):
+            require_int8_tokens(SimpleNamespace(hidden_states=torch.empty(1, 4096, 1)))
 
     def test_vae_conversion_sets_bf16_and_channels_last(self):
         class FakeVAEModel(torch.nn.Module):

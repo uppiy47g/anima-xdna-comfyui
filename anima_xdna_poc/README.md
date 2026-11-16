@@ -85,11 +85,13 @@ rows, attention queries and attention keys are split into 1024-token tiles.
 Each tile dispatches the same kernel shape as the 512x512 path, and AV partial
 products over key tiles are summed in FP32 on the host. A block takes 76
 dispatches. Row counts above 1024 must be a multiple of 1024; anything else
-raises `UnsupportedTensor`. The deterministic default input is
-synthetic. The current Base and Turbo hardware chain fixtures were captured
-read-only before block 0 during standalone ComfyUI prompt generation with the
-Qwen encoder, model patch/time embeddings, and Cosmos RoPE; fixture files are
-local-only and are not distributed.
+raises `UnsupportedTensor`. Experimental AIR attention also supports 4096 image
+tokens with an extra artifact and 44 dispatches per block; see
+[AIR attention at 1024x1024](#air-attention-at-1024x1024). The deterministic
+default input is synthetic. The current Base and Turbo hardware chain fixtures
+were captured read-only before block 0 during standalone ComfyUI prompt
+generation with the Qwen encoder, model patch/time embeddings, and Cosmos RoPE;
+fixture files are local-only and are not distributed.
 
 ## Windows prerequisites
 
@@ -583,10 +585,39 @@ workflow does not need replacement nodes. Both standard `run_range` and
 CPU-versus-NPU chain validation use the selected NPU backend; the CPU oracle
 never uses AIR.
 
-AIR is fixed to batch 1, 1024 image tokens, 512 context tokens and 16 heads
-of depth 128. Use baseline attention for 1024x1024 (4096 tokens). Masks, unsupported shapes, missing/corrupt artifacts and device
+AIR is fixed to batch 1, 512 context tokens and 16 heads of depth 128, with
+1024 image tokens (512x512 output) or 4096 image tokens (1024x1024 output,
+below). Masks, unsupported shapes, missing/corrupt artifacts and device
 failures raise errors; there is no silent baseline/CPU fallback. Runners
 remain resident across sampler steps and close on runtime unload.
+
+#### AIR attention at 1024x1024
+
+At 4096 image tokens the backend opens a `self4096` artifact (4096 keys) and
+the same `cross` artifact, so the artifact directory needs
+`self4096\manifest.json` in addition to the files above; `self` (1024 keys)
+is only used at 512x512, and a missing `self4096` raises an error. Self- and
+cross-attention each run as four 1024-query dispatches per block. K and V are
+uploaded once and stay resident for the remaining tiles, so a block uses 44
+dispatches instead of the 76 of baseline attention at this size. The first
+use at each resolution logs its own `EXPERIMENTAL AIR attention ACTIVE`
+warning.
+
+Build `self4096` in the same private AIR/AIE environment as above. The
+validated artifact uses the 8-query-core `nq8pp` schedule (the 16-core design
+from the [schedule scale-out](../docs/anima-xdna-reproducibility.md#air-attention-schedule-scale-out-kv-buffering-and-a-16-core-column-split-2026-11-06)
+section; `--schedule nq8pp` requires `--parallel-heads 2`):
+
+```powershell
+python -m examples.air_attention --keys 4096 --schedule nq8pp --parallel-heads 2 `
+  --source-dir $source --work-dir "<PERSISTENT_AIR_ARTIFACT_DIRECTORY>\self4096"
+```
+
+AIR remains **not control-equivalent** at 1024x1024: a fixed-seed decoded
+image differs from the baseline-attention image by MAE 22.1/255, and the
+latent-space difference was not measured. The [measured chain, ComfyUI and
+quality results](../docs/anima-xdna-reproducibility.md#air-attention-at-4096-keys-for-1024x1024-2026-11-16)
+are in the reproducibility report.
 
 For a controlled comparison with identical seed, prompt and sampler settings,
 stop ComfyUI, set the following and restart:

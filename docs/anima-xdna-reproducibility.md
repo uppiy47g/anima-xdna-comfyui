@@ -34,7 +34,7 @@ This dated, non-exhaustive search is not an absolute novelty claim.
 | ComfyUI | `170594057a22673349ddf0a3d88624b7fa5865bb` |
 | Wrapper source | `737338d76bf2a7dcf9806aaba5d6d936499b95ab` |
 | Models | Anima Base v1.0, Turbo V1.1, and WAI Nova Anima Turbo LoRA Ver V1.0, BF16 transformer |
-| Shape | batch 1, latent `[1,16,1,64,64]`, 512×512, context `[1,512,1024]`; 1024×1024 (`[1,16,1,128,128]`) with baseline attention, see the 2026-11-16 section |
+| Shape | batch 1, latent `[1,16,1,64,64]`, 512×512, context `[1,512,1024]`; 1024×1024 (`[1,16,1,128,128]`) with baseline attention or, experimentally, AIR attention, see the 2026-11-16 sections |
 
 The exact structured measurements and artifact digests are in
 [`evidence/anima-xdna-validated.json`](evidence/anima-xdna-validated.json).
@@ -2813,7 +2813,9 @@ is unchanged, so the recorded source hash is that of the documented file.
 
 This change makes the standard BF16 path generate 1024×1024 images: latent
 `[1,16,1,128,128]`, a 64×64 patch grid and 4096 image tokens. AIR attention
-and the INT8 profile are unchanged and remain 512×512-only.
+and the INT8 profile were unchanged by it and remained 512×512-only; the
+[next section](#air-attention-at-4096-keys-for-1024x1024-2026-11-16) adds an
+AIR path for 4096 tokens.
 
 The compact results are in
 [`evidence/anima-1024-tiling.json`](evidence/anima-1024-tiling.json).
@@ -2853,10 +2855,10 @@ Several invariants keep this safe:
   resident output buffers are reused.
 - Row counts above 1024 must be a multiple of 1024; anything else raises
   `UnsupportedTensor`.
-- At 4096 tokens, AIR attention raises an error that recommends
-  `ANIMA_XDNA_ATTENTION_BACKEND=baseline`. The INT8 profile requires AIR and
-  its fused host kernels accept at most 1024 rows, so it cannot run at 4096
-  tokens either.
+- At 4096 tokens, AIR attention raised an error that recommended
+  `ANIMA_XDNA_ATTENTION_BACKEND=baseline` (superseded by the next section).
+  The INT8 profile requires AIR and its fused host kernels accept at most 1024
+  rows, so it cannot run at 4096 tokens either.
 - With one tile, the dispatch sequence is the one used before this change.
 
 The ComfyUI wrapper accepts both latent shapes and derives the patch grid,
@@ -2924,6 +2926,371 @@ node copy before starting ComfyUI.
 - **Memory.** The memory headroom on 24 GB systems is small. Close other
   applications before generating at 1024×1024.
 
+## AIR attention at 4096 keys for 1024x1024 (2026-11-16)
+
+The tiling change above runs 1024×1024 with baseline attention only. This
+change adds an **opt-in experimental** AIR fused-attention path for the same
+4096 image tokens. It needs one more AIR artifact, `self4096`, that the
+repository generator [`examples/air_attention.py`](../examples/air_attention.py)
+builds with the `nq8pp` schedule of the
+[scale-out section](#air-attention-schedule-scale-out-kv-buffering-and-a-16-core-column-split-2026-11-06).
+The runtime dispatches it once per 1024-query tile. Baseline attention stays
+the default and there is no silent fallback. Usage is described in the
+[README](../anima_xdna_poc/README.md#air-attention-at-1024x1024).
+
+The compact results are in
+[`evidence/air-attention-4096-keys.json`](evidence/air-attention-4096-keys.json).
+
+**Result.**
+
+- **Numerics.** Base v1.0 on the deterministic synthetic 4096-token input
+  passes the 28-block chain with a 5% per-block gate and a stricter 2% final
+  gate. The worst block NRMS is 1.49% (block 13) and the final NRMS is 1.04%;
+  the tiled baseline-attention chain had 1.41% and 0.97%.
+- **Speed.** One 28-block pass takes 18.6-19.9 s, against 54.3 s with
+  baseline attention (2.7-2.9× faster), and needs 1,232 dispatches instead of
+  2,128.
+- **ComfyUI.** A real Turbo V1.1 prompt at 1024×1024 executed in 108.0 s cold
+  and 82.3 s warm, against 250.8 s cold with baseline attention.
+- **Quality.** AIR is not control-equivalent. For the same seed, the decoded
+  image differs from the baseline-attention image by a mean absolute error of
+  22.1/255. Both images are coherent and show no tile seams.
+- **512×512 behaviour.** Per-block error statistics of the AIR chain are
+  exactly equal with and without this change.
+- **INT8.** The INT8 profile stays 512×512-only.
+
+### Design
+
+Self-attention uses a new kernel with 1024 queries and 4096 keys. Its `nq8pp`
+schedule runs eight query cores per head and two heads at a time (16 cores),
+with two K/V core buffers, direct Q tiles and column-split memtile buffers.
+The nominal explicit core buffers total 53,504 bytes per core; they depend on
+the tile sizes only, not on the key count. Cross-attention keeps the unchanged
+512-key `cross` artifact. A 4096-token call is four dispatches of each kernel,
+one per 1024-query tile, and the four tiles of a call share one upload of K
+and V:
+
+| Dispatches per block | Tiled baseline | AIR |
+|---|---:|---:|
+| Linear and projections (4 row tiles) | 36 | 36 |
+| Self-attention | 32 | 4 |
+| Cross-attention | 8 | 4 |
+| Total | 76 | 44 |
+| 28-block pass | 2,128 | 1,232 |
+
+At 512×512 the AIR chain still takes 11 dispatches per block. The `aircc`
+crash noted in the tiling section came from an untiled 4096 × 4096 Triton QK
+head chain. `self4096` is a directly orchestrated MLIR-AIR kernel that reuses
+the pinned upstream microkernels, and it compiled in 25.0-27.4 s in the
+recorded builds.
+
+| Artifact | Keys | Used for | ELF SHA-256 |
+|---|---:|---|---|
+| `self4096` | 4096 | 1024×1024 self-attention (new) | `ba53bb0f0242c3858bb1de0fbc67187b354c38b8326dff92363c0a893b563f5c` |
+| `self` | 1024 | 512×512 self-attention (unchanged `nq8pp`) | `dde8ae3533003a61036ad18ae153a342743a3d05cf6ee4f56108a540cdfa8ef2` |
+| `cross` | 512 | cross-attention at both sizes (unchanged `nq8pp`) | `c849bec474984f677a34b18648f42e1749b2b71ff042ec090cc8033125dd2d34` |
+
+The `self4096` manifest records `kernel_sha256`
+`490249c83ab26777aeed6b044c6f1bca521d10a307932cff9dc01f8b07530943`, equal to
+that of the 1024- and 512-key `nq8pp` builds in the scale-out evidence. Three
+builds produced an identical `self4096` ELF: the validated artifact (built by
+the repository generator before the validation runs), the private variant
+builder of the scale-out section, and a fresh repository-generator rerun on
+the final tree, whose kernel digest matched as well. The `module_sha256` in a
+manifest is not an invariant: the MLIR embeds the kernel object path, so it
+differs between work directories while the kernel and ELF digests do not.
+
+Several invariants keep this safe:
+
+- K and V upload with the first tile of a call and are reused only by the
+  later tiles of that call (`static_indices` 1 and 2); nothing is reused
+  across calls.
+- Each tile's output is copied out before the next dispatch, because the
+  scratch output buffer is reused.
+- The backend accepts batch 1, 16 heads of depth 128, 1024 or 4096 image
+  tokens, a 512-token context and no mask. Anything else raises
+  `UnsupportedTensor`; there is no fallback.
+- Each resolution opens only its own artifacts: `self` and `cross` at
+  512×512, `self4096` and `cross` at 1024×1024. A missing `self4096` raises
+  `FileNotFoundError` when 1024×1024 is first used, and 512×512 does not need
+  it. A manifest whose key count does not match its role raises `ValueError`
+  and leaves the runners that are already open untouched.
+- The first use at each resolution logs one `EXPERIMENTAL AIR attention
+  ACTIVE` warning.
+- The INT8 profile requires 1024 image tokens and raises `UnsupportedTensor`
+  at other sizes, so it cannot silently run at 1024×1024.
+
+### Kernel micro-benchmark
+
+One artifact at a time ran through `MultiLaunchRunner` on random normal BF16
+Q/K/V (seed 7, scaled by the input scale) for 16 heads and 1024 queries. The
+error is against FP32 scaled-dot-product attention of the same BF16 inputs;
+the rounding floor is the NRMS of rounding that FP32 reference to BF16.
+"Device launch" is XRT start and wait only; "runner run" also includes host
+staging. Values are medians (min-max) in milliseconds over repeated launches;
+the run counts were not recorded:
+
+| Kernel | Input scale | Device launch | Runner run | NRMS | Rounding floor |
+|---|---:|---|---|---:|---:|
+| `self4096` (`nq8pp`, 4096 keys) | 1 | 9.77 (9.30-11.93) | 14.26 (14.11-14.51) | 4.482% | 0.165% |
+| Pinned schedule, 4096 keys | 1 | 24.52 (24.12-25.58) | 31.84 (26.50-36.58) | 4.482% | 0.165% |
+| `self4096` | 3 | 10.89 (10.43-11.94) | 14.41 (14.18-14.76) | 4.001% | 0.162% |
+| `self` (`nq8pp`, 1024 keys) | 1 | 4.27 (4.19-4.32) | 5.00 (4.81-5.21) | 4.085% | 0.166% |
+| `self` (`nq8pp`, 1024 keys) | 3 | 4.25 (4.12-4.34) | 5.25 (5.05-5.59) | 3.726% | 0.160% |
+
+- The pinned schedule (4 query cores, one K/V buffer and `pair` Q: the
+  production schedule of the scale-out section) is included for comparison
+  only; it did not run through the chain or ComfyUI. At the same NRMS, the
+  `nq8pp` kernel is about 2.5× faster by device launch (24.52 vs 9.77 ms) and
+  about 2.2× faster by runner run (31.84 vs 14.26 ms).
+- The NRMS is 23-27 times the rounding floor in every row, so the error does
+  not come from rounding the output to BF16. The manifest records the
+  precision: BF16 online-softmax state and block outputs, and BFP16-emulated
+  BF16 matrix multiplies. No amount is attributed to either.
+- Device time depends on host load; these are single-session medians.
+
+### Hardware chain validation (Base v1.0, synthetic input)
+
+All runs use `--image-tokens 4096`, the deterministic synthetic seed-0 input
+and a verified weight-cache hit. Block ranges are end-exclusive, and all three
+runs passed their gates:
+
+| Run | Dispatches | Cached runs | Worst block NRMS | Final NRMS | Gates (block/final) |
+|---|---:|---|---:|---:|---|
+| AIR, blocks 0-1 | 44 | 633.7 and 640.2 ms | 0.19% | 0.19% | 5% / 2% |
+| AIR, blocks 0-28 | 1,232 | 18.60 and 19.93 s | 1.49% (block 13) | 1.04% (block 27) | 5% / 2% |
+| Tiled baseline attention, blocks 0-28 | 2,128 | 54.27 s (one run) | 1.41% (block 13) | 0.97% | 5% / 5% |
+
+The baseline row is the run in the tiling section on the same input. The
+largest absolute error of the AIR chain is 0.1289 at block 13 and 0.3438 at the
+final block; the baseline had 0.1172 and 0.375 at the same blocks. The AIR
+runs are 2.72× (19.93 s) and 2.92× (18.60 s) faster than the baseline run.
+
+**Timing breakdown.** In the 28-block AIR run:
+
+- Blocks take 669.2-818.7 ms each (the first 688.1 ms), against 1.80-2.10 s
+  with baseline attention.
+- Every weight was a resident hit: 1,456 hits, with no allocation and no
+  weight population.
+- The one-time populate/validate step took 140.7 s and the CPU oracle 111.0 s
+  (176 s and 107 s with baseline attention).
+- The staging counters per 28-block pass were:
+
+  | Counter | Baseline attention | AIR |
+  |---|---:|---:|
+  | H2D staging | 38.64 GB | 6.34 GB (6.1× lower) |
+  | D2H staging | 66.71 GB | 15.03 GB (4.4× lower) |
+  | Host operations | 11,669.9 ms | 2,675.8 ms |
+  | Host copy | 154.4 ms | 162.6 ms |
+  | Cache sync | 184.6 ms | 178.7 ms |
+  | Resident hits | 2,576 | 1,456 |
+  | Kernel and wait | 20,494.2 ms | 5,098.7 ms (not comparable) |
+
+  Sizes are decimal gigabytes. The baseline stages score and probability
+  tensors through the host for scale and softmax; the fused kernel has no host
+  softmax stage. An AIR attention call is recorded as one stage: its wall time
+  is a stage time and its Q/K/V and output sizes count in the staging
+  counters, but it adds nothing to the kernel-and-wait counter. That counter
+  is therefore not comparable between the two runs; the staging counters, the
+  host-operation time and the stage profile below are.
+
+### Per-block stage profile
+
+This is one `--profile` run each, in stage wall milliseconds per block. The
+baseline column is the mean of blocks 0 and 1 of a two-block run without the
+CPU oracle (block wall 1,688.7 and 1,702.3 ms); the AIR column is block 0 of a
+one-block run (block wall 639.8 ms). The groups sum to the total up to
+rounding, which is slightly below the separately measured block wall time:
+
+| Group | Baseline attention | AIR |
+|---|---:|---:|
+| Self-attention, NPU | 709.1 | 74.6 (fused) |
+| Self-attention, host scale/softmax | 233.9 | - |
+| Cross-attention, NPU | 103.9 | 21.1 |
+| Cross-attention, host scale/softmax | 26.4 | - |
+| Linear and FFN, NPU | 465.5 | 454.4 |
+| Other host | 125.4 | 88.6 |
+| **Total** | 1,664.3 | 638.6 |
+
+- Attention is 1,073.3 ms (about 64%) of a baseline block, and
+  self-attention alone is 943.0 ms (about 57%). With AIR it is 95.7 ms, about
+  11× lower.
+- BF16 linears are 454.4 ms, about 71%, of an AIR block. This change leaves
+  them unchanged, and they are now the dominant cost.
+
+**512×512 regression.** The AIR chain at 1024 tokens (Base v1.0, synthetic
+input, blocks 0-4, both gates set to 1.0) ran twice from an export of the
+unmodified repository head and twice from the working tree, with one cached
+run each. Every run took 11 dispatches per block (44 in total). The per-block
+max_abs, mean_abs, RMS, reference RMS and NRMS are exactly equal between the
+head export and the working tree in both pairs; the worst is block 3 with
+NRMS 0.8475% (max_abs 0.0547). The cached runs took 568.4 and 572.4 ms for the
+head and 569.0 and 542.0 ms for this change. The second pair also printed the
+imported package path of each run. The AIR artifact directory of these runs
+was not recorded.
+
+### ComfyUI generation (Turbo V1.1)
+
+- **Software.** ComfyUI 0.38.0 (`170594057a22`) with `--cpu`, an isolated base
+  directory and the repository worktree, with host AdaLN, QKV chaining and
+  attention backend `air` (`baseline` for the control run).
+- **Workflow.** Load Anima (BF16) → Load/Attach Anima XDNA Model
+  (`Auto (from MODEL)`) → KSampler, followed by the default FP32 VAE decode.
+- **Settings.** Euler/simple, 4 steps, CFG 1, `EmptyCosmosLatentVideo` at
+  1024×1024 with length 1 and the `qwen_3_06b_base` text encoder. The
+  positive prompt is "a cheerful anime girl under cherry blossoms, detailed
+  illustration, soft daylight" and the negative prompt is "worst quality, low
+  quality, blurry, jpeg artifacts".
+
+| | Baseline attention, cold | AIR, cold | AIR, warm |
+|---|---:|---:|---:|
+| Seed | 700755787614899 | 700755787614899 | 700755787614900 |
+| Prompt executed | 250.8 s | 108.0 s (wall 110.1 s) | 82.3 s (wall 85.1 s) |
+| First sampler step | 66.6 s | 24.8 s | not recorded |
+| Later sampler steps | 53-54 s | 19.9 s (second step) | about 17.6 s |
+
+- "Cold" is the first prompt after the server starts: model loading, cache
+  verification, first-use setup and the VAE decode are included. "Warm" is a
+  second prompt on the same server. No warm baseline prompt was timed.
+- The cold prompt is 2.32× faster and the first step 2.7× faster. Later steps
+  are about 2.7× faster (19.9 vs 53-54 s) and the warm AIR steps about 3.0×
+  faster (17.6 s).
+- About 12 s of the warm prompt lies outside the four sampler steps (82.3 s
+  minus 4 × 17.6 s, an estimate). The FP32 VAE decode is part of it and was
+  not timed separately.
+- Runtime Status after both AIR prompts reported `attention_backend`
+  `air_experimental`, 8 calls, 8 chain runs, 7 resident reuses, 1,232
+  dispatches for the last call, 6.34 GB H2D and 15.03 GB D2H staging, 1,456
+  resident hits and no error. The first call took 24.7 s and the last call
+  17.6 s (chain 17.3 s, preprocess 0.24 s, postprocess 0.014 s).
+- Free system memory dropped to about 1 GiB of 23.6 GiB during sampling
+  (approximate).
+
+**Image comparison.** The cold AIR image and the cold baseline image use the
+same seed. Over the decoded 1024×1024×3 8-bit RGB pixels, the mean absolute
+error is 22.13/255, the RMS error 43.74 (NRMS 23.52%) and the PSNR 15.31 dB;
+4.54% of the pixels are identical. A visual check found both images coherent
+with no tile seams or artifacts: the composition matches and the details
+differ. The [512×512 AIR experiment](#numerical-outcome-not-production-ready)
+measured a fixed-seed latent NRMS of 29.035% and a decoded RGB MAE of
+15.975/255. Those figures are not directly comparable, because the resolution
+and the seed differ. The latent difference at 1024×1024 was not measured.
+
+**Using it in an existing install.** Python must import the updated
+`anima_xdna_poc`; see the tiling section above for the `.pth` and editable
+install caveat. An older copy keeps AIR 512×512-only, and a 1024×1024 prompt
+then raises an error. Put `self4096\` (with `aie.elf` and `manifest.json`)
+next to `self\` and `cross\` in the directory that
+`ANIMA_XDNA_AIR_ATTENTION_DIR` names, and set
+`ANIMA_XDNA_ATTENTION_BACKEND=air` before the server starts; the repository
+default stays baseline. Only a directory with the `nq8pp` `self`, `cross` and
+`self4096` was tested. A directory that mixes pinned-schedule artifacts with
+`self4096` was not.
+
+### Reproduction
+
+Set placeholders only in the current shell; do not commit paths or captures.
+Builds use the compiler environment of the earlier AIR work
+(`$compilerPython`); everything else uses the production Python venv
+(`$python`). `$repo` is this repository, `$airUpstream` the pinned upstream
+attention sources (the generator checks the `attn_npu2.cc` and `zero.cc`
+digests), `$airDir` an artifact directory that already holds the `nq8pp`
+`self\` and `cross\` artifacts (each with `aie.elf` and `manifest.json`),
+`$checkpoint` the Base v1.0 Diffusers transformer safetensors and `$scratch` a
+scratch directory:
+
+```powershell
+$env:XRT_DEV_DIR = "<XRT_SDK_DIR>"
+$env:TRITON_CACHE_DIR = "<TRITON_CACHE_DIR>"
+Set-Location $repo
+$chainMain = 'import sys; from anima_xdna_poc.cli import chain_main; sys.exit(chain_main(sys.argv[1:]))'
+
+# 1. Build self4096 (25-30 s).
+& $compilerPython -m examples.air_attention --keys 4096 --schedule nq8pp `
+  --parallel-heads 2 --source-dir $airUpstream --work-dir "$airDir\self4096"
+
+# 2. AIR chain: all 28 blocks, then a one-block stage profile.
+$env:ANIMA_XDNA_AIR_ATTENTION_DIR = $airDir
+$env:ANIMA_XDNA_ATTENTION_BACKEND = 'air'
+anima-xdna-chain $checkpoint --image-tokens 4096 --max-final-nrms 0.02
+anima-xdna-chain $checkpoint --image-tokens 4096 --start-block 0 --end-block 1 `
+  --max-final-nrms 0.02 --profile
+
+# 3. Baseline-attention chain and a two-block stage profile.
+$env:ANIMA_XDNA_ATTENTION_BACKEND = 'baseline'
+anima-xdna-chain $checkpoint --image-tokens 4096 --runs 1
+anima-xdna-chain $checkpoint --image-tokens 4096 --start-block 0 --end-block 2 `
+  --no-oracle --runs 1 --profile
+
+# 4. 512x512 regression: the head export and the working tree, same arguments.
+git -C $repo archive --format=zip --output "$scratch\head.zip" 571696a2e01a89e525a29bfd2c7670647e3545d7
+Expand-Archive "$scratch\head.zip" "$scratch\head"
+$regression = '--image-tokens', '1024', '--start-block', '0', '--end-block', '4',
+  '--warmups', '0', '--runs', '1', '--max-block-nrms', '1', '--max-final-nrms', '1'
+$env:ANIMA_XDNA_ATTENTION_BACKEND = 'air'
+foreach ($root in "$scratch\head", $repo) {
+  Set-Location $root
+  & $python -c $chainMain $checkpoint @regression
+}
+```
+
+`anima-xdna-chain` runs the installed package, which must be the updated one.
+From an uninstalled checkout, replace it with `& $python -c $chainMain` run
+from `$repo`. Step 4 uses that form so that each working directory supplies its
+own package. Run the step 4 loop twice and compare the printed per-block errors
+between the head export and the working tree.
+
+The kernel benchmark is the private `air_check.py` from the archive below. It
+takes `--artifact <directory> --scale <1 or 3> --out <json>` and uses seed 7,
+with defaults of 2 warmups and 8 runs; the other rows of the table change only
+the artifact and the scale. For ComfyUI, start a fresh isolated `--cpu` server
+for each backend (`baseline`, or `air` with `ANIMA_XDNA_AIR_ATTENTION_DIR` set
+to `$airDir`), submit the workflow above with seed 700755787614899 through the
+`/prompt` API and read the executed time and the sampler step times. On the AIR
+server, submit a second prompt with seed 700755787614900 for the warm time,
+then run a one-node Runtime Status prompt, and compare the two cold PNGs with a
+per-pixel script. The private drivers (`e2e_1024.py` for baseline attention,
+`e2e_air.py` for AIR, `status_air.py` and `compare_outputs.py`) are in the
+archive.
+
+`air4096\implementation.zip` (57 members, SHA-256
+`9cb34de96c27bb9e3fd260f4292d0d6ede03d2531380ce4c92572bce0a0d7bea`, stored in
+the evidence file as `implementation_archive_sha256`) pins the benches and
+builders, the ComfyUI drivers and comparison scripts, the saved chain,
+regression and baseline ComfyUI results with the two PNGs, the validated
+artifact directory, the other two `self4096` builds and the evidence generator.
+The archive is not committed.
+
+### Limits
+
+- **Scope.** One machine and one run per measurement; there is no statistical
+  claim. The AIR chain has two timed 28-block runs and the baseline chain one.
+- **Quality.** AIR remains opt-in and experimental, and BF16 online softmax is
+  not quality-equivalent to the control. The image comparison uses one seed;
+  there is no latent-space or CPU-reference comparison at 1024×1024.
+- **Warm baseline.** No warm baseline-attention prompt was timed, so the warm
+  comparison is AIR against the cold baseline.
+- **Gates.** The 28-block AIR run used the stricter 2% final gate and the
+  baseline run 5%. Both used 5% per block.
+- **Schedule.** Only `nq8pp` was validated through the chain and ComfyUI. The
+  pinned-schedule 4096-key kernel was only benchmarked as a kernel (31.84 vs
+  14.26 ms per runner run), and a mixed artifact directory is untested.
+- **Inputs.** The chain used the synthetic input; there is no real captured
+  4096-token fixture. Base with CFG > 1 was not run: two passes of 18.6-19.9 s
+  imply about 37-40 s per step.
+- **INT8.** The INT8 profile stays 512×512-only and now raises an explicit
+  error at other sizes.
+- **Install.** An existing install needs the updated node copy and a
+  `self4096` artifact in its AIR directory.
+- **Memory.** About 1 GiB of 23.6 GiB remained free during sampling.
+- **Saved logs.** The AIR ComfyUI timings and Runtime Status values come from
+  the driver's console output, which was not saved; the archive pins the
+  drivers and the cold-run PNG. The 4096 warning text was finalized after the
+  hardware chain and ComfyUI runs, so the saved chain stderr shows the earlier
+  wording (a log string only).
+- **What remains.** BF16 linears are about 71% of an AIR block, and 15.03 GB
+  of device-to-host staging per pass remains. This change addresses neither.
+
 ## Public verification ladder
 
 Set placeholders only in the current shell; do not commit paths or captures.
@@ -2968,7 +3335,8 @@ $env:ANIMA_XDNA_CHAIN_FIXTURE = "<CAPTURED_REAL_BLOCK_INPUT_PT>"
 Only Base v1.0, Turbo V1.1, WAI Nova Anima Turbo LoRA Ver V1.0, Radiance
 Turbo Anima v2.0, and the fixed shapes above are validated. Other Preview/Aesthetic
 checkpoints, LoRA/LLLite/ModelPatcher transformer patches, INT8, training,
-resolutions other than 512×512 and 1024×1024 (baseline attention only), other
+resolutions other than 512×512 and 1024×1024 (baseline attention, or AIR with a
+`self4096` artifact; INT8 is 512×512 only), other
 context sizes, and user batches above one are rejected. CFG batch 2 is
 executed sequentially on the single-tenant NPU.
 

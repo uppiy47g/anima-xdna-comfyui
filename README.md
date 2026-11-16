@@ -134,18 +134,31 @@ kernel shapes that are validated at 512×512, so both resolutions share the
 resident weights and the compiled kernels. A block uses 76 dispatches. Row
 counts that do not tile evenly raise an error; there is no CPU fallback.
 
-- **Attention backend.** Use baseline attention: leave
-  `ANIMA_XDNA_ATTENTION_BACKEND` unset or set it to `baseline`. AIR attention
-  and the INT8 profile remain 512×512-only and reject 4096 tokens with an
-  explicit error.
-- **Speed.** On the test machine, one 28-block pass takes about 54 s. A
-  sampler step therefore takes about 55 s with CFG 1 and roughly twice as long
-  with CFG > 1. A 4-step Turbo V1.1 prompt took 251 s, including loading and
-  VAE decoding.
+- **Attention backend.** Baseline attention (leave
+  `ANIMA_XDNA_ATTENTION_BACKEND` unset or set it to `baseline`) is the default
+  and the reference path. Experimental AIR attention
+  (`ANIMA_XDNA_ATTENTION_BACKEND=air`) also accepts 4096 tokens, but needs an
+  additional `self4096` artifact beside the `self` and `cross` ones; see the
+  [AIR attention at 1024×1024](anima_xdna_poc/README.md#air-attention-at-1024x1024)
+  section. The INT8 profile remains 512×512-only and rejects 4096 tokens with
+  an explicit error.
+- **Speed.** With baseline attention on the test machine, one 28-block pass
+  takes about 54 s. A sampler step therefore takes about 55 s with CFG 1 and
+  roughly twice as long with CFG > 1. A 4-step Turbo V1.1 prompt took 251 s,
+  including loading and VAE decoding. With AIR attention, a 28-block pass
+  takes about 19 s (44 dispatches per block instead of 76) and the same
+  prompt took 108 s on the first run and 82 s on a second run with a
+  different seed.
+- **AIR quality.** AIR attention is **not** quality-equivalent. For one fixed
+  seed, the decoded 1024×1024 image differs from the baseline-attention image
+  by MAE 22.1/255 (PSNR 15.3 dB): the composition matches and neither image
+  shows tile seams, but details change. A latent-space comparison at 1024×1024
+  was not measured. Keep baseline attention for quality-sensitive work.
 - **Memory.** Host memory use is much higher than at 512×512. On a 24 GB
   system, about 1 GB remained free during sampling.
 
 See the [1024×1024 tiling section](docs/anima-xdna-reproducibility.md#anima-1024x1024-by-tiling-xdna-dispatches-2026-11-16)
+and the [AIR 4096-key section](docs/anima-xdna-reproducibility.md#air-attention-at-4096-keys-for-1024x1024-2026-11-16)
 of the reproducibility report.
 
 ### Experimental INT8/AIR profile
@@ -183,8 +196,9 @@ The validated configuration is:
 - Anima Base v1.0, Turbo V1.1, the validated WAI Nova Anima Turbo LoRA
   Ver V1.0 full checkpoint, or Radiance Turbo Anima v2.0.
 - Batch 1 and adapted Qwen context `[1, 512, 1024]`, with either 512×512
-  output (1024 image tokens) or, on the standard BF16 path with baseline
-  attention only, 1024×1024 output (4096 image tokens).
+  output (1024 image tokens) or, on the standard BF16 path, 1024×1024 output
+  (4096 image tokens) with baseline attention or the experimental AIR
+  attention that has a `self4096` artifact. The INT8 profile is 512×512 only.
 - BF16 execution weights and block activations; the sampler latent is FP32.
 
 Compatible F16 or F32 Anima sources are normalized to BF16 when the local

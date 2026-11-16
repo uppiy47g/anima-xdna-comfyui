@@ -47,18 +47,25 @@ back to CPU.
 - matching read-only XDNA source: validated Diffusers/native Base for Base,
   or the same native Turbo checkpoint for Turbo
 - batch 1, latent `[1,16,1,64,64]` (512x512 output) or `[1,16,1,128,128]`
-  (1024x1024 output, baseline attention only)
+  (1024x1024 output: baseline attention, or experimental AIR attention with a
+  `self4096` artifact; not the INT8 profile)
 - adapted Qwen context `[1,512,1024]`
 - BF16 model weights and block activations, FP32 sampler latent
 
 At 1024x1024 the wrapper derives the 64x64 patch grid, 4096 image tokens and
 RoPE from the latent. The runtime splits every XDNA dispatch into the
 1024-token kernel shapes used at 512x512. Start ComfyUI with
-`ANIMA_XDNA_ATTENTION_BACKEND` unset or set to `baseline`; AIR attention and
-the INT8 profile reject 4096 tokens with an explicit error. A 4-step,
-CFG 1 Turbo V1.1 1024x1024 prompt completed in 251 s (about 55 s per step).
-Expect roughly twice the step time with CFG > 1, and much higher host memory
-use than at 512x512.
+`ANIMA_XDNA_ATTENTION_BACKEND` unset or set to `baseline` for the reference
+path: a 4-step, CFG 1 Turbo V1.1 1024x1024 prompt completed in 251 s (about
+55 s per step). Experimental AIR attention
+(`ANIMA_XDNA_ATTENTION_BACKEND=air`) also accepts 4096 tokens when the AIR
+artifact directory has a `self4096` artifact beside `self` and `cross`; the
+same prompt then took 108 s on the first run and 82 s on a second run with
+another seed (about 18 s per step). AIR is not quality-equivalent (see
+[AIR attention at 1024x1024](../anima_xdna_poc/README.md#air-attention-at-1024x1024)),
+and a missing `self4096` artifact stops the run with an explicit error. The
+INT8 profile rejects 4096 tokens with an explicit error. Expect roughly twice
+the step time with CFG > 1, and much higher host memory use than at 512x512.
 
 Preview/Aesthetic checkpoints, LoRA patches, LLLite, other
 batch/resolution/context sizes, and training are rejected. The normal ComfyUI

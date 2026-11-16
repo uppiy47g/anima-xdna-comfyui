@@ -17,6 +17,7 @@ import torch
 import torch.nn.functional as F
 
 from . import block, chain
+from .errors import UnsupportedTensor
 from .xdna import _ResidentKernelRunner
 from .fused_middle import FusedMiddle
 from .fused_io import FusedIO
@@ -57,6 +58,16 @@ def bitwise_equal(got, expected):
     if got.dtype != expected.dtype or got.shape != expected.shape:
         return False
     return torch.equal(got.contiguous().view(torch.uint8), expected.contiguous().view(torch.uint8))
+
+
+def require_int8_tokens(inputs):
+    """The INT8 profile's resident kernels and reshapes are fixed at 512x512."""
+    tokens = inputs.hidden_states.shape[1]
+    if tokens != 1024:
+        raise UnsupportedTensor(
+            "The optimized INT8 profile requires 1024 image tokens (512x512); got "
+            f"{tokens}. Unset the profile for other resolutions such as 1024x1024"
+        )
 
 
 def artifact_key(mode, stage):
@@ -454,6 +465,7 @@ class OptimizedInt8Runtime:
         runtime = self
 
         def run_block(*a, **kw):
+            require_int8_tokens(a[2])
             runtime.current = (kw["block_index"], kw["packed_cache"])
             started = time.perf_counter()
             try:

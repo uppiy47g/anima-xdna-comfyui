@@ -36,7 +36,7 @@ class AttentionShape:
 
     def __post_init__(self):
         if (
-            self.keys not in (512, 1024)
+            self.keys not in (512, 1024, 4096)
             or self.heads != 16
             or self.queries != 1024
             or self.depth != 128
@@ -90,26 +90,43 @@ class AIRAttention:
         self.runner = MultiLaunchRunner(str(elf), artifacts["elf_kernel_name"])
 
     def run(self, query, key, value):
+        """Attend ``query`` over the compiled key length.
+
+        The kernel is fixed at ``shape.queries`` rows. A longer query (a multiple
+        of that size) is dispatched in row tiles against the same K/V, which are
+        uploaded once per call and reused by the remaining tiles.
+        """
         import ml_dtypes
         import numpy as np
         import torch
 
         s = self.shape
+        tokens = query.shape[1] if query.ndim == 3 else 0
+        if tokens == 0 or tokens % s.queries:
+            raise ValueError(f"unexpected query shape/dtype: {query.shape}, {query.dtype}")
         for name, tensor, rows in (
-            ("query", query, s.queries), ("key", key, s.keys), ("value", value, s.keys),
+            ("query", query, tokens), ("key", key, s.keys), ("value", value, s.keys),
         ):
             if tensor.shape != (s.heads, rows, s.depth) or tensor.dtype != torch.bfloat16:
                 raise ValueError(f"unexpected {name} shape/dtype: {tensor.shape}, {tensor.dtype}")
             if tensor.device.type != "cpu" or not _all_finite(tensor):
                 raise ValueError(f"{name} must be finite CPU BF16")
-        arrays = [
-            tensor.contiguous().view(torch.uint16).numpy().view(ml_dtypes.bfloat16)
-            for tensor in (query, key, value)
-        ] + [np.empty((s.heads, s.queries, s.depth), dtype=ml_dtypes.bfloat16)]
-        got = self.runner.run(
-            arrays, bo_key="attention", intermediate_indices={3}, output_indices={3},
-        )[3]
-        output = torch.from_numpy(got.view(np.uint16)).view(torch.bfloat16).clone()
+
+        def as_bf16_array(tensor):
+            return tensor.contiguous().view(torch.uint16).numpy().view(ml_dtypes.bfloat16)
+
+        k_array, v_array = as_bf16_array(key), as_bf16_array(value)
+        scratch = np.empty((s.heads, s.queries, s.depth), dtype=ml_dtypes.bfloat16)
+        output = torch.empty(query.shape, dtype=torch.bfloat16)
+        for tile, first in enumerate(range(0, tokens, s.queries)):
+            rows = slice(first, first + s.queries)
+            # The first tile must upload K/V; static reuse is only valid within this call.
+            reuse = {"static_indices": {1, 2}} if tile else {}
+            got = self.runner.run(
+                [as_bf16_array(query[:, rows]), k_array, v_array, scratch],
+                bo_key="attention", intermediate_indices={3}, output_indices={3}, **reuse,
+            )[3]
+            output[:, rows] = torch.from_numpy(got.view(np.uint16)).view(torch.bfloat16)
         if not _all_finite(output):
             raise RuntimeError("AIR attention returned nonfinite output")
         return output
@@ -119,56 +136,89 @@ class AIRAttention:
 
 
 class AIRAttentionBackend:
-    """One persistent self/cross runner pair owned by a chain runtime."""
+    """Lazily opened AIR runners owned by a chain runtime.
+
+    Cross-attention always uses the 512-key ``cross`` artifact. Self-attention
+    uses the artifact compiled for the image token count: ``self`` at 1024
+    tokens (512x512) and ``self4096`` at 4096 tokens (1024x1024). The runners
+    are keyed by key length and opened the first time their resolution is used.
+    """
+
+    CONTEXT_TOKENS = 512
+    SELF_ARTIFACTS = {1024: "self", 4096: "self4096"}
 
     def __init__(self, directory):
         self.directory = Path(directory)
         self.runners = {}
+        self._announced = set()
 
     def validate(self, config, inputs):
+        tokens = inputs.hidden_states.shape[1]
         if (
             config.num_heads != 16 or config.head_dim != 128
-            or inputs.hidden_states.shape[1] != 1024
-            or inputs.encoder_hidden_states.shape[1] != 512
+            or tokens not in self.SELF_ARTIFACTS
+            or inputs.encoder_hidden_states.shape[1] != self.CONTEXT_TOKENS
         ):
             raise UnsupportedTensor(
-                "AIR attention requires batch 1, 1024 image tokens (512x512), "
-                "512 context tokens and 16 heads of depth 128; got "
-                f"{inputs.hidden_states.shape[1]} image tokens. Use "
-                "ANIMA_XDNA_ATTENTION_BACKEND=baseline for other resolutions "
-                "such as 1024x1024"
+                "AIR attention requires batch 1, 1024 or 4096 image tokens "
+                "(512x512 or 1024x1024), 512 context tokens and 16 heads of "
+                f"depth 128; got {tokens} image tokens. Use "
+                "ANIMA_XDNA_ATTENTION_BACKEND=baseline for other resolutions"
             )
         if inputs.attention_mask is not None:
             raise UnsupportedTensor("AIR attention does not support masks; no fallback")
 
-    def _open(self):
-        if self.runners:
-            return
+    def _open(self, image_tokens=1024):
+        wanted = (
+            (image_tokens, self.SELF_ARTIFACTS[image_tokens]),
+            (self.CONTEXT_TOKENS, "cross"),
+        )
+        opened = []
         try:
-            for keys, name in ((1024, "self"), (512, "cross")):
+            for keys, name in wanted:
+                if keys in self.runners:
+                    continue
                 runner = AIRAttention(self.directory / name / "manifest.json")
                 self.runners[keys] = runner
+                opened.append(keys)
                 if runner.shape.keys != keys:
                     raise ValueError(f"AIR {name} manifest has incorrect key length")
         except Exception:
-            self.close()
+            for keys in opened:
+                self.runners.pop(keys).close()
             raise
-        LOGGER.warning(
-            "[Anima XDNA] EXPERIMENTAL AIR attention ACTIVE: tiled QK/scale/softmax/AV, "
-            "17 dispatches/block in the BF16 projection path with QKV chaining when AdaLN "
-            "runs on XDNA; the optimized INT8 profile has a different dispatch count. "
-            "Known fixed-seed latent NRMS vs control 29.035%; not quality-equivalent. "
-            "No silent fallback."
-        )
+        if image_tokens in self._announced:
+            return
+        self._announced.add(image_tokens)
+        if image_tokens == 1024:
+            LOGGER.warning(
+                "[Anima XDNA] EXPERIMENTAL AIR attention ACTIVE: tiled QK/scale/softmax/AV, "
+                "17 dispatches/block in the BF16 projection path with QKV chaining when AdaLN "
+                "runs on XDNA; the optimized INT8 profile has a different dispatch count. "
+                "Known fixed-seed latent NRMS vs control 29.035%; not quality-equivalent. "
+                "No silent fallback."
+            )
+        else:
+            LOGGER.warning(
+                "[Anima XDNA] EXPERIMENTAL AIR attention ACTIVE at %d image tokens "
+                "(1024x1024): self-attention and cross-attention each run as %d 1024-query "
+                "dispatches per block against fully resident K/V. Known single-seed decoded "
+                "RGB MAE vs the baseline-attention control 22.1/255; BF16 online softmax is "
+                "not quality-equivalent. No silent fallback.",
+                image_tokens, image_tokens // 1024,
+            )
 
     def __call__(self, query, key, value):
-        keys = key.shape[1]
-        if keys not in (512, 1024):
-            raise UnsupportedTensor(f"unsupported AIR attention key length: {keys}")
-        self._open()
+        tokens, keys = query.shape[1], key.shape[1]
+        if tokens not in self.SELF_ARTIFACTS or keys not in (self.CONTEXT_TOKENS, tokens):
+            raise UnsupportedTensor(
+                f"unsupported AIR attention shape: {tokens} queries, {keys} keys"
+            )
+        self._open(tokens)
         return self.runners[keys].run(query, key, value)
 
     def close(self):
+        self._announced.clear()
         try:
             for runner in self.runners.values():
                 runner.close()

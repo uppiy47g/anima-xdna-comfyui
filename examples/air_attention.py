@@ -3,6 +3,11 @@
 The device ABI has only Q, K, V and the final output. Scores, unnormalised
 probabilities and online-softmax state stay in core memory. This prototype
 uses pinned MIT-licensed upstream AIE microkernels, not Triton lowering.
+
+Two schedules share the microkernels. ``base`` uses 4 query cores per head
+with a broadcast Q tile. ``nq8pp`` uses 8 query cores per head, direct Q
+tiles, separate K/V core buffers and column-split output buffers; it is the
+schedule used for the 4096-key (1024x1024) self-attention artifact.
 """
 
 import argparse
@@ -27,7 +32,25 @@ SOURCE_SHA256 = {
 }
 
 
+def schedule_name(shape):
+    return "nq8pp" if shape.query_cores == 8 else "base"
+
+
+# Recorded in nq8pp manifests; the optimized INT8 profile checks these fields.
+NQ8PP_VARIANT = {
+    "mode": "full", "kv_buffers": 2, "q_mode": "direct", "out_split": 2,
+    "no_split": True, "q_split": 2, "split_axis": "column",
+}
+
+
 def build_module(shape, kernel_object):
+    """Build the schedule selected by ``shape.query_cores``: 4 base, 8 nq8pp."""
+    if schedule_name(shape) == "nq8pp":
+        return _build_nq8pp_module(shape, kernel_object)
+    return _build_base_module(shape, kernel_object)
+
+
+def _build_base_module(shape, kernel_object):
     from air import api as air
     from air.api.types import bf16, i32
 
@@ -169,6 +192,166 @@ def build_module(shape, kernel_object):
     return launch.build(target="npu2")
 
 
+def _build_nq8pp_module(shape, kernel_object):
+    """16 cores per head pair: direct Q, separate K/V core buffers, column splits.
+
+    Each herd column gets its own half of the Q group and writes its own half
+    of the output through explicit, unsplit memtile buffers. The arithmetic is
+    the base schedule's; only data movement and the core count change.
+    """
+    from air import api as air
+    from air.api.types import bf16, i32
+
+    if shape.parallel_heads != 2:
+        raise ValueError("the nq8pp schedule requires parallel_heads=2")
+    h = shape.parallel_heads
+    nq = shape.query_cores
+    tq, tk, d = shape.query_tile, shape.key_tile, shape.depth
+    qgroup = shape.query_group
+    half = qgroup // 2
+    blocks = shape.keys // tk
+    link = str(Path(kernel_object).resolve())
+    extern = lambda name: air.extern(name, link_with=link)
+    zero_g = extern("zero_fill_g_bf16")
+    zero_o = extern("zero_fill_gp_bf16")
+    zero_l = extern("zero_fill_sp_bf16")
+    init_m = extern("neg_inf_fill_up_bf16")
+    qk = extern("matmul_a_b_bf16")
+    pv = extern("matmul_g_b_bf16")
+    softmax = extern("fused_softmax")
+    rescale_o = extern("mul_r_gp")
+    update_l = extern("accum_sp_r_s")
+    copy_l = air.extern("vector_copy_32elems", link_with=link, scalars=[i32])
+    normalise = extern("div_gp_sp")
+    qin = air.channel("QIn", size=[h, 2])
+    q2l1 = air.channel("Q2L1", size=[h, nq // 2, 2])
+    kin = air.channel("KIn", size=[h])
+    vin = air.channel("VIn", size=[h])
+    kv2l1 = air.channel("KV2L1", size=[h, 1, 1], broadcast_shape=[h, nq // 2, 2])
+    o2l2 = air.channel("O2L2", size=[h, nq // 2, 2])
+    out = air.channel("Output", size=[h, 2])
+    q = air.tensor([shape.heads, shape.queries, d], bf16)
+    k = air.tensor([shape.heads, shape.keys, d], bf16)
+    v = air.tensor([shape.heads, shape.keys, d], bf16)
+    o = air.tensor([shape.heads, shape.queries, d], bf16)
+    k_flat = k.reshape(shape.heads * shape.keys * d)
+    v_flat = v.reshape(shape.heads * shape.keys * d)
+    with air.launch(
+        [range(shape.queries // qgroup), range(shape.heads // h)],
+        name="anima_attention",
+    ) as launch:
+
+        @launch.body
+        def _(query_group, head_group):
+            first_row = query_group * qgroup
+            for local_head in range(h):
+                head = head_group * h + local_head
+                for part in range(2):
+                    qin.put(
+                        q[head, first_row + part * half:first_row + (part + 1) * half, :],
+                        indices=[local_head, part],
+                    )
+                kin.put(
+                    k_flat[head * shape.keys * d:(head + 1) * shape.keys * d]
+                    .reshape(blocks, tk, d),
+                    indices=[local_head],
+                )
+                vin.put(
+                    v_flat[head * shape.keys * d:(head + 1) * shape.keys * d]
+                    .reshape(blocks, tk, d),
+                    indices=[local_head],
+                )
+            with air.segment([range(h), range(1)], name="attention_segment") as seg:
+
+                @seg.body
+                def _(head_local, _unused):
+                    q_parts = [
+                        air.alloc([half, d], bf16, scope=seg.private(), split=False)
+                        for _part in range(2)
+                    ]
+                    k_l2 = air.alloc([tk, d], bf16, scope=seg.private(), split=False)
+                    v_l2 = air.alloc([tk, d], bf16, scope=seg.private(), split=False)
+                    o_parts = [
+                        air.alloc([half, d], bf16, scope=seg.private(), split=False)
+                        for _part in range(2)
+                    ]
+                    for part in range(2):
+                        qin.get(q_parts[part], indices=[head_local, part])
+                    for part in range(2):
+                        for pair in air.parallel(0, nq // 2):
+                            q2l1.put(
+                                q_parts[part][pair * tq:pair * tq + tq, :]
+                                .reshape(tq // 8, 8, d // 8, 8)
+                                .transpose(2, 0, 1, 3),
+                                indices=[head_local, pair, part],
+                            )
+                    for _block in air.sequential(0, blocks):
+                        kin.get(k_l2, indices=[head_local])
+                        kv2l1.put(
+                            k_l2.reshape(tk // 8, 8, d // 8, 8)
+                            .transpose(2, 0, 1, 3),
+                            indices=[head_local, 0, 0],
+                        )
+                        vin.get(v_l2, indices=[head_local])
+                        kv2l1.put(
+                            v_l2.reshape(tk // 8, 8, d // 8, 8)
+                            .transpose(2, 0, 1, 3),
+                            indices=[head_local, 0, 0],
+                        )
+                    with air.herd(
+                        [range(2), range(nq // 2)], name="attention_core",
+                        shape=(2, nq // 2), link_with=link,
+                    ) as herd:
+
+                        @herd.body
+                        def _(column, pair):
+                            q_l1 = air.alloc([tq, d], bf16, scope=herd.private())
+                            k_l1 = air.alloc([tk, d], bf16, scope=herd.private())
+                            v_l1 = air.alloc([tk, d], bf16, scope=herd.private())
+                            scores = air.alloc([tq, tk], bf16, scope=herd.private())
+                            numerator = air.alloc([tq, d], bf16, scope=herd.private())
+                            maximum = air.alloc([tq, 1], bf16, scope=herd.private())
+                            denominator = air.alloc([tq, 1], bf16, scope=herd.private())
+                            new_sum = air.alloc([tq, 1], bf16, scope=herd.private())
+                            correction = air.alloc([tq, 1], bf16, scope=herd.private())
+                            q2l1.get(q_l1, indices=[head_local, pair, column])
+                            zero_o(numerator)
+                            zero_l(denominator)
+                            init_m(maximum)
+                            for _block in air.sequential(0, blocks):
+                                zero_g(scores.reshape(tq * tk))
+                                kv2l1.get(k_l1, indices=[head_local, pair, column])
+                                qk(q_l1, k_l1, scores.reshape(tq * tk))
+                                # Scale is inside the upstream exp2 softmax.
+                                softmax(scores.reshape(tq * tk), maximum, new_sum, correction)
+                                rescale_o(correction, numerator)
+                                kv2l1.get(v_l1, indices=[head_local, pair, column])
+                                pv(scores.reshape(tq * tk), v_l1, numerator)
+                                update_l(denominator, correction, new_sum)
+                                copy_l(0, new_sum, denominator)
+                            normalise(denominator, numerator)
+                            o2l2.put(
+                                numerator.reshape(d // 8, tq // 8, 8, 8)
+                                .transpose(1, 2, 0, 3),
+                                indices=[head_local, pair, column],
+                            )
+                    for part in range(2):
+                        for pair in air.parallel(0, nq // 2):
+                            o2l2.get(
+                                o_parts[part][pair * tq:pair * tq + tq, :],
+                                indices=[head_local, pair, part],
+                            )
+                        out.put(o_parts[part], indices=[head_local, part])
+            for local_head in range(h):
+                head = head_group * h + local_head
+                for part in range(2):
+                    out.get(
+                        o[head, first_row + part * half:first_row + (part + 1) * half, :],
+                        indices=[local_head, part],
+                    )
+    return launch.build(target="npu2")
+
+
 def compile_attention(shape, work_dir, source_dir):
     from triton.backends.amd_triton_npu.driver import _aircc_compile, find_peano_root
 
@@ -212,7 +395,9 @@ def compile_attention(shape, work_dir, source_dir):
     finally:
         os.chdir(previous)
     manifest = {
-        "shape": shape.__dict__, "artifacts": artifacts,
+        "shape": shape.__dict__, "schedule": schedule_name(shape),
+        **({"variant": NQ8PP_VARIANT} if schedule_name(shape) == "nq8pp" else {}),
+        "artifacts": artifacts,
         "module_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
         "kernel_sha256": hashlib.sha256(obj.read_bytes()).hexdigest(),
         "upstream_commit": UPSTREAM_COMMIT,
@@ -230,13 +415,23 @@ def compile_attention(shape, work_dir, source_dir):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--keys", type=int, choices=(512, 1024), required=True)
+    parser.add_argument("--keys", type=int, choices=(512, 1024, 4096), required=True)
     parser.add_argument("--parallel-heads", type=int, choices=(1, 2), default=2)
+    parser.add_argument(
+        "--schedule", choices=("base", "nq8pp"), default="base",
+        help="base: 4 query cores per head; nq8pp: 8 cores, direct Q, split K/V/output buffers",
+    )
     parser.add_argument("--source-dir", type=Path, required=True)
     parser.add_argument("--work-dir", type=Path, required=True)
     args = parser.parse_args()
+    if args.schedule == "nq8pp" and args.parallel_heads != 2:
+        parser.error("--schedule nq8pp requires --parallel-heads 2")
     compile_attention(
-        AttentionShape(args.keys, parallel_heads=args.parallel_heads),
+        AttentionShape(
+            args.keys,
+            query_cores=8 if args.schedule == "nq8pp" else 4,
+            parallel_heads=args.parallel_heads,
+        ),
         args.work_dir, args.source_dir,
     )
 

@@ -23,7 +23,7 @@
     "self_attention_qk": "per query tile: (16 heads, 1024 queries, 1024-key tiles, 256 padded depth)",
     "self_attention_av": "per query tile: 4 inner (key) tiles of 1024, FP32 host accumulation",
     "cross_attention": "per query tile: 512 context keys, unchanged kernel shapes",
-    "air_and_int8": "unchanged and 512x512-only; AIR rejects 4096 tokens with an explicit error naming the baseline backend, and INT8 requires AIR",
+    "air_and_int8": "at the time of this change: unchanged and 512x512-only; AIR rejects 4096 tokens with an explicit error naming the baseline backend, and INT8 requires AIR (AIR at 4096 tokens was added afterwards, see air-attention-4096-keys.json; INT8 stays 512x512-only)",
     "fallback": "none; row counts above 1024 that are not a multiple of 1024 raise UnsupportedTensor"
   },
   "chain_validation_base_v1_0": [
@@ -239,7 +239,7 @@
   "limits": [
     "One machine, one run per measurement; no statistical claim.",
     "Base with CFG > 1 at 1024x1024 was not run end to end; two chain passes per step imply about 110 s per step.",
-    "AIR attention and the INT8 profile are not available at 1024x1024.",
+    "At the time of this change AIR attention and the INT8 profile were not available at 1024x1024; AIR attention at 1024x1024 was added afterwards (air-attention-4096-keys.json) and the INT8 profile is still 512x512-only.",
     "Peak host memory is much higher than at 512x512; about 1.1 GiB of 23.6 GiB remained free during sampling."
   ]
 }
