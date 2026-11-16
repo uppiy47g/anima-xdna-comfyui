@@ -1,19 +1,24 @@
 import gc
+import importlib
 import json
 import sys
 import types
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import mock
 
 import torch
+from safetensors import safe_open
+from safetensors.torch import save_file
 
 from anima_xdna_poc.checkpoint_schema import NATIVE_NAMES, canonical_keys
 from comfyui_xdna_nodes.model_wrapper import (
     ATTACHMENT_KEY,
     AUTO_CHECKPOINT,
     LoadAnimaBF16,
+    LoadAnimaXDNACache,
     AnimaXDNARuntimeStatus,
     LoadAttachAnimaXDNAModel,
     ModelSourceProvenance,
@@ -61,15 +66,20 @@ FakeAnimaParameters = type(
 
 
 class FakePatcher:
-    def __init__(self):
-        self.model = FakeBaseModel()
+    def __init__(self, model=None, load_device=None, offload_device=None):
+        self.model = model if model is not None else FakeBaseModel()
+        self.load_device = load_device or torch.device("cpu")
+        self.offload_device = offload_device or torch.device("cpu")
         self.patches = {}
+        self.hook_patches = {}
+        self.weight_wrapper_patches = {}
+        self.injections = {}
         self.model_options = {"transformer_options": {}}
         self.wrappers = {}
         self.attachments = {}
 
     def clone(self):
-        clone = FakePatcher()
+        clone = type(self)(load_device=self.load_device, offload_device=self.offload_device)
         clone.model = self.model
         clone.patches = self.patches.copy()
         clone.model_options = {
@@ -86,6 +96,9 @@ class FakePatcher:
             for key, value in self.attachments.items()
         }
         return clone
+
+    def pre_run(self):
+        pass
 
     def add_wrapper_with_key(self, kind, key, wrapper):
         self.wrappers.setdefault(kind, {}).setdefault(key, []).append(wrapper)
@@ -212,6 +225,227 @@ class ComfyUIXDNAWrapperTests(unittest.TestCase):
                 sys.modules.pop(name, None)
             else:
                 sys.modules[name] = value
+
+    @contextmanager
+    def cache_loader_module(self):
+        comfy = sys.modules["comfy"]
+        detection = types.ModuleType("comfy.model_detection")
+        patcher = types.ModuleType("comfy.model_patcher")
+        patcher.ModelPatcher = FakePatcher
+        folder_paths = types.ModuleType("folder_paths")
+        name = "comfyui_xdna_nodes.cache_loader"
+        previous = sys.modules.pop(name, None)
+        try:
+            with (
+                mock.patch.dict(
+                    sys.modules,
+                    {
+                        "comfy.model_detection": detection,
+                        "comfy.model_patcher": patcher,
+                        "folder_paths": folder_paths,
+                    },
+                ),
+                mock.patch.object(comfy, "model_detection", detection, create=True),
+                mock.patch.object(
+                    comfy.model_management, "get_torch_device",
+                    return_value=torch.device("cpu"), create=True,
+                ),
+                mock.patch.object(
+                    comfy.model_management, "unet_manual_cast",
+                    return_value=torch.float32, create=True,
+                ),
+            ):
+                yield importlib.import_module(name)
+        finally:
+            sys.modules.pop(name, None)
+            if previous is not None:
+                sys.modules[name] = previous
+
+    def test_cache_loader_never_reads_or_constructs_comfy_block_weights(self):
+        class HostAnima(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.blocks = torch.nn.ModuleList()
+                self.host = torch.nn.Linear(1, 1, bias=False, dtype=torch.bfloat16)
+                self.register_buffer("frequencies", torch.tensor([3.0]), persistent=False)
+
+        HostAnima.__name__ = "Anima"
+        with TemporaryDirectory() as temporary, self.cache_loader_module() as loader:
+            config = types.SimpleNamespace(
+                unet_config={
+                    "image_model": "anima", "num_blocks": 28, "model_channels": 2048,
+                    "in_channels": 16, "out_channels": 16, "num_heads": 16,
+                },
+                quant_config=None,
+                supported_inference_dtypes=[torch.bfloat16, torch.float32],
+                set_inference_dtype=mock.Mock(),
+            )
+
+            def construct(*args, **kwargs):
+                self.assertEqual(config.unet_config["num_blocks"], 0)
+                return types.SimpleNamespace(diffusion_model=HostAnima())
+
+            config.get_model = construct
+            loader.comfy.model_detection.model_config_from_unet = mock.Mock(return_value=config)
+            path = Path(temporary, "model.safetensors")
+            for dtype in (torch.bfloat16, torch.float16, torch.float32):
+                with self.subTest(dtype=dtype):
+                    tensors = {
+                        f"net.{key}": value.detach().to(dtype)
+                        for key, value in fake_anima_parameters(dtype).items()
+                        if key.startswith("blocks.")
+                    }
+                    tensors["net.host.weight"] = torch.tensor([[1.25]], dtype=dtype)
+                    save_file(tensors, path)
+                    reads = []
+
+                    @contextmanager
+                    def guarded_open(*args, **kwargs):
+                        with safe_open(*args, **kwargs) as source:
+                            proxy = mock.Mock(wraps=source)
+
+                            def get_tensor(key):
+                                self.assertNotIn(".blocks.", key)
+                                reads.append(key)
+                                return source.get_tensor(key)
+
+                            proxy.get_tensor.side_effect = get_tensor
+                            yield proxy
+
+                    with mock.patch.object(loader, "safe_open", guarded_open):
+                        model = loader._load_host_model(path)
+                    self.assertEqual(reads, ["net.host.weight"])
+                    self.assertEqual(list(model.diffusion_model.named_parameters())[0][0], "host.weight")
+                    self.assertEqual(model.diffusion_model.host.weight.item(), 1.25)
+                    self.assertEqual(model.diffusion_model.host.weight.dtype, torch.bfloat16)
+                    self.assertEqual(model.diffusion_model.frequencies.item(), 3.0)
+                    config.set_inference_dtype.assert_called_with(
+                        torch.bfloat16, torch.float32, device=torch.device("cpu")
+                    )
+                    self.assertEqual(len(model.diffusion_model.blocks), 28)
+                    with self.assertRaisesRegex(RuntimeError, "CPU fallback is unavailable"):
+                        model.diffusion_model.blocks[0](torch.zeros(1))
+                    meta_sd = loader.comfy.model_detection.model_config_from_unet.call_args.args[0]
+                    self.assertTrue(all(value.is_meta for value in meta_sd.values()))
+                    tensors["net.host.weight"] = torch.zeros(2, 1, dtype=dtype)
+                    save_file(tensors, path)
+                    with self.assertRaisesRegex(RuntimeError, "host-layer shape mismatch"):
+                        loader._load_host_model(path)
+                    tensors["net.host.weight"] = torch.zeros(1, 1, dtype=dtype)
+                    tensors["net.unexpected.weight"] = torch.zeros(1, dtype=dtype)
+                    save_file(tensors, path)
+                    with self.assertRaisesRegex(RuntimeError, "host-layer checkpoint mismatch"):
+                        loader._load_host_model(path)
+                    del tensors["net.host.weight"]
+                    del tensors["net.unexpected.weight"]
+                    save_file(tensors, path)
+                    with self.assertRaisesRegex(RuntimeError, "host-layer checkpoint mismatch"):
+                        loader._load_host_model(path)
+
+    def test_cache_backed_runtime_verifies_cache_and_reports_only_host_storage(self):
+        runtime = SharedRuntime(Path("fixture.safetensors"))
+        diffusion = FakeAnimaParameters({
+            "host.weight": torch.nn.Parameter(torch.ones(2, dtype=torch.bfloat16)),
+        })
+        chain = mock.Mock()
+        chain.source_identity = {"schema": "native-net", "block_fingerprint": "raw"}
+        chain.execution_identity = {
+            "source_dtypes": ["BF16"], "block_fingerprint": "verified",
+        }
+        chain.base_execution_identity = chain.execution_identity
+        chain.cache_status = None
+        with (
+            mock.patch(
+                "comfyui_xdna_nodes.model_wrapper.AnimaXDNAChainRuntime", return_value=chain,
+            ),
+            mock.patch(
+                "comfyui_xdna_nodes.model_wrapper.fingerprint_model_blocks",
+                side_effect=AssertionError("No second block MODEL should be fingerprinted"),
+            ),
+        ):
+            runtime.prepare(diffusion, cache_backed=True)
+        chain.prepare_weight_cache.assert_called_once()
+        status = runtime.snapshot()
+        self.assertEqual(status["model_fingerprint"], "verified")
+        self.assertEqual(status["model_block_parameter_bytes"], 0)
+        self.assertEqual(status["model_nonblock_parameter_bytes"], 4)
+        self.assertTrue(status["model_block_parameters_omitted"])
+        self.assertFalse(status["model_block_parameters_released"])
+        runtime.close()
+        chain.prepare_weight_cache.side_effect = RuntimeError("cache integrity failure")
+        with (
+            mock.patch(
+                "comfyui_xdna_nodes.model_wrapper.AnimaXDNAChainRuntime", return_value=chain,
+            ),
+            self.assertRaisesRegex(RuntimeError, "cache integrity failure"),
+        ):
+            runtime.prepare(diffusion, cache_backed=True)
+        self.assertEqual(chain.close.call_count, 2)
+
+    def test_cache_loader_clones_keep_guards_and_shared_runtime(self):
+        with self.cache_loader_module() as loader:
+            runtime = SharedRuntime(Path("fixture.safetensors"))
+            model = loader.CacheBackedModelPatcher()
+            model.set_attachments(ATTACHMENT_KEY, RuntimeAttachment(runtime))
+            clone = model.clone()
+            self.assertIs(type(clone), type(model))
+            self.assertIs(clone.model, model.model)
+            self.assertEqual(runtime.snapshot()["reference_count"], 2)
+            clone.pre_run()
+            for action, message in (
+                (lambda: clone.add_patches({}), "LoRA/weight patches"),
+                (lambda: clone.add_hook_patches(None, {}), "weight hooks"),
+                (lambda: clone.model_state_dict_for_saving(), "execution-only MODEL"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, message):
+                    action()
+            model.get_attachment(ATTACHMENT_KEY).cleanup()
+            with self.assertRaisesRegex(RuntimeError, "was unloaded"):
+                model.pre_run()
+            clone.pre_run()
+            clone.get_attachment(ATTACHMENT_KEY).cleanup()
+            self.assertEqual(runtime.snapshot()["state"], "closed")
+
+    def test_cache_loader_closes_on_source_change_and_rejects_gpu(self):
+        with self.cache_loader_module() as loader:
+            loader.folder_paths.get_full_path_or_raise = mock.Mock(return_value="fixture.safetensors")
+            with (
+                mock.patch.object(loader, "_load_host_model", return_value=FakeBaseModel()),
+                mock.patch.object(loader, "_file_identity_token", side_effect=["before", "after"]),
+                mock.patch.object(SharedRuntime, "prepare"),
+                mock.patch.object(SharedRuntime, "close") as close,
+                self.assertRaisesRegex(RuntimeError, "changed while loading"),
+            ):
+                loader.load_cache_backed_model("fixture.safetensors")
+            close.assert_called_once()
+            loader.comfy.model_management.get_torch_device.return_value = torch.device("cuda")
+            with self.assertRaisesRegex(RuntimeError, "requires ComfyUI --cpu"):
+                loader.load_cache_backed_model("fixture.safetensors")
+
+    def test_cache_model_cannot_be_attached_again(self):
+        model = FakePatcher()
+        model.model.diffusion_model.xdna_cache_backed = True
+        with self.assertRaisesRegex(RuntimeError, "already provides an attached MODEL"):
+            LoadAttachAnimaXDNAModel().attach(model, AUTO_CHECKPOINT, False)
+
+    def test_cache_loader_node_cache_tracks_source_and_options(self):
+        with mock.patch.object(LoadAnimaBF16, "IS_CHANGED", return_value="source-a"):
+            initial = LoadAnimaXDNACache.IS_CHANGED("fixture.safetensors", False)
+            self.assertEqual(
+                initial, LoadAnimaXDNACache.IS_CHANGED("fixture.safetensors", False)
+            )
+            for options in (
+                {"rebuild_cache": True},
+                {"rebuild_cache": False, "cache_dir": "different-cache"},
+                {"rebuild_cache": False, "qkv_chaining": False},
+            ):
+                self.assertNotEqual(
+                    initial, LoadAnimaXDNACache.IS_CHANGED("fixture.safetensors", **options)
+                )
+        with mock.patch.object(LoadAnimaBF16, "IS_CHANGED", return_value="source-b"):
+            self.assertNotEqual(
+                initial, LoadAnimaXDNACache.IS_CHANGED("fixture.safetensors", False)
+            )
 
     def test_attach_clones_model_and_registers_diffusion_wrapper(self):
         with TemporaryDirectory() as temporary:

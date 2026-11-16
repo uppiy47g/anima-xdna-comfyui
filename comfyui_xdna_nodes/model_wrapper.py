@@ -96,6 +96,7 @@ class RuntimeDiagnostics:
     model_nonblock_parameter_bytes: int = 0
     model_fp32_block_memory_warning: Optional[str] = None
     model_block_parameters_released: bool = False
+    model_block_parameters_omitted: bool = False
     model_block_memory_policy: str = "retain_shared_modelpatcher_parameters"
 
 
@@ -165,10 +166,14 @@ class SharedRuntime:
                 0,
             )
 
-    def prepare(self, diffusion_model) -> None:
+    def prepare(self, diffusion_model, *, cache_backed: bool = False) -> None:
         with self._lock:
             if self._runtime is not None:
                 return
+            if cache_backed and (
+                self.effective_tensor_provider is not None or self.lora_patch_count
+            ):
+                raise RuntimeError("Cache-backed MODEL cannot use live LoRA patches")
             started = time.perf_counter()
             runtime = AnimaXDNAChainRuntime(
                 self.checkpoint,
@@ -190,8 +195,14 @@ class SharedRuntime:
                     raise RuntimeError(
                         "packed cache did not expose BF16 execution identity"
                     )
+                base_execution_identity = runtime.base_execution_identity
+                if not isinstance(base_execution_identity, dict):
+                    base_execution_identity = execution_identity
                 identity_started = time.perf_counter()
-                if self.base_model_fingerprint is None:
+                if cache_backed:
+                    base_model_fingerprint = base_execution_identity["block_fingerprint"]
+                    model_schema = "cache-backed-anima"
+                elif self.base_model_fingerprint is None:
                     base_model_fingerprint, model_schema = (
                         fingerprint_model_blocks(diffusion_model)
                     )
@@ -202,13 +213,6 @@ class SharedRuntime:
                     time.perf_counter() - identity_started
                 ) * 1000
                 source_fingerprint = identity["block_fingerprint"]
-                base_execution_identity = runtime.base_execution_identity
-                if not isinstance(base_execution_identity, dict):
-                    base_execution_identity = execution_identity
-                if base_execution_identity is None:
-                    raise RuntimeError(
-                        "packed cache did not expose base execution identity"
-                    )
                 source_execution_fingerprint = base_execution_identity[
                     "block_fingerprint"
                 ]
@@ -221,7 +225,11 @@ class SharedRuntime:
                         "Base or Turbo checkpoint; no dispatch was attempted."
                     )
                 model_fingerprint = execution_identity["block_fingerprint"]
-                storage_profile = _model_storage_profile(diffusion_model)
+                storage_profile = _model_storage_profile(
+                    diffusion_model, cache_backed=cache_backed
+                )
+                if cache_backed and storage_profile["block_parameter_count"]:
+                    raise RuntimeError("Cache-backed MODEL must not allocate block parameters")
             except BaseException:
                 self.effective_tensor_provider = None
                 runtime.effective_tensor_provider = None
@@ -262,6 +270,11 @@ class SharedRuntime:
             self.diagnostics.model_nonblock_parameter_bytes = storage_profile[
                 "nonblock_parameter_bytes"
             ]
+            if cache_backed:
+                self.diagnostics.model_block_parameters_omitted = True
+                self.diagnostics.model_block_memory_policy = (
+                    "cache_backed_no_comfy_block_parameters"
+                )
             fp32_bytes = storage_profile["block_dtype_bytes"].get("float32", 0)
             if fp32_bytes:
                 self.diagnostics.model_fp32_block_memory_warning = (
@@ -983,12 +996,15 @@ def _effective_lora_provider(model):
     )
 
 
-def _model_storage_profile(diffusion_model) -> dict[str, Any]:
+def _model_storage_profile(diffusion_model, *, cache_backed: bool = False) -> dict[str, Any]:
     parameters = dict(diffusion_model.named_parameters())
-    schema = detect_checkpoint_schema(parameters.keys())
-    block_parameter_names = {
-        schema.canonical_to_source[key] for key in canonical_keys()
-    }
+    if cache_backed:
+        block_parameter_names = {name for name in parameters if name.startswith("blocks.")}
+    else:
+        schema = detect_checkpoint_schema(parameters.keys())
+        block_parameter_names = {
+            schema.canonical_to_source[key] for key in canonical_keys()
+        }
     block_dtype_numel: Counter[str] = Counter()
     block_dtype_bytes: Counter[str] = Counter()
     block_parameter_count = 0
@@ -1241,6 +1257,11 @@ class LoadAttachAnimaXDNAModel:
     ):
         attach_started = time.perf_counter()
         _validate_patcher(model)
+        if getattr(model.model.diffusion_model, "xdna_cache_backed", False):
+            raise RuntimeError(
+                "Load Anima XDNA (Cache-backed) already provides an attached MODEL; "
+                "connect it directly to the sampler."
+            )
         path = _resolve_attach_checkpoint(model, checkpoint)
         if not path.is_file():
             raise RuntimeError(f"Anima checkpoint does not exist: {path}")
@@ -1341,6 +1362,48 @@ class LoadAttachAnimaXDNAModel:
         return patched, json.dumps(runtime.snapshot(), indent=2)
 
 
+class LoadAnimaXDNACache:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                **LoadAnimaBF16.INPUT_TYPES()["required"],
+                "rebuild_cache": ("BOOLEAN", {"default": False}),
+            },
+            "optional": {
+                "cache_dir": ("STRING", {"default": ""}),
+                "qkv_chaining": ("BOOLEAN", {"default": True}),
+            },
+        }
+
+    RETURN_TYPES = ("MODEL", "STRING")
+    RETURN_NAMES = ("model", "runtime_status")
+    FUNCTION = "load"
+    CATEGORY = "Anima XDNA 2"
+
+    @classmethod
+    def IS_CHANGED(cls, unet_name, rebuild_cache, cache_dir="", qkv_chaining=True):
+        return json.dumps(
+            {
+                "source": LoadAnimaBF16.IS_CHANGED(unet_name),
+                "options": LoadAttachAnimaXDNAModel.IS_CHANGED(
+                    AUTO_CHECKPOINT, rebuild_cache, cache_dir, qkv_chaining
+                ),
+            },
+            sort_keys=True,
+        )
+
+    def load(self, unet_name, rebuild_cache=False, cache_dir="", qkv_chaining=True):
+        from .cache_loader import load_cache_backed_model
+
+        model = load_cache_backed_model(
+            unet_name, rebuild_cache, cache_dir, qkv_chaining
+        )
+        return model, json.dumps(
+            model.get_attachment(ATTACHMENT_KEY).runtime.snapshot(), indent=2
+        )
+
+
 class AnimaXDNARuntimeStatus:
     @classmethod
     def INPUT_TYPES(cls):
@@ -1391,6 +1454,7 @@ class AnimaXDNAUnload:
 
 NODE_CLASS_MAPPINGS = {
     "LoadAnimaBF16": LoadAnimaBF16,
+    "LoadAnimaXDNACache": LoadAnimaXDNACache,
     "LoadAttachAnimaXDNAModel": LoadAttachAnimaXDNAModel,
     "AnimaXDNARuntimeStatus": AnimaXDNARuntimeStatus,
     "AnimaXDNAUnload": AnimaXDNAUnload,
@@ -1398,6 +1462,7 @@ NODE_CLASS_MAPPINGS = {
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "LoadAnimaBF16": "Load Anima (BF16)",
+    "LoadAnimaXDNACache": "Load Anima XDNA (Cache-backed)",
     "LoadAttachAnimaXDNAModel": "Load/Attach Anima XDNA Model",
     "AnimaXDNARuntimeStatus": "Anima XDNA Runtime Status",
     "AnimaXDNAUnload": "Unload Anima XDNA Runtime",

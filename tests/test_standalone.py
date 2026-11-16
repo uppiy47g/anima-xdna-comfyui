@@ -30,6 +30,7 @@ class StandaloneTests(unittest.TestCase):
                 set(module.NODE_CLASS_MAPPINGS),
                 {
                     "LoadAnimaBF16",
+                    "LoadAnimaXDNACache",
                     "LoadAttachAnimaXDNAModel",
                     "AnimaXDNARuntimeStatus",
                     "AnimaXDNAUnload",

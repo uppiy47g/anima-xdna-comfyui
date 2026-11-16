@@ -126,6 +126,24 @@ contexts and XRT buffers remain resident across denoising steps. The regular
 launcher uses baseline attention by default. Direct AIR attention is a
 separate experimental opt-in.
 
+#### Cache-backed MODEL loader
+
+**Load Anima XDNA (Cache-backed)** can replace **Load Anima (BF16)** plus
+**Load/Attach Anima XDNA Model**. It loads only the host layers and executes
+the 28 blocks from the verified packed-weight cache, avoiding the duplicate
+ComfyUI block Parameters. Connect its MODEL directly to the sampler in
+ComfyUI `--cpu`. The original checkpoint is still required. This is not
+INT8 conversion; BF16 weights and the existing CPU compute policy are retained.
+
+Live LoRAs/weight patches and saving this execution-only MODEL as a checkpoint
+are unsupported; use the original workflow for them. See the
+[cache-backed loader guide](comfyui_xdna_nodes/README.md#cache-backed-execution-only-loader).
+
+In one matched 512×512 Turbo/AIR run, peak process working set fell from
+15.36 to 11.76 GiB (3.60 GiB / 23.4% less), with bitwise-identical latents
+and pixel-identical images. This is not a 1024×1024 measurement; see the
+[memory experiment](docs/anima-xdna-reproducibility.md#cache-backed-model-loader-and-512x512-memory-2026-11-17).
+
 #### 1024×1024 output
 
 The standard path also accepts a 1024×1024 latent (`[1,16,1,128,128]`, 4096

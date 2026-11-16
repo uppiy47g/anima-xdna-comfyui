@@ -139,6 +139,46 @@ starting ComfyUI. The packed cache defaults to
 
 ## Nodes
 
+### Cache-backed, execution-only loader
+
+**Load Anima XDNA (Cache-backed)** (`LoadAnimaXDNACache`) is an opt-in
+replacement for the **Load Anima (BF16)** + **Load/Attach Anima XDNA Model**
+pair. Select a native Anima safetensors checkpoint and connect its `MODEL`
+directly to the sampler. Do not attach it again. It requires ComfyUI `--cpu`;
+attention selection and the existing runtime environment are unchanged.
+
+The loader reads tensor shapes without materializing block tensors, constructs
+only the host layers, and loads their BF16 weights. The 28 transformer blocks
+execute from the existing verified packed-weight cache, built automatically
+when absent. Input/time embeddings, the LLM adapter, and final projection stay
+on the host, using ComfyUI's normal CPU compute-dtype policy. The original
+checkpoint is still required and is never modified. The cache is not a
+standalone checkpoint or a new quantization format.
+
+This MODEL has no ComfyUI block Parameters, not a full MODEL whose weights
+were deleted after loading. **Anima XDNA Runtime Status** reports
+`model_block_parameters_omitted=true`, zero block Parameter bytes, and the
+`cache_backed_no_comfy_block_parameters` memory policy. XRT weight buffers and
+the mapped cache remain separate allocations; do not add their byte counts
+to process memory counters.
+
+Normal MODEL clones share the host module and reference-counted XDNA runtime.
+**Unload Anima XDNA Runtime** releases one attachment; the final reference
+closes the cache and device resources. Reload the MODEL before using an
+explicitly unloaded attachment again.
+
+Live LoRA/weight patches, weight hooks, GPU placement, and checkpoint saving
+or merging are rejected rather than silently ignoring missing blocks. Use
+the original loader/LoRA/attach workflow below when those weight operations
+are needed. Full checkpoints that already contain merged weights can be
+selected normally. This loader does not change AIR's numerical limitations.
+
+The [512x512 memory experiment](../docs/anima-xdna-reproducibility.md#cache-backed-model-loader-and-512x512-memory-2026-11-17)
+measured a 3.60 GiB reduction in peak process working set, with identical
+latents and pixels. A 1024x1024 memory comparison was not run.
+
+### Original loader and attach workflow
+
 1. Load the native Anima MODEL with **Load Anima (BF16)**. Its selector
    includes both `diffusion_models:` transformer files and `checkpoints:`
    full checkpoints; unqualified legacy workflow values still resolve as

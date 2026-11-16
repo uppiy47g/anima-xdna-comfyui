@@ -3291,6 +3291,136 @@ The archive is not committed.
 - **What remains.** BF16 linears are about 71% of an AIR block, and 15.03 GB
   of device-to-host staging per pass remains. This change addresses neither.
 
+## Cache-backed MODEL loader and 512x512 memory (2026-11-17)
+
+**Result.** The new opt-in **Load Anima XDNA (Cache-backed)** node avoids
+allocating ComfyUI's duplicate 28-block Parameters. In a paired 512x512
+Turbo V1.1 experiment, peak process working set fell from **15.357 GiB to
+11.757 GiB**, a **3.600 GiB (23.44%)** reduction. Both first and repeat
+generations matched the original loader's latents bitwise and its decoded
+RGB pixels exactly. This is a loader/storage change, not INT8 quantization.
+Evidence: [`evidence/cache-backed-loader-512-memory.json`](evidence/cache-backed-loader-512-memory.json).
+
+### Construction and safety
+
+The loader uses safetensors shape/dtype metadata to detect the native Anima
+architecture without creating block tensors. It constructs ComfyUI's Anima
+with zero host transformer blocks, loads only the 125 host Parameters, then
+installs 28 parameter-free block sentinels. A sentinel raises if executed:
+the existing diffusion wrapper must run those blocks from the verified XDNA
+cache. No full ComfyUI block MODEL is created and subsequently stripped, and
+no shared upstream MODEL is mutated.
+
+The existing cache builder and verifier still check source fingerprints,
+packed payloads and architecture; a missing cache is built using the normal
+streaming path. The original source checkpoint remains required. Host layers
+and cache are loaded from the same selected source, whose file identity is
+checked before and after preparation. Missing/unexpected host tensors,
+wrong shapes, extra block tensors, unsupported architectures and changed
+source files raise explicit errors.
+
+The patch/time embeddings, LLM adapter and final projection remain BF16
+Parameters. Their computation follows ComfyUI's `unet_manual_cast` policy,
+just like **Load Anima (BF16)**: FP32 host computation on this CPU. An initial
+prototype incorrectly set the compute dtype to `None`, causing output
+differences. That version was rejected; the measurements below are from the
+corrected implementation and a fresh matched pair.
+
+Normal MODEL clones share host layers and a reference-counted XDNA attachment.
+The loader refuses live LoRA/weight patches, weight hooks, GPU placement and
+checkpoint export/merging. Use the original loader/LoRA/attach workflow for
+live patches, or select a full checkpoint with already merged weights.
+Re-attaching this MODEL is rejected; it already contains the wrapper.
+Explicit unload releases an attachment, and the final reference closes cache
+and device resources. An unloaded attachment cannot sample again without
+reloading. The existing loader is unchanged.
+
+### Measurement
+
+Each variant ran in a separate fresh standalone ComfyUI Python process,
+invoking the actual loader, CLIP, KSampler and VAEDecode nodes. This was
+**not** an HTTP server/UI prompt-executor measurement. Each process generated
+two images sequentially with the same seed. The packed disk cache was a
+verified hit in both processes; "first" does not mean a cold disk-cache build.
+
+- Ryzen AI 9 365, XDNA 2 `npu2`, 25,359,659,008 physical RAM bytes.
+- ComfyUI `170594057a22673349ddf0a3d88624b7fa5865bb`, Python 3.13.9,
+  PyTorch `2.14.1+cpu`, XRT SDK 2.21.75.
+- Turbo V1.1, 512x512, 4 steps, Euler/simple, CFG 1, seed
+  `700755787614899`; Qwen 3 0.6B and the default FP32 Qwen Image VAE.
+- BF16 AIR `nq8pp` self/cross artifacts, host AdaLN, QKV chaining,
+  10 PyTorch intra-op threads and one inter-op thread. No INT8 profile,
+  GEMM-layout override or BF16 VAE patch.
+- Positive: "a cheerful anime girl under cherry blossoms, detailed
+  illustration, soft daylight". Negative: "worst quality, low quality,
+  blurry, jpeg artifacts".
+
+Windows `GetProcessMemoryInfo` supplied process-lifetime peak working set and
+peak private commit through final unload/GC. Current working set,
+`PrivateUsage` and system available physical memory were also sampled at a
+requested 50 ms interval; scheduling can lengthen the actual interval.
+
+| Metric | Original BF16 loader + attach | Cache-backed loader |
+|---|---:|---:|
+| ComfyUI block Parameter bytes | 3,875,565,568 | 0 |
+| ComfyUI non-block Parameter bytes | 306,572,288 | 306,572,288 |
+| Peak working set, bytes | 16,489,283,584 | 12,624,310,272 |
+| Peak working set, GiB | 15.357 | 11.757 |
+| Peak private commit, bytes | 16,061,812,736 | 9,940,877,312 |
+| Peak private commit, GiB | 14.959 | 9.258 |
+| First sampler, seconds | 22.152 | 20.425 |
+| Repeat sampler, seconds | 17.119 | 16.473 |
+
+Working set is resident RAM; private commit is a different OS quantity.
+The 5.701 GiB private-commit reduction includes allocation/lifetime effects
+and must not be presented as the amount of physical RAM saved. XRT BOs,
+mapped cache bytes and Parameter bytes are separate descriptions of memory:
+do not add them to the OS counters or to one another.
+
+Both variants ran four chains per image (eight total), with 308 dispatches
+per chain and no additional weight population in the last resident call.
+Within each process, the repeat latent was also bitwise identical to the
+first. Across loaders, both comparisons had latent max error/NRMS zero and
+RGB MAE zero. Explicit runtime unload closed both runtimes; after model GC,
+private commit was about 1.63 GiB (original) / 1.74 GiB (cache-backed).
+
+These are single observations, not a performance benchmark. Equal outputs
+establish parity with the **existing AIR path**, not equivalence to baseline
+attention or a CPU-only model.
+
+### Use and reproduction
+
+Update the node package actually imported by ComfyUI, then restart with
+`--cpu`. Replace the original loader/attach pair with
+**Load Anima XDNA (Cache-backed)** (`LoadAnimaXDNACache`), select the same
+native checkpoint, and connect `MODEL` directly to KSampler.
+`rebuild_cache`, `cache_dir` and `qkv_chaining` retain their existing meanings.
+The Runtime Status node reports `model_block_parameters_omitted=true`,
+zero block Parameter bytes and policy `cache_backed_no_comfy_block_parameters`.
+
+To reproduce the pair, use the same environment/artifacts and settings
+above, and separate fresh processes. In one, call
+`LoadAnimaBF16.load` followed by `LoadAttachAnimaXDNAModel.attach`; in the
+other, call `LoadAnimaXDNACache.load`. Use the real `CLIPLoader`,
+`CLIPTextEncode`, `EmptyCosmosLatentVideo`, `KSampler` and `VAEDecode` nodes
+in both, retain the same objects between two same-seed generations, record
+OS counters during loading/sampling/decoding, and compare saved latent
+tensors and RGB arrays. Do not compare PNG file bytes, since metadata can
+differ. End with explicit runtime unload, model unload and GC.
+
+The private `implementation.zip` archive has 18 members, 2,707,934 bytes and
+SHA-256 `d182c741b15842ae127eca463238a35a99aea75b2d97aa46e4e2575b55c70d5e`.
+It pins the measurement/recording scripts, lifecycle smoke, corrected-pair
+console logs, memory traces, latents and PNGs. It contains no model weights
+and is not committed. Keep paths and captures local; use placeholders when
+adapting the scripts.
+
+**Limits.** One machine, checkpoint, seed and process pair. No 1024x1024
+memory run, cold-cache-build peak, INT8 combination, CFG > 1, live-LoRA or
+CPU-only reference was measured. System available memory includes other
+applications and the OS cache, so it is only observational. The normal
+installed node copy and production launcher were not modified.
+
 ## Public verification ladder
 
 Set placeholders only in the current shell; do not commit paths or captures.
