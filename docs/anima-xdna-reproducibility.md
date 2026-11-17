@@ -34,7 +34,7 @@ This dated, non-exhaustive search is not an absolute novelty claim.
 | ComfyUI | `170594057a22673349ddf0a3d88624b7fa5865bb` |
 | Wrapper source | `737338d76bf2a7dcf9806aaba5d6d936499b95ab` |
 | Models | Anima Base v1.0, Turbo V1.1, and WAI Nova Anima Turbo LoRA Ver V1.0, BF16 transformer |
-| Shape | batch 1, latent `[1,16,1,64,64]`, 512×512, context `[1,512,1024]`; 1024×1024 (`[1,16,1,128,128]`) with baseline attention or, experimentally, AIR attention, see the 2026-11-16 sections |
+| Shape | batch 1, latent `[1,16,1,64,64]`, 512×512, context `[1,512,1024]`; 1024×1024 (`[1,16,1,128,128]`) with baseline attention or, experimentally, AIR attention or the INT8 profile, see the 2026-11-16 and 2026-11-17 sections |
 
 The exact structured measurements and artifact digests are in
 [`evidence/anima-xdna-validated.json`](evidence/anima-xdna-validated.json).
@@ -3528,6 +3528,145 @@ and is not committed.
 Post-GC counters were recorded but not compared. System available memory
 includes other applications and the OS cache.
 
+## INT8 at 1024x1024 with host/NPU overlap (2026-11-17)
+
+**Result.** The INT8 profile now accepts 4096 image tokens (1024×1024). With
+**Load Anima XDNA (Cache-backed)**, Turbo V1.1 and four Euler steps at CFG 1,
+a warm prompt takes **23.4–24.8 s** sampling (about 5.8 s per step) plus
+about 6.8 s decode. The first prompt of a fresh process takes about **49 s**
+sampling, against **71.4 s** for cache-backed AIR BF16 in a fresh process,
+because the first four forwards run the verified sequential path with
+boundary checks. For context, the earlier legacy-loader AIR BF16 whole
+prompt took 108.0 s cold and 82.3 s warm (not directly comparable: it
+includes loading, text encoding and decode). Overlapping host work with the
+NPU is bitwise identical to the sequential INT8 schedule and shortens warm
+block time by about **10%** (2.6–2.8 s). INT8 is **not** quality-equivalent
+to BF16 (see below). Evidence:
+[`evidence/int8-1024-tiled-overlap.json`](evidence/int8-1024-tiled-overlap.json).
+
+### Tiled INT8
+
+The 512×512 INT8 kernels (1024-row GEMMs, 1024-key projections) run once per
+1024-row tile of the 4096-token block, as in the
+[tiling section](#anima-1024x1024-by-tiling-xdna-dispatches-2026-11-16). The
+fused host kernels keep their 1024-row shape and are called per tile into
+slices of one output tensor. Attention between the tiled QKV and output
+projections is AIR BF16 at 4096 keys, so every tile's K/V must exist before
+the first query tile. This needs the `self4096` artifact in
+`ANIMA_XDNA_AIR_ATTENTION_DIR` (see
+[AIR attention at 4096 keys](#air-attention-at-4096-keys-for-1024x1024-2026-11-16)).
+It is validated when present and optional for 512×512; a 1024×1024 run
+without it fails when the AIR attention runner opens it. Masked attention and
+token counts other than 1024 and 4096 are rejected with explicit errors;
+there is no fallback.
+
+### Host/NPU overlap
+
+A probe showed that `pyxrt`'s `wait2()` holds the GIL: a monitor thread
+stalled for up to 4.75 ms during a 4.53 ms NPU job, and a worker-thread
+variant took 5.03 ms, the sum of the NPU (4.53 ms) and host (0.47 ms) times. The working pattern is single-threaded: `run.start()`,
+host work for the previous job, then `run.wait2()`. With 1.25 ms of host work
+per 1024×2048×8192 job, a serial 5.51 ms pair became 4.33 ms, against 4.53
+ms for the NPU alone.
+
+Only one NPU job is ever in flight. Runners used by the overlapped schedule
+lazily allocate a second output buffer (slot = tile % 2), so a finished
+tile's accumulator stays valid while the next tile runs; inputs are copied
+into the input buffer at `start`. Schedule per block:
+
+- **QKV:** start QKV(t+1), then run `qkv_prepare(t)`.
+- **Attention output:** quantize tile t+1 while out(t) runs, and run the
+  gated residual of tile t while out(t+1) runs.
+- **MLP:** NPU order `in0, in1, out0, in2, out1, …`; GELU of a finished `in`
+  job and the gated residual of a finished `out` job run behind the next job.
+  The GELU output is consumed by the `out` launch of its own tile before
+  another GELU can replace it; the code asserts this.
+- **Not overlapped:** the AIR attention itself (about 10.2–10.6 s per warm
+  prompt, 44% of overlapped block time). The host is idle during it.
+
+Overlap is active when `ANIMA_XDNA_INT8_OVERLAP` is not `0` (default `1`),
+only for tiled blocks, and only after the verified first prompt (its four
+forwards run the sequential schedule with boundary checks).
+
+### Measurement
+
+Each variant ran in a fresh standalone ComfyUI Python process with the real
+nodes (not an HTTP/UI prompt-executor run): Ryzen AI 9 365, 25,359,659,008
+physical RAM bytes, Turbo V1.1, seed `700755787614899`, four Euler/simple
+steps, CFG 1, `int8-attn-l1k64-nq8pp`, AIR `nq8pp`, host AdaLN, BF16
+channels-last VAE and the prompts of the previous sections.
+
+| Variant | Sampling seconds (run 0 / 1 / 2) | Latent |
+|---|---:|---|
+| INT8, sequential (`…OVERLAP=0`) | 48.99 / 26.02 / 27.63 | `0107a682…` |
+| INT8, overlapped | 49.04 / 23.43 / 24.80 | `0107a682…` |
+| AIR BF16, cache-backed (one run) | 71.40 | different |
+
+All eight 1024×1024 INT8 latents are bitwise identical, including an earlier
+two-run sequential process (50.54 / 25.91 s) that used the default at the
+time. Warm sampling ranges do not overlap between the two schedules
+(23.4–24.8 s against 25.9–27.6 s). Overlapped warm block time was 22.96 and
+24.32 s, against 25.54 and 27.16 s sequentially. Host time hidden behind the
+NPU in the first overlapped warm run was 1.16 s (attn1 QKV), 0.57 s (attn2
+QKV), 0.45 s / 0.39 s (attn1 / attn2 output), 0.31 s (MLP in) and 0.64 s (MLP
+out). Attn1 QKV is host-bound: per-tile host preparation is longer than the
+NPU job, so a faster NPU would not help it. The 512×512 INT8 run with the
+flag set was bitwise identical to the sequential one (latent `4e4de447…`;
+14.9 / 5.6 s against 16.0 / 5.5 s sampling): the 1024-token path does not use
+the overlapped schedule.
+
+Memory peaks during sampling (GiB, 23.6 GiB total; one process per variant;
+sampled every 0.1–0.2 s):
+
+| Metric | AIR BF16 | INT8 cold | INT8 warm |
+|---|---:|---:|---:|
+| Peak working set | 13.10 | 11.77 | 10.66 |
+| Peak private bytes | 11.35 | 10.34 | 9.57 |
+| Minimum system available | 3.63 | 5.07 | 6.13 |
+
+The overlapped process measured the same within noise (cold 11.79 GiB working
+set, 5.09 GiB minimum available; warm 10.69–10.75 GiB and 6.09–6.16 GiB).
+Lifetime peak working set including decode was 13.49 GiB for AIR BF16 and
+11.78–11.81 GiB for INT8. The packed BF16 cache is a file-backed mapping that
+counts toward working set, which is why INT8 lowers private bytes (about
+1.0 GiB cold, 1.8 GiB warm) more than it lowers the cache-backed working set.
+The cold/warm difference was not decomposed. The memory saving is therefore
+modest: it moves the cache-backed 1024×1024 run from 3.6 GiB to 5–6 GiB of
+free system memory, and no INT8 execution cache or BF16-mapping release was
+attempted.
+
+**Quality.** Against the AIR BF16 image of the same seed, the decoded
+1024×1024 INT8 RGB differs by MAE 24.32/255, normalized RMS 24.94% (relative
+to the reference RMS) and PSNR 14.87 dB. INT8 is therefore a different,
+faster result, not an equivalent one; no visual-quality judgment,
+latent-space comparison or multi-seed statistics were made. Use the BF16 path
+where fidelity matters.
+
+### Use
+
+- Requires the `self4096` AIR artifact next to `self` and `cross` in
+  `ANIMA_XDNA_AIR_ATTENTION_DIR`, as for 1024×1024 AIR BF16, plus the usual
+  INT8 environment (the INT8 profile already requires
+  `ANIMA_XDNA_ATTENTION_BACKEND=air`).
+- Set `ANIMA_XDNA_INT8_OVERLAP=0` to run the sequential schedule.
+- Existing installs need the new code and `self4096` copied in; this change
+  does not modify an installed ComfyUI copy.
+
+The private `implementation-int8-1024.zip` archive has 46 members, 23,372,218
+bytes and SHA-256
+`d232b98f2f224d823e36032f07987270d742ef792dab069bcd4e756f4daf1fcc`. It pins
+the measurement script (SHA-256
+`c99814364920317ed3e6b1d687b5281bf82447c34b0608e7472f78c75e4420c2`), the
+overlap probe (SHA-256
+`a946879bdf303efcb1eead54289d8498db8e0fafc5cf71c703d857f2c8d026fa`),
+console logs, result/memory traces, latents and PNGs, without model weights,
+and is not committed. Keep paths and captures local.
+
+**Limits.** One machine, seed and prompt; two to three runs per setting. No
+CFG > 1, LoRA, CPU-only or HTTP/UI 1024×1024 measurement. The BF16 baseline
+is one cold run. Separate processes may differ by thermal state or
+background load, so the roughly 10% gain is a measured range, not a bound.
+
 ## Public verification ladder
 
 Set placeholders only in the current shell; do not commit paths or captures.
@@ -3572,9 +3711,9 @@ $env:ANIMA_XDNA_CHAIN_FIXTURE = "<CAPTURED_REAL_BLOCK_INPUT_PT>"
 Only Base v1.0, Turbo V1.1, WAI Nova Anima Turbo LoRA Ver V1.0, Radiance
 Turbo Anima v2.0, and the fixed shapes above are validated. Other Preview/Aesthetic
 checkpoints, unsupported LoRA types, LLLite, runtime ModelPatcher transformer
-patches, INT8, training,
-resolutions other than 512×512 and 1024×1024 (baseline attention, or AIR with a
-`self4096` artifact; INT8 is 512×512 only), other
+patches, INT8 outside the experimental profile, training,
+resolutions other than 512×512 and 1024×1024 (baseline attention, or AIR or
+INT8 with a `self4096` artifact), other
 context sizes, and user batches above one are rejected. CFG batch 2 is
 executed sequentially on the single-tenant NPU.
 

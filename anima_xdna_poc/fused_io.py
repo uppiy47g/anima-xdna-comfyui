@@ -53,14 +53,21 @@ class FusedIO:
             raise RuntimeError(f"Fused modulate+quantize rejected invalid input or nonfinite output (code {code})")
         return self.quantized, self.scales
 
-    def dequant_gated_residual(self, accumulator, row_scale, weight_scale, gate, hidden):
-        """Return a new BF16 [1, rows, columns] tensor: hidden + gate * dequantized."""
+    def dequant_gated_residual(self, accumulator, row_scale, weight_scale, gate, hidden, out=None):
+        """Return a BF16 [1, rows, columns] tensor: hidden + gate * dequantized.
+
+        A new tensor is allocated unless ``out`` (same shape, contiguous) is supplied.
+        """
         self._tensor(accumulator, torch.int32, (self.rows, self.columns), "accumulator")
         self._tensor(row_scale, torch.float32, (self.rows, 1), "row_scale")
         self._tensor(weight_scale, torch.float32, (1, self.columns), "weight_scale")
         self._tensor(hidden, torch.bfloat16, (1, self.rows, self.columns), "hidden")
         gate = _row_vector(gate, "gate", self.columns)
-        output = torch.empty_like(hidden)
+        if out is None:
+            output = torch.empty_like(hidden)
+        else:
+            self._tensor(out, torch.bfloat16, (1, self.rows, self.columns), "out")
+            output = out
         code = self.exit(
             accumulator.data_ptr(), row_scale.data_ptr(), weight_scale.data_ptr(),
             gate.data_ptr(), hidden.data_ptr(), output.data_ptr(),

@@ -619,6 +619,14 @@ latent-space difference was not measured. The [measured chain, ComfyUI and
 quality results](../docs/anima-xdna-reproducibility.md#air-attention-at-4096-keys-for-1024x1024-2026-11-16)
 are in the reproducibility report.
 
+The experimental INT8 profile (`ANIMA_XDNA_OPTIMIZED_PROFILE=int8-attn-l1k64-nq8pp`)
+reuses the same `self4096` artifact for 1024x1024: it runs its 512x512 INT8
+GEMM and projection kernels once per 1024-row tile around AIR attention at
+4096 keys. After its checked first prompt it overlaps host work with the next
+NPU job (`ANIMA_XDNA_INT8_OVERLAP=0` disables this; results are bitwise
+identical). It is not quality-equivalent to BF16; see the
+[INT8 at 1024x1024 section](../docs/anima-xdna-reproducibility.md#int8-at-1024x1024-with-hostnpu-overlap-2026-11-17).
+
 For a controlled comparison with identical seed, prompt and sampler settings,
 stop ComfyUI, set the following and restart:
 

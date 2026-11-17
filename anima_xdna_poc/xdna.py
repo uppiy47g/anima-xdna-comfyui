@@ -725,6 +725,25 @@ class _ResidentKernelRunner:
         scratch_indices: set[int],
         output_index: int,
     ) -> tuple[Any, dict[str, Any]]:
+        return self.finish(
+            self.start(arrays, key, static_indices, scratch_indices, output_index)
+        )
+
+    def start(
+        self,
+        arrays: list[Any],
+        key: str,
+        static_indices: set[int],
+        scratch_indices: set[int],
+        output_index: int,
+        slot: int = 0,
+    ) -> dict[str, Any]:
+        """Stage inputs and launch without waiting; finish() reads the slot's output.
+
+        Only one launch may be in flight per runner. Outputs of different slots
+        stay valid until their slot is launched again, so a caller can read the
+        previous tile's result while the next one runs.
+        """
         import numpy as np
 
         sizes = [array.size * array.itemsize for array in arrays]
@@ -743,6 +762,12 @@ class _ResidentKernelRunner:
                     f"resident dynamic buffers changed sizes from "
                     f"{dynamic_sizes} to {[sizes[0], sizes[2]]}"
                 )
+        if slot:
+            slots = self.__dict__.setdefault("_output_slots", {})
+            if slot not in slots:
+                slots[slot] = self.xrt.ext.bo(self.device, sizes[2])
+                allocation_count += 1
+            output_bo = slots[slot]
         if first_weight:
             self.weight_bos[key] = (sizes[1], self.xrt.ext.bo(self.device, sizes[1]))
             allocation_count += 1
@@ -787,36 +812,51 @@ class _ResidentKernelRunner:
         for index, bo in enumerate(bos):
             run.set_arg(index, bo)
         run.start()
-        run.wait2()
-        kernel_sync_ms = (time.perf_counter() - started) * 1000
+        return {
+            "run": run,
+            "launched": started,
+            "output_bo": bos[output_index],
+            "template": arrays[output_index],
+            "output_bytes": sizes[output_index],
+            "profile": {
+                "h2d_bytes": h2d_bytes,
+                "allocation_count": allocation_count,
+                "resident_hit": not first_weight,
+                "allocation_ms": allocation_ms,
+                "host_copy_ms": copy_ms,
+                "h2d_sync_ms": h2d_sync_ms,
+                "weight_population_ms": weight_population_ms,
+                "weight_population_bytes": weight_population_bytes,
+            },
+        }
+
+    def finish(self, pending: dict[str, Any]) -> tuple[Any, dict[str, Any]]:
+        import numpy as np
+
+        pending["run"].wait2()
+        kernel_sync_ms = (time.perf_counter() - pending["launched"]) * 1000
 
         started = time.perf_counter()
-        bos[output_index].sync(
+        pending["output_bo"].sync(
             self.xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_FROM_DEVICE
         )
         d2h_sync_ms = (time.perf_counter() - started) * 1000
-        template = arrays[output_index]
+        template = pending["template"]
         output = np.frombuffer(
-            bos[output_index].map(),
+            pending["output_bo"].map(),
             dtype=template.dtype,
             count=template.size,
         ).reshape(template.shape)
         return output, {
-            "h2d_bytes": h2d_bytes,
-            "d2h_bytes": sizes[output_index],
-            "allocation_count": allocation_count,
-            "resident_hit": not first_weight,
-            "allocation_ms": allocation_ms,
-            "host_copy_ms": copy_ms,
-            "h2d_sync_ms": h2d_sync_ms,
+            **pending["profile"],
+            "d2h_bytes": pending["output_bytes"],
             "kernel_sync_ms": kernel_sync_ms,
             "d2h_sync_ms": d2h_sync_ms,
-            "weight_population_ms": weight_population_ms,
-            "weight_population_bytes": weight_population_bytes,
         }
 
     def close(self):
         self.dynamic_bos = None
+        self.__dict__.pop("_output_slots", None)
         self.weight_bos = {}
         self.kernel = None
         self.context = None

@@ -1,0 +1,178 @@
+{
+  "date": "2026-11-17",
+  "status": "measured_1024x1024_int8_cache_backed_with_host_npu_overlap",
+  "repository_base": "21cbcbb",
+  "implementation": {
+    "int8_tiling": "the 512x512 INT8 kernels (1024-row GEMMs, 1024-key attention projections) run once per 1024-row tile at 4096 image tokens; fused host kernels keep their fixed 1024-row shape and are called per tile; results are written into tile slices of one output tensor",
+    "attention": "AIR BF16 attention at 4096 keys (self4096 artifact) between the tiled INT8 QKV and output projections; K/V of all tiles must exist before any query tile runs",
+    "overlap": "one NPU job in flight at a time; run.start() is issued, host work for the previous job runs on the main thread, then run.wait2() (pyxrt wait2 holds the GIL, so a worker thread cannot overlap)",
+    "overlap_schedule": {
+      "qkv": "QKV(t+1) is started before qkv_prepare(t)",
+      "attention_out": "quantize(t+1) runs while out(t) is in flight; the gated residual of tile t runs while out(t+1) is in flight",
+      "mlp": "NPU order in0, in1, out0, in2, out1, ...; GELU of a finished 'in' job and the gated residual of a finished 'out' job run behind the next job"
+    },
+    "output_slots": "per-runner two-slot output ring (slot = tile % 2); inputs are copied into the input buffer at start, so one input buffer suffices",
+    "overlap_gate": "ANIMA_XDNA_INT8_OVERLAP (default 1; 0 disables) and only after the four verified warm-up forwards; the verified sequential path is unchanged"
+  },
+  "configuration": {
+    "size": [1024, 1024],
+    "steps": 4,
+    "cfg": 1.0,
+    "seed": 700755787614899,
+    "sampler": "euler",
+    "scheduler": "simple",
+    "model": "anima_turboV11",
+    "loader": "Load Anima XDNA (Cache-backed)",
+    "profile": "int8-attn-l1k64-nq8pp",
+    "backend": "air (4096 keys)",
+    "vae": "bf16 channels-last clfix",
+    "adaln_device": "host",
+    "torch_threads": 10,
+    "torch_version": "2.14.1+cpu",
+    "python": "3.13.9",
+    "cpu": "AMD Ryzen AI 9 365",
+    "device": "XDNA 2 npu2",
+    "system_physical_bytes": 25359659008,
+    "xrt_sdk": "2.21.75",
+    "positive": "a cheerful anime girl under cherry blossoms, detailed illustration, soft daylight",
+    "negative": "worst quality, low quality, blurry, jpeg artifacts",
+    "process_model": "fresh standalone ComfyUI Python process per variant (real nodes, no HTTP server); the first run of every process includes the four verified forwards"
+  },
+  "private_artifacts": {
+    "implementation_zip": {
+      "members": 46,
+      "bytes": 23372218,
+      "sha256": "d232b98f2f224d823e36032f07987270d742ef792dab069bcd4e756f4daf1fcc"
+    },
+    "measure_script_sha256": "c99814364920317ed3e6b1d687b5281bf82447c34b0608e7472f78c75e4420c2",
+    "overlap_probe_sha256": "a946879bdf303efcb1eead54289d8498db8e0fafc5cf71c703d857f2c8d026fa",
+    "committed": false
+  },
+  "overlap_probe": {
+    "pyxrt_wait2_releases_gil": false,
+    "worker_thread_overlaps_host_python": false,
+    "async_start_host_work_wait_on_main_thread": "hides host work",
+    "synthetic": "one 1024x2048x8192 INT8 job against three host calls of layer norm plus modulate-quantize",
+    "host_work_ms": 1.25,
+    "serial_ms": 5.51,
+    "async_start_host_wait_ms": 4.33,
+    "npu_alone_ms": 4.53,
+    "thread_variant": {
+      "npu_ms": 4.53,
+      "host_ms": 0.47,
+      "serial_pair_ms": 5.31,
+      "overlapped_pair_ms": 5.03,
+      "max_monitor_gap_during_npu_ms": 4.75
+    }
+  },
+  "runs": {
+    "int8_sequential": {
+      "overlap_env": "ANIMA_XDNA_INT8_OVERLAP=0",
+      "sample_seconds": [48.99, 26.02, 27.63],
+      "decode_seconds": [7.24, 6.78, 6.80],
+      "block_wall_seconds_per_run": [48.43, 25.54, 27.16],
+      "latent_sha256": "0107a68286504e82851d9452240f3995a3d9ab0f48b0cc6ce228df2d66b102b0",
+      "latent_bitwise_identical_across_runs": true,
+      "earlier_single_run_seconds": [50.54, 25.91]
+    },
+    "int8_overlapped": {
+      "overlap_env": "ANIMA_XDNA_INT8_OVERLAP=1",
+      "sample_seconds": [49.04, 23.43, 24.80],
+      "decode_seconds": [7.22, 6.77, 6.80],
+      "block_wall_seconds_per_run": [48.46, 22.96, 24.32],
+      "latent_sha256": "0107a68286504e82851d9452240f3995a3d9ab0f48b0cc6ce228df2d66b102b0",
+      "latent_bitwise_identical_across_runs": true,
+      "latent_bitwise_identical_to_sequential": true,
+      "overlapped_runs": [1, 2],
+      "run0_note": "verification forwards run sequentially, so run 0 is not overlapped"
+    },
+    "air_bf16_cache_backed": {
+      "sample_seconds": [71.4],
+      "decode_seconds": [15.75],
+      "latent_sha256": "834fbcb21898"
+    },
+    "legacy_loader_air_bf16_reference": {
+      "cold_prompt_seconds": 108.0,
+      "warm_prompt_seconds": 82.3,
+      "note": "earlier AIR section: whole ComfyUI prompt with the standard loader (not sampling only), so not directly comparable with the sampling seconds above"
+    }
+  },
+  "overlap_gain": {
+    "warm_sample_seconds_saved": [2.59, 2.83],
+    "warm_block_wall_percent_saved": [10.1, 10.5],
+    "per_step_seconds_average_run1": 5.81,
+    "hidden_host_ms_run1": {
+      "attn1_qkv": 1157,
+      "attn1_out": 450,
+      "attn2_qkv": 574,
+      "attn2_out": 387,
+      "mlp_in": 312,
+      "mlp_out": 643
+    },
+    "not_overlapped": "AIR attention (10.19 and 10.59 s per warm run, 44% of the overlapped block time) is not overlapped; the host is idle during it",
+    "air_attention_seconds_sequential_warm": [9.90, 10.69],
+    "host_bound_stage": "attn1 QKV: host preparation per tile exceeds the NPU job, so the hidden window equals the host time"
+  },
+  "memory_gib": {
+    "phase": "peaks sampled every ~0.1-0.2 s during the sampling phase of each run; system total 23.6 GiB",
+    "air_bf16_cache_backed": {
+      "peak_working_set": 13.10,
+      "peak_private": 11.35,
+      "minimum_system_available": 3.63,
+      "decode_peak_working_set": 13.48
+    },
+    "int8_sequential_cold": {
+      "peak_working_set": 11.77,
+      "peak_private": 10.34,
+      "minimum_system_available": 5.07
+    },
+    "int8_sequential_warm": {
+      "peak_working_set": 10.66,
+      "peak_private": 9.57,
+      "minimum_system_available": 6.13
+    },
+    "int8_overlapped_cold": {
+      "peak_working_set": 11.79,
+      "peak_private": 10.35,
+      "minimum_system_available": 5.09
+    },
+    "int8_overlapped_warm": {
+      "peak_working_set": [10.69, 10.75],
+      "peak_private": [9.66, 9.65],
+      "minimum_system_available": [6.16, 6.09]
+    },
+    "lifetime_peak_working_set": {
+      "air_bf16_cache_backed": 13.49,
+      "int8_sequential": 11.78,
+      "int8_overlapped": 11.81
+    },
+    "interpretation": "private bytes fall by about 1.0 GiB (cold) to 1.8 GiB (warm); the file-backed packed BF16 cache counts toward working set; overlap changed no measured peak beyond run-to-run noise"
+  },
+  "quality_vs_air_bf16_same_seed": {
+    "decoded_rgb_mae_of_255": 24.32,
+    "decoded_rgb_normalized_rms_percent": 24.94,
+    "decoded_rgb_psnr_db": 14.87,
+    "equivalent": false,
+    "note": "INT8 W8A8 quantization changes the decoded image; no visual-quality judgment is made here. A latent-space comparison and multi-seed statistics were not measured."
+  },
+  "regression_512x512": {
+    "int8_sequential_latent_sha256": "4e4de4471ee4c362",
+    "int8_with_overlap_flag_latent_sha256": "4e4de4471ee4c362",
+    "bitwise_identical": true,
+    "sample_seconds_sequential": [16.04, 5.47],
+    "sample_seconds_with_flag": [14.87, 5.57],
+    "note": "the overlap path only applies to tiled (4096-token) blocks; the 1024-token path keeps the sequential schedule"
+  },
+  "boundary_checks": "the four verified forwards passed on the tiled path (QKV projections, qkv_prepare, layout quantization, gated residual) in every run",
+  "unit_tests": {
+    "full_suite": "139 tests OK, 2 skipped",
+    "overlap": "fake-NPU tests assert the exact start/finish/host ordering, that only one job is in flight, that outputs match the sequential schedule, and that slot reuse is detected (a fixed-slot mutation fails)"
+  },
+  "limits": [
+    "one machine, one seed and one prompt; three runs per overlap setting",
+    "no CFG > 1, LoRA or CPU-only 1024x1024 measurement",
+    "INT8 is not quality-equivalent to BF16; only one image pair was compared",
+    "the AIR attention step is not overlapped and remains about 44% of a warm block pass",
+    "the installed ComfyUI copy was not modified; its AIR directory has no self4096 artifact"
+  ]
+}

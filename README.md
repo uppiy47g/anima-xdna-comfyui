@@ -165,8 +165,9 @@ counts that do not tile evenly raise an error; there is no CPU fallback.
   (`ANIMA_XDNA_ATTENTION_BACKEND=air`) also accepts 4096 tokens, but needs an
   additional `self4096` artifact beside the `self` and `cross` ones; see the
   [AIR attention at 1024×1024](anima_xdna_poc/README.md#air-attention-at-1024x1024)
-  section. The INT8 profile remains 512×512-only and rejects 4096 tokens with
-  an explicit error.
+  section. The experimental INT8 profile also accepts 4096 tokens when AIR
+  attention has the `self4096` artifact; see
+  [INT8 at 1024x1024](#int8-at-1024x1024) below.
 - **Speed.** With baseline attention on the test machine, one 28-block pass
   takes about 54 s. A sampler step therefore takes about 55 s with CFG 1 and
   roughly twice as long with CFG > 1. A 4-step Turbo V1.1 prompt took 251 s,
@@ -207,6 +208,27 @@ boundaries on the first four forwards, and raises errors instead of silently
 falling back on unsupported cases. This fixed-shape experimental profile is
 not a general quantization mode.
 
+#### INT8 at 1024x1024
+
+The profile also runs 1024×1024 (4096 tokens) by running its 512×512 INT8
+kernels once per 1024-row tile. It needs the AIR `self4096` artifact beside
+`self` and `cross` (without it a 1024×1024 run stops with an explicit error),
+and works best with **Load Anima XDNA (Cache-backed)**. On the test machine a
+4-step, CFG 1 Turbo V1.1 prompt took about 49 s for sampling in a fresh process
+(the first prompt runs the checked, sequential path) and 23.4–24.8 s on warm
+prompts, plus about 7 s VAE decode; cache-backed AIR BF16 took 71 s for
+sampling in a fresh process. Peak working set while sampling was 10.7–11.8 GiB
+instead of 13.1 GiB, leaving 5–6 GiB of system memory free. INT8 is **not**
+quality-equivalent: for one fixed seed the decoded image differs from the AIR
+BF16 image by MAE 24.3/255 (PSNR 14.9 dB).
+
+After the checked first prompt, the host work around each NPU job (norm,
+quantization, GELU, gated residual) runs while the next NPU job executes. The
+output is bitwise identical to the sequential schedule and warm sampling was
+about 10% faster. It is on by default; set `ANIMA_XDNA_INT8_OVERLAP=0` to use
+the sequential schedule. Details, limits and the single-machine caveats are in
+the [reproducibility report](docs/anima-xdna-reproducibility.md#int8-at-1024x1024-with-hostnpu-overlap-2026-11-17).
+
 ## Supported configuration
 
 The validated configuration is:
@@ -223,7 +245,8 @@ The validated configuration is:
 - Batch 1 and adapted Qwen context `[1, 512, 1024]`, with either 512×512
   output (1024 image tokens) or, on the standard BF16 path, 1024×1024 output
   (4096 image tokens) with baseline attention or the experimental AIR
-  attention that has a `self4096` artifact. The INT8 profile is 512×512 only.
+  attention that has a `self4096` artifact. The experimental INT8 profile
+  also accepts 1024×1024 with the `self4096` artifact.
 - BF16 execution weights and block activations; the sampler latent is FP32.
 
 Compatible F16 or F32 Anima sources are normalized to BF16 when the local

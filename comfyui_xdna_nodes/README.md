@@ -48,7 +48,8 @@ back to CPU.
   or the same native Turbo checkpoint for Turbo
 - batch 1, latent `[1,16,1,64,64]` (512x512 output) or `[1,16,1,128,128]`
   (1024x1024 output: baseline attention, or experimental AIR attention with a
-  `self4096` artifact; not the INT8 profile)
+  `self4096` artifact; the experimental INT8 profile also accepts it, see
+  below)
 - adapted Qwen context `[1,512,1024]`
 - BF16 model weights and block activations, FP32 sampler latent
 
@@ -64,7 +65,8 @@ same prompt then took 108 s on the first run and 82 s on a second run with
 another seed (about 18 s per step). AIR is not quality-equivalent (see
 [AIR attention at 1024x1024](../anima_xdna_poc/README.md#air-attention-at-1024x1024)),
 and a missing `self4096` artifact stops the run with an explicit error. The
-INT8 profile rejects 4096 tokens with an explicit error. Expect roughly twice
+experimental INT8 profile also runs 4096 tokens with the `self4096` artifact
+(see below). Expect roughly twice
 the step time with CFG > 1, and much higher host memory use than at 512x512.
 
 Preview/Aesthetic checkpoints, LoRA patches, LLLite, other
@@ -116,6 +118,18 @@ generation took 17.93 s; a same-process repeat reproduced the latent bitwise
 and took 5.79 s for sampling plus 1.51 s for VAE decode (7.30 s total). These
 are single-run smoke measurements, not a controlled benchmark or a quality
 equivalence claim.
+
+At 1024x1024 the profile runs its 512x512 INT8 kernels once per 1024-row tile
+and needs the AIR `self4096` artifact beside `self` and `cross` in the AIR
+directory. The runtime bundle installed by `install_int8_runtime.ps1` ships
+only the `self` and `cross` artifacts, so a 1024x1024 INT8 run needs a
+`self4096` directory added to that AIR directory by hand. The
+checked first prompt in a process runs sequentially, and later prompts overlap
+host work with NPU jobs (bitwise identical results, about 10% faster); set
+`ANIMA_XDNA_INT8_OVERLAP=0` to disable the overlap. INT8 at 1024x1024 is not
+quality-equivalent to BF16 AIR (one fixed-seed decoded image: MAE 24.3/255).
+See the root README and the
+[reproducibility report](../docs/anima-xdna-reproducibility.md#int8-at-1024x1024-with-hostnpu-overlap-2026-11-17).
 For an F16 or F32 source, matching is performed after the same explicit BF16
 normalization used by the XDNA packed cache. Raw source hashes and dtypes still
 remain part of the cache identity.
