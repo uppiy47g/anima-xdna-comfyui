@@ -310,6 +310,37 @@ class OptimizedProfileTests(unittest.TestCase):
                 events.append("air")
                 return (query.float() + key.float() + value.float()).bfloat16()
 
+            class FakeAIR:
+                """Resident AIR buffers; each output slot is overwritten by its next launch."""
+
+                def __init__(self):
+                    self.queries = [torch.zeros(16, 1024, 128, dtype=torch.bfloat16) for _ in range(4)]
+                    self.key = torch.zeros(16, 4096, 128, dtype=torch.bfloat16)
+                    self.value = torch.zeros_like(self.key)
+
+                def resident(self, tiles):
+                    return tuple(self.queries[:tiles]), self.key, self.value
+
+                def start(self, tile, slot, upload_kv):
+                    assert upload_kv == (tile == 0)
+                    rows = slice(tile * 1024, (tile + 1) * 1024)
+                    compute = (self.queries[tile].float() + self.key[:, rows].float()
+                               + self.value[:, rows].float()).bfloat16()
+                    return npu.launch("air", slot, compute, f"air{tile}")
+
+                def finish(self, pending):
+                    return pending()
+
+            class Backend:
+                def __call__(self, query, key, value):
+                    return air(query, key, value)
+
+                @staticmethod
+                def runner_for(tokens, keys):
+                    assert (tokens, keys) == (4096, 4096)
+                    return fake_air
+
+            fake_air = FakeAIR()
             runtime.attention_qkv_start = qkv_start
             runtime.attention_host = SimpleNamespace(prepare=prepare)
             runtime.attention_quantize_layout = quantize
@@ -318,7 +349,7 @@ class OptimizedProfileTests(unittest.TestCase):
             execution = SimpleNamespace(
                 weights={"attn1.norm_q.weight": 1, "attn1.norm_k.weight": 1},
                 config=SimpleNamespace(num_heads=16, head_dim=128), runner_device="xdna",
-                attention_runner=air, metrics=[], host=lambda name, operation: operation(),
+                attention_runner=Backend(), metrics=[], host=lambda name, operation: operation(),
                 linear=lambda name, attended, weight_name: out_start("attn1", attended)()[0],
             )
             normalized = QuantizedActivation(
@@ -327,25 +358,45 @@ class OptimizedProfileTests(unittest.TestCase):
             gate = torch.full((1, 1, 4), 0.5).bfloat16()
             result = runtime.attention_tiled(
                 execution, "attn1", block._row_tiles(4096), normalized, None, None, gate, hidden)
-            return result, events
+            return result, events, execution.metrics
 
-        sequential, _ = run(False)
-        overlapped, events = run(True)
+        sequential, _, sequential_metrics = run(False)
+        overlapped, events, metrics = run(True)
 
         self.assertTrue(torch.equal(overlapped, sequential))
+        for collected in (sequential_metrics, metrics):
+            air_metrics = [m for m in collected if m.name == "attn1.air_attention"]
+            self.assertEqual([(m.dispatches, m.h2d_bytes, m.d2h_bytes) for m in air_metrics],
+                             [(4, 3 * 16 * 4096 * 128 * 2, 16 * 4096 * 128 * 2)])
         self.assertEqual(events, [
             "start:qkv0",
             "finish:qkv0", "start:qkv1", "prepare0",
             "finish:qkv1", "start:qkv2", "prepare1",
             "finish:qkv2", "start:qkv3", "prepare2",
             "finish:qkv3", "prepare3",
-            "air",
-            "quantize0", "start:out0",
-            "quantize1", "finish:out0", "start:out1", "exit0",
-            "quantize2", "finish:out1", "start:out2", "exit1",
-            "quantize3", "finish:out2", "start:out3", "exit2",
+            "start:air0",
+            "finish:air0", "start:air1", "quantize0",
+            "finish:air1", "start:out0", "quantize1",
+            "finish:out0", "start:air2", "exit0",
+            "finish:air2", "start:out1", "quantize2",
+            "finish:out1", "start:air3", "exit1",
+            "finish:air3", "start:out2", "quantize3",
+            "finish:out2", "start:out3", "exit2",
             "finish:out3", "exit3",
         ])
+
+    def test_two_stage_waits_for_the_job_in_flight_when_settling_fails(self):
+        events = []
+        npu = _FakeNPU(events)
+
+        def settle(kind, index, outcome):
+            raise RuntimeError("nonfinite")
+
+        with self.assertRaisesRegex(RuntimeError, "nonfinite"):
+            OptimizedInt8Runtime.two_stage(
+                3, lambda kind, index: npu.launch(kind, index % 2, torch.zeros(1), f"{kind}{index}"), settle)
+        self.assertEqual(events, ["start:in0", "finish:in0", "start:in1", "finish:in1"])
+        self.assertIsNone(npu.busy)
 
     def test_vae_conversion_sets_bf16_and_channels_last(self):
         class FakeVAEModel(torch.nn.Module):

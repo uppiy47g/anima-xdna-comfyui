@@ -214,20 +214,23 @@ The profile also runs 1024×1024 (4096 tokens) by running its 512×512 INT8
 kernels once per 1024-row tile. It needs the AIR `self4096` artifact beside
 `self` and `cross` (without it a 1024×1024 run stops with an explicit error),
 and works best with **Load Anima XDNA (Cache-backed)**. On the test machine a
-4-step, CFG 1 Turbo V1.1 prompt took about 49 s for sampling in a fresh process
-(the first prompt runs the checked, sequential path) and 23.4–24.8 s on warm
-prompts, plus about 7 s VAE decode; cache-backed AIR BF16 took 71 s for
-sampling in a fresh process. Peak working set while sampling was 10.7–11.8 GiB
-instead of 13.1 GiB, leaving 5–6 GiB of system memory free. INT8 is **not**
+4-step, CFG 1 Turbo V1.1 prompt took about 49–55 s for sampling in a fresh process
+(the first prompt runs the checked, sequential path) and 21.2–22.7 s on warm
+prompts, plus about 5–7 s VAE decode; cache-backed AIR BF16 took 71 s for
+sampling in a fresh process. Peak working set while sampling was 10.3–11.9 GiB
+instead of 13.1 GiB, leaving about 4.7–6.3 GiB of system memory free. INT8 is **not**
 quality-equivalent: for one fixed seed the decoded image differs from the AIR
 BF16 image by MAE 24.3/255 (PSNR 14.9 dB).
 
 After the checked first prompt, the host work around each NPU job (norm,
-quantization, GELU, gated residual) runs while the next NPU job executes. The
-output is bitwise identical to the sequential schedule and warm sampling was
-about 10% faster. It is on by default; set `ANIMA_XDNA_INT8_OVERLAP=0` to use
-the sequential schedule. Details, limits and the single-machine caveats are in
-the [reproducibility report](docs/anima-xdna-reproducibility.md#int8-at-1024x1024-with-hostnpu-overlap-2026-11-17).
+quantization, GELU, gated residual, AIR input/output handling) runs while the
+next NPU job executes, and AIR attention tiles alternate with the attention
+output projection on the NPU. The output is bitwise identical to the
+sequential schedule and warm sampling was about 18% faster. It is on by
+default; set `ANIMA_XDNA_INT8_OVERLAP=0` to use the sequential schedule.
+Details, limits and the single-machine caveats are in the reproducibility
+report: [host/NPU overlap](docs/anima-xdna-reproducibility.md#int8-at-1024x1024-with-hostnpu-overlap-2026-11-17)
+and [AIR attention overlap](docs/anima-xdna-reproducibility.md#air-attention-overlap-at-1024x1024-2026-11-17).
 
 ## Supported configuration
 

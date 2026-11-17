@@ -560,16 +560,21 @@ class OptimizedInt8Runtime:
     def attention_tiled(self, execution, prefix, tiles, normalized, context, rotary, gate, hidden):
         """Attention over 1024-row tiles; AIR needs every K/V row, so projections finish first.
 
-        With overlap, the next tile's NPU job runs while the host prepares the current one
-        and while it quantizes/exits around the output projection.
+        With overlap, the next tile's NPU job runs while the host prepares the current one.
+        Prepared Q/K/V go straight into AIR's resident buffers, and AIR tiles then share the
+        NPU with the output projection (see ``attention_air_overlapped``).
         """
         shared = prefix == "attn1"
         tokens = hidden.shape[1]
         count = len(tiles)
         overlap = self.overlapped()
         weights = (execution.weights[prefix + ".norm_q.weight"], execution.weights[prefix + ".norm_k.weight"])
-        query = torch.empty(16, tokens, 128, dtype=torch.bfloat16)
-        key = value = None
+        if overlap:
+            air = execution.attention_runner.runner_for(tokens, tokens if shared else context.shape[-2])
+            queries, key, value = air.resident(count)
+        else:
+            query = torch.empty(16, tokens, 128, dtype=torch.bfloat16)
+            key = value = None
 
         def qkv_start(index):
             start, end = tiles[index]
@@ -591,36 +596,88 @@ class OptimizedInt8Runtime:
             if self.verify_attention:
                 expected = prepare_reference(accumulators, row_scales, weight_scales, *weights, tile_rotary)
                 self.check_boundary(prefix + ".prepare", prepared, expected)
-            query[:, start:end] = prepared[0]
+            if overlap:
+                queries[index].copy_(prepared[0])
+            else:
+                query[:, start:end] = prepared[0]
             if shared:
                 if key is None:
                     key = torch.empty_like(query)
                     value = torch.empty_like(query)
                 key[:, start:end] = prepared[1]
                 value[:, start:end] = prepared[2]
-            elif key is None:
+            elif index == 0:
                 # Cross K/V come from the shared 512-token context, so tile 0 is complete.
-                key, value = prepared[1], prepared[2]
+                if overlap:
+                    key.copy_(prepared[1])
+                    value.copy_(prepared[2])
+                else:
+                    key, value = prepared[1], prepared[2]
+        if overlap:
+            return self.attention_air_overlapped(execution, prefix, tiles, air, key.shape[1], gate, hidden)
         started = time.perf_counter()
         output = execution.attention_runner(query, key, value)
-        wall = (time.perf_counter() - started) * 1000
-        h2d = (query.numel() + key.numel() + value.numel()) * 2
-        d2h = output.numel() * 2
-        execution.metrics.append(block.StageMetric(
-            prefix + ".air_attention", execution.runner_device, wall, len(tiles),
-            4 * execution.config.num_heads * tokens * key.shape[1] * execution.config.head_dim,
-            h2d + d2h, h2d, d2h,
-        ))
+        self.air_metric(execution, prefix, (time.perf_counter() - started) * 1000, count, key.shape[1])
         result = torch.empty_like(hidden)
-
-        def quantize(index):
-            start, end = tiles[index]
-            return execution.host(
+        for index, (start, end) in enumerate(tiles):
+            attended = execution.host(
                 prefix + ".av_layout_quantize",
                 lambda: self.attention_quantize_layout(prefix, output[:, start:end].contiguous()),
             )
+            accumulator = execution.linear(prefix + ".out", attended, prefix + ".to_out.0.weight")
+            execution.host(
+                prefix + ".gated_residual",
+                lambda: self.attention_exit(
+                    prefix, accumulator, gate, hidden[:, start:end], out=result[:, start:end]),
+            )
+        return result
 
-        def leave(index, accumulator):
+    @staticmethod
+    def air_metric(execution, prefix, wall_ms, count, keys):
+        heads, depth = execution.config.num_heads, execution.config.head_dim
+        query_bytes = 2 * heads * 1024 * count * depth
+        h2d = query_bytes + 2 * (2 * heads * keys * depth)
+        execution.metrics.append(block.StageMetric(
+            prefix + ".air_attention", execution.runner_device, wall_ms, count,
+            4 * heads * 1024 * count * keys * depth, h2d + query_bytes, h2d, query_bytes,
+        ))
+
+    def attention_air_overlapped(self, execution, prefix, tiles, air, keys, gate, hidden):
+        """NPU order air0, air1, out0, air2, out1, ...: AIR tiles share the NPU with the output projection.
+
+        Each AIR tile writes one of two resident output slots and is quantized while the next
+        job runs, before AIR reuses that slot; out t's gated residual hides the same way.
+        prepare() already rejected nonfinite Q/K/V and the head-major quantization rejects
+        nonfinite AIR output, so no separate finiteness pass is needed here.
+        """
+        result = torch.empty_like(hidden)
+        attended = None
+        air_ms = 0.0
+
+        def launch_job(kind, index):
+            nonlocal attended
+            if kind == "in":
+                return self.launch(
+                    prefix + ".air_runner_ms", prefix + ".air_hidden_host_ms",
+                    lambda: air.start(index, index % 2, index == 0), air.finish)
+            if attended is None or attended[0] != index:
+                raise AssertionError("Attention out launch must consume the AIR output of its own tile")
+            quantized = attended[1]
+            attended = None
+            return self.attention_out_start(prefix, quantized, index % 2)
+
+        def settle(kind, index, outcome):
+            nonlocal attended, air_ms
+            if kind == "in":
+                output, exposed = outcome
+                air_ms += exposed
+                if index == len(tiles) - 1:
+                    self.air_metric(execution, prefix, air_ms, len(tiles), keys)
+                attended = (index, execution.host(
+                    prefix + ".av_layout_quantize", lambda: self.attention_quantize_layout(prefix, output)))
+                return
+            accumulator, profile = outcome
+            execution.metrics.append(self.linear_metric(prefix + ".out", profile["exposed_ms"], True, profile))
             start, end = tiles[index]
             execution.host(
                 prefix + ".gated_residual",
@@ -628,21 +685,43 @@ class OptimizedInt8Runtime:
                     prefix, accumulator, gate, hidden[:, start:end], out=result[:, start:end]),
             )
 
-        if not overlap:
-            for index in range(count):
-                attended = quantize(index)
-                accumulator = execution.linear(prefix + ".out", attended, prefix + ".to_out.0.weight")
-                leave(index, accumulator)
-            return result
-        pending = self.attention_out_start(prefix, quantize(0), 0)
-        for index in range(count):
-            following = quantize(index + 1) if index + 1 < count else None
-            accumulator, profile = pending()
-            execution.metrics.append(self.linear_metric(prefix + ".out", profile["exposed_ms"], True, profile))
-            if following is not None:
-                pending = self.attention_out_start(prefix, following, (index + 1) % 2)
-            leave(index, accumulator)
+        self.two_stage(len(tiles), launch_job, settle)
         return result
+
+    @staticmethod
+    def two_stage(count, launch_job, settle):
+        """Run in/out job pairs per tile in NPU order in0, in1, out0, in2, out1, ...
+
+        After a job finishes the next one starts first, then the host settles the finished
+        one, unless the next job is that tile's own out job, which needs the settled result.
+        If settling fails, the job still in flight is waited for before the error propagates.
+        """
+        order = [("in", index) for index in range(min(2, count))]
+        for index in range(count):
+            order.append(("out", index))
+            if index + 2 < count:
+                order.append(("in", index + 2))
+        pending = launch_job(*order[0])
+        for position, (kind, index) in enumerate(order):
+            outcome = pending()
+            pending = None
+            following = order[position + 1] if position + 1 < len(order) else None
+            try:
+                if following is None:
+                    settle(kind, index, outcome)
+                elif following == ("out", index):
+                    settle(kind, index, outcome)
+                    pending = launch_job(*following)
+                else:
+                    pending = launch_job(*following)
+                    settle(kind, index, outcome)
+            except BaseException:
+                if pending is not None:
+                    try:
+                        pending()
+                    except Exception:
+                        pass
+                raise
 
     def feed_forward_tiled(self, execution, tiles, activation, gate, hidden):
         """MLP over 1024-row tiles so the INT32 GEMM intermediates stay tile-sized."""
@@ -667,12 +746,6 @@ class OptimizedInt8Runtime:
         (out) of the finished job runs. GELU output and its row scale are consumed by the very
         next out launch, before another GELU can reuse the fused-kernel buffers.
         """
-        count = len(tiles)
-        order = [("in", index) for index in range(min(2, count))]
-        for index in range(count):
-            order.append(("out", index))
-            if index + 2 < count:
-                order.append(("in", index + 2))
         middle = None
 
         def launch_job(kind, index):
@@ -687,8 +760,9 @@ class OptimizedInt8Runtime:
             middle = None
             return self.int8_project_start(quantized, "out", index % 2, scale=row_scale)
 
-        def settle(kind, index, payload, profile):
+        def settle(kind, index, outcome):
             nonlocal middle
+            payload, profile = outcome
             start, end = tiles[index]
             execution.metrics.append(self.linear_metric(
                 "ff.proj_in" if kind == "in" else "ff.proj_out", profile["exposed_ms"], False, profile))
@@ -703,18 +777,7 @@ class OptimizedInt8Runtime:
                     lambda: self.exit(gate, hidden[:, start:end], out=result[:, start:end]),
                 )
 
-        pending = launch_job(*order[0])
-        for position, (kind, index) in enumerate(order):
-            payload, profile = pending()
-            following = order[position + 1] if position + 1 < len(order) else None
-            if following is None:
-                settle(kind, index, payload, profile)
-            elif following == ("out", index):
-                settle(kind, index, payload, profile)
-                pending = launch_job(*following)
-            else:
-                pending = launch_job(*following)
-                settle(kind, index, payload, profile)
+        self.two_stage(len(tiles), launch_job, settle)
         return result
 
     def run_io_tiled(self, execution, inputs):

@@ -3582,7 +3582,8 @@ into the input buffer at `start`. Schedule per block:
   The GELU output is consumed by the `out` launch of its own tile before
   another GELU can replace it; the code asserts this.
 - **Not overlapped:** the AIR attention itself (about 10.2–10.6 s per warm
-  prompt, 44% of overlapped block time). The host is idle during it.
+  prompt, 44% of overlapped block time). The host is idle during it. The
+  [next section](#air-attention-overlap-at-1024x1024-2026-11-17) overlaps it.
 
 Overlap is active when `ANIMA_XDNA_INT8_OVERLAP` is not `0` (default `1`),
 only for tiled blocks, and only after the verified first prompt (its four
@@ -3666,6 +3667,144 @@ and is not committed. Keep paths and captures local.
 CFG > 1, LoRA, CPU-only or HTTP/UI 1024×1024 measurement. The BF16 baseline
 is one cold run. Separate processes may differ by thermal state or
 background load, so the roughly 10% gain is a measured range, not a bound.
+
+## AIR attention overlap at 1024x1024 (2026-11-17)
+
+**Result.** In the overlapped INT8 1024×1024 schedule, AIR attention tiles now
+alternate with the attention output projection on the NPU, and AIR's host
+work runs behind the next NPU job. Warm sampling was **21.2–22.7 s** (three
+warm prompts in two fresh processes), against 23.4–24.8 s for the previous
+overlapped schedule and 25.5 s for that schedule re-measured in the same
+session. Against the sequential schedule (25.9–27.6 s warm), mean warm
+sampling is about 18% lower. Exposed AIR time per warm prompt fell from
+10.2–11.1 s to 6.9–7.8 s. All 1024×1024 latents remain bitwise identical
+(`0107a682…`), and 512×512 is unchanged. Evidence:
+[`evidence/int8-1024-air-overlap.json`](evidence/int8-1024-air-overlap.json).
+
+### Where AIR time went
+
+A private probe of one AIR call with random BF16 inputs (10 threads) split
+the time like this:
+
+| Part (ms per call) | Self, 4096 keys | Cross, 512 keys |
+|---|---:|---:|
+| Whole call | 62.3 | 19.8 |
+| Kernel, four 1024-row tiles | 46.65 | 11.44 |
+| Finiteness checks (inputs + output) | 4.48 + 4.44 | 1.84 + 2.49 |
+| Query layout and copies into/out of the buffers | 4.45 | not split |
+| Host total (whole call minus kernel) | ≈15.6 | ≈8.4 |
+
+Over 112 block calls per prompt, the kernels alone take about 5.2 s (self)
+plus 1.3 s (cross), and the host part about 2.7 s, all of it with the NPU idle.
+
+A second probe launched an AIR tile and an INT8 `proj_out` GEMM on separate
+hardware contexts at the same time. Together they took 12.53 ms, against
+13.12 ms back to back and 10.96 ms for the AIR tile alone, so the NPU does
+not run them concurrently to any useful degree. The schedule therefore keeps
+one NPU job in flight and hides host work, not NPU work.
+
+### Design
+
+- **Resident AIR buffers.** Each AIR runner allocates its query tiles, K/V and
+  two output slots once as XRT buffer objects mapped as BF16 tensors. The
+  host-side Q/K/V preparation writes straight into them, so the staging copies
+  disappear. `start(tile, slot, upload_kv)` syncs K/V (first tile only) and the
+  query tile, then launches without waiting. `finish` waits and syncs the output
+  slot back. The buffers take about 56 MB (self) and 28 MB (cross) and replace
+  the 40 MB and 12 MB sequential buffer sets, which are released.
+- **Schedule.** After the tiled QKV phase, the NPU order per block is `air0,
+  air1, out0, air2, out1, air3, out2, out3`, the same two-stage order as the
+  MLP. Each finished AIR tile is quantized behind the next job, before AIR
+  writes that output slot again. Each `out` job's gated residual also runs
+  behind the next job. The `out` launch must consume its own tile's
+  quantization; the code asserts this. If host work fails mid-schedule, the
+  job in flight is waited for before the error propagates.
+- **Finiteness.** The overlapped path drops AIR's separate finiteness passes.
+  The fused Q/K/V preparation already rejects non-finite Q/K/V, and the
+  head-major quantization of the AIR output rejects any non-finite value with
+  an error. The verified first prompt still uses the sequential AIR call with
+  its checks, and so does 512×512.
+
+The gate is unchanged: overlap runs when `ANIMA_XDNA_INT8_OVERLAP` is not `0`
+(default `1`), only for tiled blocks, and only after the four verified
+forwards.
+
+### Measurement
+
+The setup matched the previous section: a fresh standalone ComfyUI process
+per variant with the real nodes, **Load Anima XDNA (Cache-backed)**, Turbo
+V1.1, seed `700755787614899`, four Euler/simple steps, CFG 1,
+`int8-attn-l1k64-nq8pp` and AIR `nq8pp`. To separate code from machine state,
+the previous commit was re-measured in the same session from an export of
+that commit.
+
+| Variant | Sampling s (run 0 / 1 / 2) | Warm block s | Latent |
+|---|---:|---:|---|
+| AIR overlap, process A | 54.55 / 21.34 / 22.66 | 20.91 / 22.22 | `0107a682…` |
+| AIR overlap, process B | 52.28 / 21.22 | 20.78 | `0107a682…` |
+| Previous overlap, re-measured | 52.13 / 25.54 | 25.07 | `0107a682…` |
+| Previous overlap, previous section | 49.04 / 23.43 / 24.80 | 22.96 / 24.32 | `0107a682…` |
+
+The cold first prompt was 2–5 s slower in every process measured this
+session, including the previous commit (52.1 s), so that shift comes from
+machine state, not this change. The first prompt runs mostly the sequential
+verified path, so it is not expected to gain much.
+
+Exposed NPU wait per warm prompt (s):
+
+| Stage | AIR overlap | Previous overlap |
+|---|---:|---:|
+| Self-attention AIR | 5.55–6.35 | 7.47–8.10 |
+| Cross-attention AIR | 1.31–1.41 | 2.52–2.95 |
+| Attention output projections | 1.24–1.39 | 0.83–0.95 |
+| Sum | 8.10–9.15 | 11.02–11.94 |
+
+The output projections now expose more wait, because less host work sits
+behind each `out` job. The net attention saving is about 2–4 s per prompt.
+Host work hidden behind AIR in a warm prompt was 0.15 s (self) and 0.19 s
+(cross); host work hidden behind the output projections was 0.25 s and
+0.19 s. Exposed AIR time is now within 0.4–1.3 s of the probe's kernel-only
+time (6.5 s). What remains is mostly the per-tile buffer syncs and launch.
+
+Sampling-phase memory peaks were unchanged within noise. In process A, the
+cold run peaked at 11.81 GiB working set and 10.29 GiB private, with
+4.87 GiB minimum available. Warm runs peaked at 10.35 GiB, 9.69 GiB and
+6.32 GiB. The re-measured previous commit gave 11.82 / 10.37 / 4.86 GiB cold
+and 10.75 / 9.68 / 5.94 GiB warm.
+
+At 512×512 the overlap does not apply. One process gave 15.29 / 5.64 s
+sampling (previous: 14.87 / 5.57 s), latent `4e4de447…` bitwise identical,
+and 8.01 / 7.05 GiB private peaks (previous: 8.00 / 7.03 GiB).
+
+### Use and reproduction
+
+No new setting: `ANIMA_XDNA_INT8_OVERLAP=0` still selects the sequential
+schedule. As before, 1024×1024 needs `self4096` beside `self` and `cross`, and
+an installed ComfyUI copy needs the new code copied in.
+
+The private `implementation-air-overlap.zip` archive has 35 members, 17,470,236
+bytes and SHA-256
+`0fa4606d28534ae073c65f504e3903ac1859d17f173ba877e8dd50c7d3058542`. It pins:
+
+- the code patch against the previous commit;
+- the unchanged measurement script (SHA-256
+  `c99814364920317ed3e6b1d687b5281bf82447c34b0608e7472f78c75e4420c2`);
+- the AIR probes (SHA-256
+  `40867cfaa994ccad14d655ff3de85a10056a6c49f804b7b1782fccbad8b22cb2` and
+  `8d8a1390b1eb3aab7ecbf2086ab6d8fb305e67509ea39e89d1a9b2bf601dd95e`);
+- the concurrency probe (SHA-256
+  `45b0ce18372ccaaa5ef9de633da515e978cb56e9975bf5aae17bb33f326e0b64`);
+- console logs, result and memory traces, latents and PNGs.
+
+It contains no model weights and is not committed. Keep paths and captures
+local.
+
+**Limits.** One machine, seed and prompt; one to three warm runs per variant.
+No CFG > 1, LoRA or HTTP/UI measurement. Warm times of the same code varied
+by up to 2.1 s between runs and processes, so the gain is a measured range,
+not a bound. Ideas not tried: caching cross-attention K/V per
+block (the cross QKV projection recomputes the context K/V for every tile)
+and fewer per-tile buffer syncs.
 
 ## Public verification ladder
 

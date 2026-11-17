@@ -448,6 +448,69 @@ class AIRAttentionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             attention.run(q[:, :, :64], k, k)
 
+    def test_resident_launches_reuse_key_value_and_alternate_output_slots(self):
+        syncs = []
+
+        class FakeBO:
+            def __init__(self, size):
+                self.memory = bytearray(size)
+
+            def map(self):
+                return memoryview(self.memory)
+
+            def sync(self, direction):
+                syncs.append((direction, self))
+
+        class FakeRun:
+            def __init__(self, kernel):
+                self.args = {}
+
+            def set_arg(self, index, bo):
+                self.args[index] = bo
+
+            def start(self):
+                self.args[3].memory[:] = self.args[0].memory
+
+            def wait2(self):
+                pass
+
+        xrt = SimpleNamespace(
+            ext=SimpleNamespace(bo=lambda device, size: FakeBO(size)), run=FakeRun,
+            xclBOSyncDirection=SimpleNamespace(XCL_BO_SYNC_BO_TO_DEVICE="h2d", XCL_BO_SYNC_BO_FROM_DEVICE="d2h"),
+        )
+        attention = AIRAttention.__new__(AIRAttention)
+        attention.shape = AttentionShape(512)
+        attention.runner = SimpleNamespace(_xrt=xrt, device=None, kernel=None, _bos={"attention": None}, unload=Mock())
+        attention._init_resident()
+
+        queries, key, value = attention.resident(2)
+        self.assertEqual(attention.runner._bos, {})
+        self.assertEqual([tuple(q.shape) for q in queries], [(16, 1024, 128)] * 2)
+        self.assertEqual((tuple(key.shape), key.dtype), ((16, 512, 128), torch.bfloat16))
+        self.assertEqual([d for d, _ in syncs], ["h2d", "h2d"])
+        syncs.clear()
+        queries[0].fill_(1)
+        queries[1].fill_(2)
+        first = attention.finish(attention.start(0, 0, True))
+        second = attention.finish(attention.start(1, 1, False))
+        self.assertTrue(bool((first == 1).all()) and bool((second == 2).all()))
+        kv = attention._kv_bos
+        self.assertEqual(syncs, [
+            ("h2d", kv[0]), ("h2d", kv[1]), ("h2d", attention._query_bos[0]), ("d2h", attention._output_bos[0]),
+            ("h2d", attention._query_bos[1]), ("d2h", attention._output_bos[1]),
+        ])
+        attention.runner._bos["attention"] = None
+        self.assertIs(attention.resident(1)[0][0], queries[0])
+        self.assertEqual(attention.runner._bos, {})
+        for invalid in ((2, 0, False), (0, 2, False)):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                attention.start(*invalid)
+        with self.assertRaises(ValueError):
+            attention.resident(5)
+        attention.close()
+        self.assertEqual((attention._queries, attention._output_bos), ([], []))
+        attention.runner.unload.assert_called_once()
+
     @unittest.skipUnless(importlib.util.find_spec("air"), "MLIR-AIR bindings not installed")
     def test_direct_air_module_keeps_intermediates_on_device(self):
         for keys, query_cores in ((512, 4), (1024, 4), (1024, 8), (4096, 8)):

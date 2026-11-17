@@ -88,6 +88,89 @@ class AIRAttention:
         from triton.backends.amd_triton_npu.multilaunch import MultiLaunchRunner
 
         self.runner = MultiLaunchRunner(str(elf), artifacts["elf_kernel_name"])
+        self._init_resident()
+
+    def _init_resident(self):
+        self._query_bos, self._queries = [], []
+        self._kv_bos, self._kv = [], []
+        self._output_bos, self._outputs = [], []
+
+    def _resident_buffer(self, shape):
+        import numpy as np
+        import torch
+
+        count = 1
+        for size in shape:
+            count *= size
+        bo = self.runner._xrt.ext.bo(self.runner.device, 2 * count)
+        view = np.frombuffer(bo.map(), dtype=np.int16, count=count)
+        return bo, torch.from_numpy(view).view(torch.bfloat16).reshape(shape)
+
+    def resident(self, tiles):
+        """BO-backed ``(query tiles, key, value)`` that ``start`` reads without a staging copy.
+
+        The caller writes each launch's inputs into these tensors first. They are
+        reused by every later call and stay valid until ``close``. The sequential
+        ``run`` buffer set is released on every call; ``run`` re-creates it if needed.
+        """
+        s = self.shape
+        if type(tiles) is not int or not 1 <= tiles <= 4:
+            raise ValueError("AIR resident buffers support 1..4 query tiles")
+        # The cross runner is shared with 512x512, whose sequential run() may have re-created it.
+        self.runner._bos.pop("attention", None)
+        try:
+            if not self._outputs:
+                for _ in range(2):
+                    bo, view = self._resident_buffer((s.heads, s.keys, s.depth))
+                    self._kv_bos.append(bo)
+                    self._kv.append(view)
+                to_device = self.runner._xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE
+                for _ in range(2):
+                    bo, view = self._resident_buffer((s.heads, s.queries, s.depth))
+                    view.zero_()
+                    bo.sync(to_device)
+                    self._output_bos.append(bo)
+                    self._outputs.append(view)
+            while len(self._queries) < tiles:
+                bo, view = self._resident_buffer((s.heads, s.queries, s.depth))
+                self._query_bos.append(bo)
+                self._queries.append(view)
+        except Exception:
+            self._release_resident()
+            raise
+        return tuple(self._queries[:tiles]), self._kv[0], self._kv[1]
+
+    def start(self, tile, slot, upload_kv):
+        """Launch AIR on resident query ``tile`` into output ``slot`` (0 or 1) without waiting.
+
+        ``upload_kv`` syncs the resident K/V first; later tiles of the same call reuse
+        them. Only one NPU job may be in flight; ``finish`` must follow.
+        """
+        if slot not in (0, 1) or not self._outputs or not 0 <= tile < len(self._queries):
+            raise ValueError("AIR start requires resident buffers for this tile and slot 0 or 1")
+        xrt = self.runner._xrt
+        to_device = xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE
+        if upload_kv:
+            for bo in self._kv_bos:
+                bo.sync(to_device)
+        self._query_bos[tile].sync(to_device)
+        run = xrt.run(self.runner.kernel)
+        for index, bo in enumerate((self._query_bos[tile], *self._kv_bos, self._output_bos[slot])):
+            run.set_arg(index, bo)
+        run.start()
+        return run, slot
+
+    def finish(self, pending):
+        """Wait for ``start``; the returned view stays valid until that slot is launched again."""
+        run, slot = pending
+        run.wait2()
+        self._output_bos[slot].sync(self.runner._xrt.xclBOSyncDirection.XCL_BO_SYNC_BO_FROM_DEVICE)
+        return self._outputs[slot]
+
+    def _release_resident(self):
+        # Drop tensor views before releasing the BO storage they alias.
+        self._queries, self._kv, self._outputs = [], [], []
+        self._query_bos, self._kv_bos, self._output_bos = [], [], []
 
     def run(self, query, key, value):
         """Attend ``query`` over the compiled key length.
@@ -132,6 +215,7 @@ class AIRAttention:
         return output
 
     def close(self):
+        self._release_resident()
         self.runner.unload()
 
 
@@ -208,14 +292,17 @@ class AIRAttentionBackend:
                 image_tokens, image_tokens // 1024,
             )
 
-    def __call__(self, query, key, value):
-        tokens, keys = query.shape[1], key.shape[1]
+    def runner_for(self, tokens, keys):
+        """The opened runner for ``tokens`` image queries over ``keys`` keys."""
         if tokens not in self.SELF_ARTIFACTS or keys not in (self.CONTEXT_TOKENS, tokens):
             raise UnsupportedTensor(
                 f"unsupported AIR attention shape: {tokens} queries, {keys} keys"
             )
         self._open(tokens)
-        return self.runners[keys].run(query, key, value)
+        return self.runners[keys]
+
+    def __call__(self, query, key, value):
+        return self.runner_for(query.shape[1], key.shape[1]).run(query, key, value)
 
     def close(self):
         self._announced.clear()
