@@ -918,6 +918,7 @@ class PackedWeightCache:
         self.status: Optional[CacheStatus] = None
         self._lease: Optional[_VerifiedPayloadLease] = None
         self._mapped = None
+        self._mapping_released = False
         self._host_linears: dict[tuple[int, str], torch.Tensor] = {}
 
     def identify(self) -> tuple[str, dict[str, Any], CacheTimings]:
@@ -1772,10 +1773,30 @@ class PackedWeightCache:
 
     def close(self) -> None:
         self._mapped = None
+        self._mapping_released = False
         self._host_linears.clear()
         if self._lease is not None:
             self._lease.release()
             self._lease = None
+
+    def release_mapping(self) -> None:
+        """Unmap the payload while keeping it verified for a lazy remap."""
+        if self._lease is None:
+            return
+        self.close()
+        self._mapping_released = True
+
+    def _remap(self) -> None:
+        if self.status is None or self.manifest is None:
+            raise RuntimeError("packed weight cache is not open")
+        identity = _verified_payload_identity(
+            self.status.path,
+            self.status.key,
+            self.manifest,
+        )
+        self._lease = _VERIFIED_PAYLOADS.acquire(identity)
+        self._mapped = self._lease.mapped
+        self._mapping_released = False
 
     def __enter__(self):
         self.open()
@@ -1785,6 +1806,8 @@ class PackedWeightCache:
         self.close()
 
     def _record(self, identifier: str) -> dict[str, Any]:
+        if self._mapped is None and self._mapping_released:
+            self._remap()
         if self.manifest is None or self._mapped is None:
             raise RuntimeError("packed weight cache is not open")
         for record in self.manifest["tensors"]:

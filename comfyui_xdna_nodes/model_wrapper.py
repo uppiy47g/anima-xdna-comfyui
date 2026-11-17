@@ -170,10 +170,6 @@ class SharedRuntime:
         with self._lock:
             if self._runtime is not None:
                 return
-            if cache_backed and (
-                self.effective_tensor_provider is not None or self.lora_patch_count
-            ):
-                raise RuntimeError("Cache-backed MODEL cannot use live LoRA patches")
             started = time.perf_counter()
             runtime = AnimaXDNAChainRuntime(
                 self.checkpoint,
@@ -344,6 +340,13 @@ class SharedRuntime:
                 self._runtime.__enter__()
                 self.diagnostics.state = "open"
             return self._runtime
+
+    def suspend(self):
+        """Release XRT resident weights; the next forward reopens lazily."""
+        with self._npu_lock, self._lock:
+            if self._runtime is not None and self._runtime.is_open:
+                self._runtime.close_session()
+                self.diagnostics.state = "prepared"
 
     def close(self):
         with self._lock:
@@ -620,12 +623,16 @@ class RuntimeAttachment:
 
 
 class AnimaXDNADiffusionWrapper:
-    def __init__(self, runtime: SharedRuntime):
+    def __init__(self, runtime: Optional[SharedRuntime]):
         self.runtime = runtime
 
+    def _runtime_for(self, executor) -> SharedRuntime:
+        return self.runtime
+
     def __call__(self, executor, x, timesteps, context, fps=None, padding_mask=None, **kwargs):
+        runtime = self._runtime_for(executor)
         try:
-            return self.runtime.forward(
+            return runtime.forward(
                 executor.class_obj,
                 x,
                 timesteps,
@@ -635,7 +642,7 @@ class AnimaXDNADiffusionWrapper:
                 **kwargs,
             )
         except PrototypeError as error:
-            self.runtime.diagnostics.last_error = str(error)
+            runtime.diagnostics.last_error = str(error)
             raise RuntimeError(f"Anima XDNA execution failed: {error}") from error
 
     def to(self, _device):
@@ -675,7 +682,15 @@ def _validate_patcher(model):
         )
 
 
-def _effective_lora_provider(model):
+def _effective_lora_provider(model, base_source=None):
+    """Snapshot block patches into an effective BF16 tensor provider.
+
+    ``base_source`` supplies base block tensors for MODELs without block
+    parameters (cache-backed): ``key_patches(patches)`` returns the same
+    mapping as ``ModelPatcher.get_key_patches`` with shape-only bases,
+    ``tensor(model_key)`` materializes one BF16 base tensor, and
+    ``block_fingerprint`` is the already verified base execution identity.
+    """
     snapshot_started = time.perf_counter()
     snapshot_clone_ms = 0.0
     snapshot_hash_ms = 0.0
@@ -689,7 +704,7 @@ def _effective_lora_provider(model):
     }
     if not block_patch_keys:
         return None, 0, None, None
-    if not hasattr(model, "get_key_patches"):
+    if base_source is None and not hasattr(model, "get_key_patches"):
         raise RuntimeError(
             "unsupported ComfyUI ModelPatcher API; missing get_key_patches"
         )
@@ -706,7 +721,11 @@ def _effective_lora_provider(model):
             f"commit {SUPPORTED_COMFY_COMMIT}."
         ) from error
 
-    key_patches = model.get_key_patches("diffusion_model.")
+    key_patches = (
+        base_source.key_patches(patches)
+        if base_source is not None
+        else model.get_key_patches("diffusion_model.")
+    )
     schema = detect_checkpoint_schema(key_patches.keys())
     canonical_to_model = dict(schema.canonical_to_source)
     canonical_model_keys = set(canonical_to_model.values())
@@ -921,19 +940,27 @@ def _effective_lora_provider(model):
 
     cpu = torch.device("cpu")
 
+    def materialized_base(model_key: str, base: torch.Tensor) -> torch.Tensor:
+        if base_source is None:
+            return base
+        return base_source.tensor(model_key)
+
     def base_provider(canonical_key: str) -> torch.Tensor:
-        _model_key, entries = entries_by_canonical[canonical_key]
+        model_key, entries = entries_by_canonical[canonical_key]
         base, convert = entries[0]
         tensor = comfy.model_management.cast_to_device(
-            base, cpu, torch.bfloat16, copy=True
+            materialized_base(model_key, base), cpu, torch.bfloat16, copy=True
         )
         return convert(tensor, inplace=True).detach().contiguous()
 
     base_identity_started = time.perf_counter()
-    base_identity = fingerprint_effective_tensors(
-        base_provider,
-        range(28),
-    )
+    if base_source is None:
+        base_fingerprint = fingerprint_effective_tensors(
+            base_provider,
+            range(28),
+        )["block_fingerprint"]
+    else:
+        base_fingerprint = base_source.block_fingerprint
     base_identity_ms = (
         time.perf_counter() - base_identity_started
     ) * 1000
@@ -941,6 +968,7 @@ def _effective_lora_provider(model):
     def provider(canonical_key: str) -> torch.Tensor:
         model_key, entries = entries_by_canonical[canonical_key]
         base, convert = entries[0]
+        base = materialized_base(model_key, base)
         compute_dtype = comfy.model_management.lora_compute_dtype(cpu)
         tensor = comfy.model_management.cast_to_device(
             base, cpu, compute_dtype, copy=True
@@ -991,7 +1019,7 @@ def _effective_lora_provider(model):
     return (
         provider,
         patch_count,
-        base_identity["block_fingerprint"],
+        base_fingerprint,
         schema.name,
     )
 

@@ -851,6 +851,35 @@ class PackedWeightCacheTests(unittest.TestCase):
             rebuilt.close()
             self.assertFalse(rebuilt_status.hit)
 
+    def test_released_mapping_remaps_lazily_and_rechecks_identity(self):
+        config = _tiny_block_config()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkpoint = root / "model.safetensors"
+            _save_blocks(checkpoint, config)
+            cache = PackedWeightCache(checkpoint, config, 0, 1, root / "cache")
+            status = cache.open()
+            expected = cache.tensor("0:attn1.to_q.weight:k0")
+            record = cache._lease._record
+
+            cache.release_mapping()
+            self.assertIsNone(cache._mapped)
+            self.assertIsNone(record.mapped)
+            self.assertTrue(
+                torch.equal(cache.tensor("0:attn1.to_q.weight:k0"), expected)
+            )
+            self.assertIsNotNone(record.mapped)
+
+            cache.release_mapping()
+            manifest_path = status.path / "manifest.json"
+            manifest_path.write_text(
+                manifest_path.read_text(encoding="utf-8") + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(CacheIntegrityError, "not verified"):
+                cache.tensor("0:attn1.to_q.weight:k0")
+            cache.close()
+
     def test_manifest_change_invalidates_process_local_verification(self):
         config = _tiny_block_config()
         with tempfile.TemporaryDirectory() as directory:

@@ -135,14 +135,21 @@ ComfyUI block Parameters. Connect its MODEL directly to the sampler in
 ComfyUI `--cpu`. The original checkpoint is still required. This is not
 INT8 conversion; BF16 weights and the existing CPU compute policy are retained.
 
-Live LoRAs/weight patches and saving this execution-only MODEL as a checkpoint
-are unsupported; use the original workflow for them. See the
+Standard **Load LoRA** / **Load LoRA Model Only** nodes can be placed after
+this loader, with the same supported LoRA types as the original workflow.
+The first prompt with a new LoRA builds or verifies its effective packed
+cache; base and LoRA MODELs can then be switched without reloading. Weight
+hooks, bypass LoRA nodes, unsupported LoRA types and saving this
+execution-only MODEL as a checkpoint are rejected. See the
 [cache-backed loader guide](comfyui_xdna_nodes/README.md#cache-backed-execution-only-loader).
 
 In one matched 512×512 Turbo/AIR run, peak process working set fell from
 15.36 to 11.76 GiB (3.60 GiB / 23.4% less), with bitwise-identical latents
 and pixel-identical images. This is not a 1024×1024 measurement; see the
 [memory experiment](docs/anima-xdna-reproducibility.md#cache-backed-model-loader-and-512x512-memory-2026-11-17).
+With one 512×512 LoRA, peak working set was 11.92 GiB versus 16.52 GiB for
+the original LoRA workflow, again with bitwise-identical latents; see the
+[LoRA experiment](docs/anima-xdna-reproducibility.md#cache-backed-loader-with-standard-lora-nodes-2026-11-17).
 
 #### 1024×1024 output
 

@@ -167,15 +167,38 @@ Normal MODEL clones share the host module and reference-counted XDNA runtime.
 closes the cache and device resources. Reload the MODEL before using an
 explicitly unloaded attachment again.
 
-Live LoRA/weight patches, weight hooks, GPU placement, and checkpoint saving
-or merging are rejected rather than silently ignoring missing blocks. Use
-the original loader/LoRA/attach workflow below when those weight operations
-are needed. Full checkpoints that already contain merged weights can be
-selected normally. This loader does not change AIR's numerical limitations.
+Standard **Load LoRA** or **Load LoRA Model Only** nodes can follow this
+loader, chained as usual. The MODEL exposes the block keys as BF16 meta
+placeholders, so ComfyUI's normal LoRA key mapping accepts block patches
+without allocating block weights. ComfyUI applies host-layer patches; block
+patches are consumed by XDNA. Before a patched MODEL first samples, the loader
+validates its patches, reads base block tensors from the original checkpoint
+on demand, and builds or reuses the effective-weight packed cache exactly as
+the original attach path does. The supported patch types and strengths are
+the same as in the [original workflow](#original-loader-and-attach-workflow);
+unsupported types raise before NPU dispatch.
+
+Each distinct patch set gets one runtime, reused across prompts and clones.
+When a different MODEL samples, for example switching from a LoRA back to the
+base, the previously resident runtime is suspended: its XRT buffers close and
+its cache mapping is released, then remapped with an identity check on next
+use. The first prompt with a new LoRA therefore includes the effective-cache
+build (about 25 s at 512x512) or verification (about 16 s); repeat prompts do
+not. **Anima XDNA Runtime Status** shows the base runtime for a LoRA MODEL
+until that MODEL has sampled once.
+
+Weight hooks, bypass LoRA nodes (**Load LoRA (Bypass) (For debugging)** and
+its Model Only variant), GPU placement and checkpoint saving or merging are
+rejected rather than silently ignoring missing blocks. Full checkpoints that already
+contain merged weights can be selected normally. This loader does not change
+AIR's numerical limitations.
 
 The [512x512 memory experiment](../docs/anima-xdna-reproducibility.md#cache-backed-model-loader-and-512x512-memory-2026-11-17)
 measured a 3.60 GiB reduction in peak process working set, with identical
-latents and pixels. A 1024x1024 memory comparison was not run.
+latents and pixels. A 1024x1024 memory comparison was not run. With one
+LoRA, the [LoRA experiment](../docs/anima-xdna-reproducibility.md#cache-backed-loader-with-standard-lora-nodes-2026-11-17)
+measured 11.92 GiB versus 16.52 GiB for the original LoRA workflow, with
+identical latents, including after base/LoRA switching.
 
 ### Original loader and attach workflow
 

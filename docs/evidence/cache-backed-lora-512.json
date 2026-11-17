@@ -1,0 +1,298 @@
+{
+  "date": "2026-11-17",
+  "status": "measured_512x512_cache_backed_lora",
+  "repository_base": "18778c1",
+  "implementation": {
+    "keys": "block state_dict exposes BF16 meta placeholders, so ComfyUI's standard LoRA key map and add_patches accept block keys without allocating block weights",
+    "application": "ComfyUI applies host-layer patches; block patches are never applied by ComfyUI (parameter-free blocks) and are consumed by the XDNA runtime",
+    "runtime": "pre_run validates the patch contract, reads base block tensors from the checkpoint on demand, and builds or reuses the effective BF16 packed cache keyed by checkpoint and LoRA content; one runtime per patches_uuid, reused across prompts and clones",
+    "switching": "a newly selected runtime suspends the previously resident one: XRT buffers and AIR runners close and the packed-cache mapping is released; reopening remaps through the in-process verified lease (identity re-checked)",
+    "supported": [
+      "ordinary additive 2-D LoRAAdapter",
+      "hybrid Turbo Q/K norm diff",
+      "any finite strength"
+    ],
+    "unsupported": [
+      "LoHa/LoKr/OFT/DoRA/reshape/mid-weight LoRA",
+      "other block diff/bias patches",
+      "weight hooks",
+      "GPU host placement",
+      "checkpoint saving/merging"
+    ],
+    "original_loader_unchanged": true
+  },
+  "configuration": {
+    "size": [
+      512,
+      512
+    ],
+    "steps": 4,
+    "cfg": 1.0,
+    "seed": 700755787614899,
+    "sampler": "euler",
+    "scheduler": "simple",
+    "model": "anima_turboV11",
+    "backend": "air",
+    "torch_threads": 10,
+    "vae": "default_fp32",
+    "torch_version": "2.14.1+cpu",
+    "python": "3.13.9 (tags/v3.13.9:8183fa5, Oct 14 2025, 14:09:13) [MSC v.1944 64 bit (AMD64)]",
+    "comfyui_commit": "170594057a22673349ddf0a3d88624b7fa5865bb",
+    "cpu": "AMD Ryzen AI 9 365",
+    "device": "XDNA 2 npu2",
+    "system_physical_bytes": 25359659008,
+    "xrt_sdk": "2.21.75",
+    "triton_xdna": "3.6.0.2026093004+75679dc",
+    "air_schedule": "nq8pp (self and cross)",
+    "adaln_device": "host",
+    "optimized_int8_profile": false,
+    "gemm_layout_override": false,
+    "disk_weight_cache": "base cache verified hit; LoRA effective cache built in cache_cold, then a verified hit in legacy and both warm runs",
+    "block_fingerprint": "066b4281037504b1b7200ecd65b4182fc765ed882ecd5ca650db7308246a8dee",
+    "positive": "a cheerful anime girl under cherry blossoms, detailed illustration, soft daylight",
+    "negative": "worst quality, low quality, blurry, jpeg artifacts",
+    "lora": {
+      "file": "anima-highres-aesthetic-boost.safetensors",
+      "bytes": 138662176,
+      "sha256": "db5b2dcc4e1afa215058b7a85fb9377124c2e9aabd48c25e595af7199207c299",
+      "format": "BF16 diffusion_model.blocks.*.lora_A/lora_B pairs; 448 block patches, no host-layer keys",
+      "node": "LoraLoaderModelOnly",
+      "strength_model": 1.0
+    }
+  },
+  "methodology": {
+    "execution": "Separate fresh standalone ComfyUI Python processes invoking the actual loader, LoraLoaderModelOnly, CLIP, KSampler and VAEDecode nodes, not an HTTP server or GUI measurement. Order: cache_cold, legacy, cache_warm_mapping_retained, then cache_warm after the mapping-release fix. Legacy samples LoRA twice; cache runs sample LoRA, LoRA, base, LoRA with the same seed.",
+    "memory": "Windows GetProcessMemoryInfo PROCESS_MEMORY_COUNTERS_EX: PeakWorkingSetSize and PeakPagefileUsage through explicit unload/GC. Current PrivateUsage and WorkingSetSize and GlobalMemoryStatusEx available physical memory sampled every 50 ms; actual intervals may be longer under load.",
+    "accounting": "Working set (resident RAM) and private commit are distinct. Do not add XRT BO, mmap or parameter-byte counts to these OS counters. System available memory includes other processes and the OS cache.",
+    "lora_phase": "Peaks through the second LoRA decode (after_decode_1), before any base/LoRA switching.",
+    "scope": "One machine, checkpoint, LoRA, seed and run per variant; a memory/output parity check, not a statistically controlled speed comparison."
+  },
+  "measurements": {
+    "legacy": {
+      "node_chain": "LoadAnimaBF16 -> LoraLoaderModelOnly -> LoadAttachAnimaXDNAModel",
+      "code": "final",
+      "loader_seconds": 27.6568914999998,
+      "runs": [
+        {
+          "label": "lora",
+          "sampler_seconds": 26.622822299999825,
+          "latent_sha256": "7943df48dd62a6185c89e1032d6b4228ecc7264e60cc5f02feeba654eca738b2",
+          "rgb_sha256": "e374b56a721178955424f71e839747587d37474fe0696c6d3ff5c66ef86a55a9"
+        },
+        {
+          "label": "lora",
+          "sampler_seconds": 16.24592870000015,
+          "latent_sha256": "7943df48dd62a6185c89e1032d6b4228ecc7264e60cc5f02feeba654eca738b2",
+          "rgb_sha256": "e374b56a721178955424f71e839747587d37474fe0696c6d3ff5c66ef86a55a9"
+        }
+      ],
+      "lora_effective_cache": {
+        "hit": true,
+        "reason": "verified hit",
+        "packed_bytes": 3963645952,
+        "fingerprint_ms": 12592.925899999955,
+        "pack_ms": 0.0,
+        "verify_ms": 2886.453199999778,
+        "total_ms": 15600.59880000017,
+        "runtime_cold_setup_ms": 15737.25450000029,
+        "lora_patch_count": 448
+      },
+      "lora_phase_peak_working_set_bytes": 17738522624,
+      "lora_phase_peak_private_commit_bytes": 22681952256,
+      "lora_phase_min_system_available_bytes": 204800,
+      "process_peak_working_set_bytes": 17738522624,
+      "process_peak_private_commit_bytes": 22681952256,
+      "private_commit_after_model_gc_bytes": 13078515712,
+      "runtimes_closed_after_unload": true,
+      "runtime_count": 1
+    },
+    "cache_cold": {
+      "node_chain": "LoadAnimaXDNACache -> LoraLoaderModelOnly (base MODEL kept for switching)",
+      "code": "final except mapping release on suspend",
+      "loader_seconds": 8.509091400000216,
+      "runs": [
+        {
+          "label": "lora",
+          "sampler_seconds": 45.99026090000007,
+          "latent_sha256": "7943df48dd62a6185c89e1032d6b4228ecc7264e60cc5f02feeba654eca738b2",
+          "rgb_sha256": "e374b56a721178955424f71e839747587d37474fe0696c6d3ff5c66ef86a55a9"
+        },
+        {
+          "label": "lora",
+          "sampler_seconds": 15.628968600000007,
+          "latent_sha256": "7943df48dd62a6185c89e1032d6b4228ecc7264e60cc5f02feeba654eca738b2",
+          "rgb_sha256": "e374b56a721178955424f71e839747587d37474fe0696c6d3ff5c66ef86a55a9"
+        },
+        {
+          "label": "base",
+          "sampler_seconds": 23.770373899999868,
+          "latent_sha256": "956f9bc941b33c426311d7e0645464126cf03eeec1c65a4af45bf70d1c2eafd3",
+          "rgb_sha256": "e991714d06d158d3462752f9ea311f7f339eb76ea2c6f7de2e93400c708fbb48"
+        },
+        {
+          "label": "lora",
+          "sampler_seconds": 18.58836119999978,
+          "latent_sha256": "7943df48dd62a6185c89e1032d6b4228ecc7264e60cc5f02feeba654eca738b2",
+          "rgb_sha256": "e374b56a721178955424f71e839747587d37474fe0696c6d3ff5c66ef86a55a9"
+        }
+      ],
+      "lora_effective_cache": {
+        "hit": false,
+        "reason": "cache miss",
+        "packed_bytes": 3963645952,
+        "fingerprint_ms": 24767.65609999984,
+        "pack_ms": 21346.28180000027,
+        "verify_ms": 0.0,
+        "total_ms": 24923.444600000494,
+        "runtime_cold_setup_ms": 24926.104900000155,
+        "lora_patch_count": 448
+      },
+      "lora_phase_peak_working_set_bytes": 12771827712,
+      "lora_phase_peak_private_commit_bytes": 15805841408,
+      "lora_phase_min_system_available_bytes": 2321997824,
+      "process_peak_working_set_bytes": 15904411648,
+      "process_peak_private_commit_bytes": 15805841408,
+      "private_commit_after_model_gc_bytes": 3551604736,
+      "runtimes_closed_after_unload": true,
+      "runtime_count": 2
+    },
+    "cache_warm_mapping_retained": {
+      "node_chain": "LoadAnimaXDNACache -> LoraLoaderModelOnly (base MODEL kept for switching)",
+      "code": "suspend kept the packed-cache mapping (pre-fix diagnostic)",
+      "loader_seconds": 9.06641290000016,
+      "runs": [
+        {
+          "label": "lora",
+          "sampler_seconds": 36.00410910000028,
+          "latent_sha256": "7943df48dd62a6185c89e1032d6b4228ecc7264e60cc5f02feeba654eca738b2",
+          "rgb_sha256": "e374b56a721178955424f71e839747587d37474fe0696c6d3ff5c66ef86a55a9"
+        },
+        {
+          "label": "lora",
+          "sampler_seconds": 15.599580600000081,
+          "latent_sha256": "7943df48dd62a6185c89e1032d6b4228ecc7264e60cc5f02feeba654eca738b2",
+          "rgb_sha256": "e374b56a721178955424f71e839747587d37474fe0696c6d3ff5c66ef86a55a9"
+        },
+        {
+          "label": "base",
+          "sampler_seconds": 21.65340040000001,
+          "latent_sha256": "956f9bc941b33c426311d7e0645464126cf03eeec1c65a4af45bf70d1c2eafd3",
+          "rgb_sha256": "e991714d06d158d3462752f9ea311f7f339eb76ea2c6f7de2e93400c708fbb48"
+        },
+        {
+          "label": "lora",
+          "sampler_seconds": 19.575882499999807,
+          "latent_sha256": "7943df48dd62a6185c89e1032d6b4228ecc7264e60cc5f02feeba654eca738b2",
+          "rgb_sha256": "e374b56a721178955424f71e839747587d37474fe0696c6d3ff5c66ef86a55a9"
+        }
+      ],
+      "lora_effective_cache": {
+        "hit": true,
+        "reason": "verified hit",
+        "packed_bytes": 3963645952,
+        "fingerprint_ms": 13060.832399999981,
+        "pack_ms": 0.0,
+        "verify_ms": 2850.0653999999486,
+        "total_ms": 16043.577599999935,
+        "runtime_cold_setup_ms": 16047.362399999656,
+        "lora_patch_count": 448
+      },
+      "lora_phase_peak_working_set_bytes": 12796444672,
+      "lora_phase_peak_private_commit_bytes": 15806517248,
+      "lora_phase_min_system_available_bytes": 6920605696,
+      "process_peak_working_set_bytes": 16969510912,
+      "process_peak_private_commit_bytes": 15806517248,
+      "private_commit_after_model_gc_bytes": 3541291008,
+      "runtimes_closed_after_unload": true,
+      "runtime_count": 2
+    },
+    "cache_warm": {
+      "node_chain": "LoadAnimaXDNACache -> LoraLoaderModelOnly (base MODEL kept for switching)",
+      "code": "final",
+      "loader_seconds": 7.311281799999961,
+      "runs": [
+        {
+          "label": "lora",
+          "sampler_seconds": 35.79972289999978,
+          "latent_sha256": "7943df48dd62a6185c89e1032d6b4228ecc7264e60cc5f02feeba654eca738b2",
+          "rgb_sha256": "e374b56a721178955424f71e839747587d37474fe0696c6d3ff5c66ef86a55a9"
+        },
+        {
+          "label": "lora",
+          "sampler_seconds": 15.678432099999554,
+          "latent_sha256": "7943df48dd62a6185c89e1032d6b4228ecc7264e60cc5f02feeba654eca738b2",
+          "rgb_sha256": "e374b56a721178955424f71e839747587d37474fe0696c6d3ff5c66ef86a55a9"
+        },
+        {
+          "label": "base",
+          "sampler_seconds": 21.470502000000124,
+          "latent_sha256": "956f9bc941b33c426311d7e0645464126cf03eeec1c65a4af45bf70d1c2eafd3",
+          "rgb_sha256": "e991714d06d158d3462752f9ea311f7f339eb76ea2c6f7de2e93400c708fbb48"
+        },
+        {
+          "label": "lora",
+          "sampler_seconds": 18.518147299999782,
+          "latent_sha256": "7943df48dd62a6185c89e1032d6b4228ecc7264e60cc5f02feeba654eca738b2",
+          "rgb_sha256": "e374b56a721178955424f71e839747587d37474fe0696c6d3ff5c66ef86a55a9"
+        }
+      ],
+      "lora_effective_cache": {
+        "hit": true,
+        "reason": "verified hit",
+        "packed_bytes": 3963645952,
+        "fingerprint_ms": 12651.452800000243,
+        "pack_ms": 0.0,
+        "verify_ms": 2755.507900000339,
+        "total_ms": 15528.139199999714,
+        "runtime_cold_setup_ms": 15531.147899999723,
+        "lora_patch_count": 448
+      },
+      "lora_phase_peak_working_set_bytes": 12795494400,
+      "lora_phase_peak_private_commit_bytes": 15806545920,
+      "lora_phase_min_system_available_bytes": 6547038208,
+      "process_peak_working_set_bytes": 12795494400,
+      "process_peak_private_commit_bytes": 15806545920,
+      "private_commit_after_model_gc_bytes": 3395969024,
+      "runtimes_closed_after_unload": true,
+      "runtime_count": 2
+    }
+  },
+  "output_comparisons": {
+    "lora_latent_bitwise_equal_all_runs": true,
+    "lora_latent_count": 11,
+    "lora_distinct_latent_rgb_hashes": 1,
+    "lora_latent_sha256": "7943df48dd62a6185c89e1032d6b4228ecc7264e60cc5f02feeba654eca738b2",
+    "lora_rgb_sha256": "e374b56a721178955424f71e839747587d37474fe0696c6d3ff5c66ef86a55a9",
+    "base_after_switch_bitwise_equal_prior_cache_backed": true,
+    "base_distinct_latent_rgb_hashes": 1,
+    "base_rgb_equals_prior_evidence": true,
+    "lora_changes_output": true
+  },
+  "reductions": {
+    "lora_phase_peak_working_set_bytes": 4943028224,
+    "lora_phase_peak_working_set_percent": 27.866064884750575,
+    "lora_phase_peak_private_commit_bytes": 6875406336,
+    "switching_peak_working_set_bytes_mapping_release": 4174016512
+  },
+  "known_costs": [
+    "On a LoRA cache hit, the cache key is still derived by recomputing and hashing all effective block tensors (about 13 s, once per runtime and process). This existing path is shared with the original LoRA workflow.",
+    "That identification is the attributed source of the 15.81 GB lifetime peak private commit (9.94 GB without LoRA in the earlier base-only experiment); 50 ms PrivateUsage samples never exceeded 10.10 GB, so the peak was transient.",
+    "Runtime Status reports the base runtime for a LoRA MODEL until that MODEL has sampled once."
+  ],
+  "limits": [
+    "One LoRA (448 block patches, no host keys), strength 1.0, 512x512, CFG 1; no 1024x1024, CFG > 1, chained-LoRA or host-key LoRA memory run.",
+    "Not an HTTP/GUI run; the deployed UI was checked separately for node registration only.",
+    "System available memory includes other applications and the OS cache.",
+    "No CPU-only reference.",
+    "Post-GC private commit is recorded but not compared; objects retained by the original-workflow harness after unload were not investigated.",
+    "The original LoRA run exhausted system available memory, so its working set was constrained by paging; treat the working-set difference as observational."
+  ],
+  "private_archive": {
+    "name": "implementation-lora.zip",
+    "sha256": "dd30d8b430fa3d933afa6548f24d95c169d462c215a6d2234f51194dd4e8eb3d",
+    "members": 42,
+    "bytes": 9266331,
+    "committed": false,
+    "contents": "Measurement and recording scripts, logs, result/memory traces, latents and PNGs for the four runs. No model or LoRA weights."
+  }
+}

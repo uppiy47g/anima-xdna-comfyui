@@ -3327,9 +3327,9 @@ differences. That version was rejected; the measurements below are from the
 corrected implementation and a fresh matched pair.
 
 Normal MODEL clones share host layers and a reference-counted XDNA attachment.
-The loader refuses live LoRA/weight patches, weight hooks, GPU placement and
-checkpoint export/merging. Use the original loader/LoRA/attach workflow for
-live patches, or select a full checkpoint with already merged weights.
+As first released, the loader refused live LoRA/weight patches, weight hooks,
+GPU placement and checkpoint export/merging; standard LoRA nodes are now
+supported by the [follow-up below](#cache-backed-loader-with-standard-lora-nodes-2026-11-17).
 Re-attaching this MODEL is rejected; it already contains the wrapper.
 Explicit unload releases an attachment, and the final reference closes cache
 and device resources. An unloaded attachment cannot sample again without
@@ -3421,6 +3421,113 @@ CPU-only reference was measured. System available memory includes other
 applications and the OS cache, so it is only observational. The normal
 installed node copy and production launcher were not modified.
 
+## Cache-backed loader with standard LoRA nodes (2026-11-17)
+
+**Result.** Standard **Load LoRA** / **Load LoRA Model Only** nodes can now
+follow **Load Anima XDNA (Cache-backed)**. In a 512x512 Turbo V1.1 run with
+one LoRA, peak process working set was **11.917 GiB**, versus **16.520 GiB**
+for the original BF16 loader + LoRA + attach workflow (4.604 GiB / 27.9%
+less). All 11 LoRA latents across four processes, including repeats and
+LoRA prompts after switching, were bitwise identical, as were their RGB
+pixels. The base prompt after switching matched the earlier cache-backed
+base latent bitwise. Evidence:
+[`evidence/cache-backed-lora-512.json`](evidence/cache-backed-lora-512.json).
+
+### Design
+
+- **Keys.** Each parameter-free block sentinel exposes its 20 tensors as BF16
+  `meta` placeholders in `state_dict`. ComfyUI's standard LoRA key map and
+  `add_patches` therefore accept block keys, while no block storage is
+  allocated. Host-layer patches are applied by ComfyUI normally; block
+  patches are never applied by ComfyUI, because the sentinels have no
+  Parameters, and are consumed by the XDNA runtime instead.
+- **Runtime.** `pre_run` selects a runtime by the MODEL's `patches_uuid`.
+  An unpatched MODEL uses the base runtime. A patched MODEL validates the
+  same patch contract as the original attach path, reads base block tensors
+  from the original checkpoint on demand (file identity re-checked), and
+  builds or reuses the effective BF16 packed cache keyed by the checkpoint
+  and LoRA content. One runtime per patch set is shared by later prompts
+  and clones. The lookup is dynamic, because ComfyUI copies wrappers before
+  `pre_run`.
+- **Switching.** The newly selected runtime suspends the previously resident
+  one. Its AIR runners, XRT buffers and session close, and its packed-cache
+  mapping is released. The next use remaps through the in-process verified
+  lease and re-checks the payload identity; it does not re-verify the full
+  payload.
+- **Contract.** Supported patches are the original workflow's: ordinary
+  additive 2-D `LoRAAdapter` and the hybrid Turbo Q/K-norm `diff`, at any
+  finite strength. LoHa/LoKr/OFT/DoRA, reshape/mid-weight LoRA, other block
+  diff/bias patches, weight hooks, bypass LoRA injection (block submodule
+  lookup raises), GPU placement and checkpoint saving/merging raise instead
+  of being ignored. The original loader is
+  unchanged.
+
+A development run without the mapping release showed why it is needed:
+after switching from LoRA to base, the suspended LoRA payload stayed mapped
+and peak working set rose to 15.804 GiB. With the release, the whole
+four-prompt run peaked at 11.917 GiB with unchanged times and outputs.
+
+### Measurement
+
+Settings, environment, prompts and memory counters match the
+[cache-backed memory experiment](#cache-backed-model-loader-and-512x512-memory-2026-11-17).
+The LoRA file was `anima-highres-aesthetic-boost.safetensors`: 138,662,176
+bytes, SHA-256
+`db5b2dcc4e1afa215058b7a85fb9377124c2e9aabd48c25e595af7199207c299`,
+448 block patches, no host-layer keys, `LoraLoaderModelOnly` strength 1.0.
+Each variant ran in a fresh standalone ComfyUI Python process using the real
+nodes (not HTTP/UI). Order: cache cold, original, cache warm without mapping
+release, then cache warm with the final code. The original workflow sampled
+LoRA twice; cache-backed runs sampled LoRA, LoRA, base, LoRA with the same
+seed, keeping the base MODEL for switching.
+
+| Metric | Original BF16 + LoRA + attach | Cache-backed + LoRA |
+|---|---:|---:|
+| Peak working set through LoRA prompts, bytes | 17,738,522,624 | 12,795,494,400 |
+| Peak working set, GiB | 16.520 | 11.917 |
+| Peak private commit, bytes | 22,681,952,256 | 15,806,545,920 |
+| Minimum system available, LoRA prompts | 204,800 bytes | 6.097 GiB |
+| Loader seconds | 27.66 | 7.31 |
+| First LoRA sampler seconds | 26.6 | 35.8 |
+| Repeat LoRA sampler seconds | 16.2 | 15.7 |
+| Base after switch / LoRA again, seconds | — | 21.5 / 18.5 |
+
+The original workflow verifies the effective cache during attach (inside
+"Loader seconds"); the cache-backed loader does it lazily in the first LoRA
+prompt (warm hit: 15.5 s, of which 12.7 s identifies the effective tensors).
+In the cold run, the first LoRA prompt took 46.0 s, including a 24.9 s
+effective-cache build; later prompts took 15.6 / 23.8 / 18.6 s. All
+runtimes closed after explicit unload.
+
+The original run exhausted available memory, so its working set was limited
+by paging; treat the difference as observational. Cache-backed LoRA peak
+working set is only 0.16 GiB above the earlier cache-backed base-only run.
+Its higher peak private commit (14.721 versus 9.258 GiB) is attributed to the
+existing effective-cache identification, which recomputes and hashes every
+effective tensor even on a cache hit; the original LoRA workflow shares that
+path. The peak was transient: 50 ms `PrivateUsage` samples never exceeded
+10,103,123,968 bytes.
+
+### Use
+
+Connect **Load Anima XDNA (Cache-backed)** → **Load LoRA** /
+**Load LoRA Model Only** (chaining allowed) → KSampler under ComfyUI
+`--cpu`. Do not attach again. Expect the first prompt with a new LoRA or
+strength to take longer; repeats reuse its runtime. **Anima XDNA Runtime
+Status** reports the base runtime for a LoRA MODEL until it has sampled once.
+
+The private `implementation-lora.zip` archive has 42 members, 9,266,331
+bytes and SHA-256
+`dd30d8b430fa3d933afa6548f24d95c169d462c215a6d2234f51194dd4e8eb3d`. It
+pins the measurement/recording scripts, console logs, result and memory
+traces, latents and PNGs for the four runs, without model or LoRA weights,
+and is not committed.
+
+**Limits.** One machine, checkpoint, LoRA, seed and run per variant. No
+1024x1024, CFG > 1, chained-LoRA, host-key LoRA or CPU-only measurement.
+Post-GC counters were recorded but not compared. System available memory
+includes other applications and the OS cache.
+
 ## Public verification ladder
 
 Set placeholders only in the current shell; do not commit paths or captures.
@@ -3464,7 +3571,8 @@ $env:ANIMA_XDNA_CHAIN_FIXTURE = "<CAPTURED_REAL_BLOCK_INPUT_PT>"
 
 Only Base v1.0, Turbo V1.1, WAI Nova Anima Turbo LoRA Ver V1.0, Radiance
 Turbo Anima v2.0, and the fixed shapes above are validated. Other Preview/Aesthetic
-checkpoints, LoRA/LLLite/ModelPatcher transformer patches, INT8, training,
+checkpoints, unsupported LoRA types, LLLite, runtime ModelPatcher transformer
+patches, INT8, training,
 resolutions other than 512×512 and 1024×1024 (baseline attention, or AIR with a
 `self4096` artifact; INT8 is 512×512 only), other
 context sizes, and user batches above one are rejected. CFG batch 2 is
@@ -3529,8 +3637,8 @@ BF16 packed cache and that the F16 checkpoint remained unchanged.
 - **Checkpoint mismatch:** choose the exact matching Base source, or use the
   same native Turbo file for MODEL and XDNA source. The full digest check is
   intentionally expensive once per attachment and cannot be disabled.
-- **Unsupported patches:** remove LoRA/LLLite; they are rejected rather than
-  ignored.
+- **Unsupported patches:** remove unsupported LoRA types or LLLite; they are
+  rejected rather than ignored.
 - **Cache corruption:** run `anima-xdna-cache verify <checkpoint>`, then an
   explicit `rebuild` if verification reports the exact failure.
 - **Low Task Manager utilization:** use CLI dispatch/kernel timings and wrapper

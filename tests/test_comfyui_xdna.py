@@ -4,6 +4,7 @@ import json
 import sys
 import types
 import unittest
+import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -70,7 +71,9 @@ class FakePatcher:
         self.model = model if model is not None else FakeBaseModel()
         self.load_device = load_device or torch.device("cpu")
         self.offload_device = offload_device or torch.device("cpu")
+        self.size = 0
         self.patches = {}
+        self.patches_uuid = None
         self.hook_patches = {}
         self.weight_wrapper_patches = {}
         self.injections = {}
@@ -81,7 +84,8 @@ class FakePatcher:
     def clone(self):
         clone = type(self)(load_device=self.load_device, offload_device=self.offload_device)
         clone.model = self.model
-        clone.patches = self.patches.copy()
+        clone.patches = {key: value[:] for key, value in self.patches.items()}
+        clone.patches_uuid = self.patches_uuid
         clone.model_options = {
             "transformer_options": self.model_options["transformer_options"].copy()
         }
@@ -97,7 +101,23 @@ class FakePatcher:
         }
         return clone
 
+    def add_patches(self, patches, strength_patch=1.0, strength_model=1.0):
+        # Mirrors ComfyUI: only keys present in the model state_dict are patched.
+        model_state = self.model.state_dict()
+        added = []
+        for key, adapter in patches.items():
+            if key in model_state:
+                self.patches.setdefault(key, []).append(
+                    (strength_patch, adapter, strength_model, None, None)
+                )
+                added.append(key)
+        self.patches_uuid = uuid.uuid4()
+        return added
+
     def pre_run(self):
+        pass
+
+    def cleanup(self):
         pass
 
     def add_wrapper_with_key(self, kind, key, wrapper):
@@ -323,6 +343,23 @@ class ComfyUIXDNAWrapperTests(unittest.TestCase):
                         torch.bfloat16, torch.float32, device=torch.device("cpu")
                     )
                     self.assertEqual(len(model.diffusion_model.blocks), 28)
+                    block_state = {
+                        key: value
+                        for key, value in model.diffusion_model.state_dict().items()
+                        if key.startswith("blocks.")
+                    }
+                    self.assertEqual(
+                        set(block_state),
+                        {key for key in fake_anima_parameters(dtype) if key.startswith("blocks.")},
+                    )
+                    self.assertTrue(all(
+                        value.is_meta and value.dtype == torch.bfloat16
+                        for value in block_state.values()
+                    ))
+                    self.assertEqual(
+                        [name for name, _ in model.diffusion_model.named_parameters()],
+                        ["host.weight"],
+                    )
                     with self.assertRaisesRegex(RuntimeError, "CPU fallback is unavailable"):
                         model.diffusion_model.blocks[0](torch.zeros(1))
                     meta_sd = loader.comfy.model_detection.model_config_from_unet.call_args.args[0]
@@ -386,14 +423,17 @@ class ComfyUIXDNAWrapperTests(unittest.TestCase):
         with self.cache_loader_module() as loader:
             runtime = SharedRuntime(Path("fixture.safetensors"))
             model = loader.CacheBackedModelPatcher()
-            model.set_attachments(ATTACHMENT_KEY, RuntimeAttachment(runtime))
+            model.set_attachments(ATTACHMENT_KEY, loader.CacheRuntimeAttachment(runtime))
             clone = model.clone()
             self.assertIs(type(clone), type(model))
             self.assertIs(clone.model, model.model)
             self.assertEqual(runtime.snapshot()["reference_count"], 2)
             clone.pre_run()
+            self.assertIs(model.model.diffusion_model.xdna_active_runtime, runtime)
+            clone.cleanup()
+            self.assertIsNone(model.model.diffusion_model.xdna_active_runtime)
             for action, message in (
-                (lambda: clone.add_patches({}), "LoRA/weight patches"),
+                (lambda: clone.get_key_patches("diffusion_model."), "no ComfyUI block weights"),
                 (lambda: clone.add_hook_patches(None, {}), "weight hooks"),
                 (lambda: clone.model_state_dict_for_saving(), "execution-only MODEL"),
             ):
@@ -405,6 +445,156 @@ class ComfyUIXDNAWrapperTests(unittest.TestCase):
             clone.pre_run()
             clone.get_attachment(ATTACHMENT_KEY).cleanup()
             self.assertEqual(runtime.snapshot()["state"], "closed")
+
+    def _cache_backed_lora_fixture(self, loader, directory):
+        dtype = torch.bfloat16
+        tensors = {
+            f"net.{key}": value.detach()
+            for key, value in fake_anima_parameters(dtype).items()
+            if key.startswith("blocks.")
+        }
+        tensors["net.blocks.0.self_attn.q_proj.weight"] = torch.tensor([[1.0]], dtype=dtype)
+        tensors["net.host.weight"] = torch.zeros(1, dtype=dtype)
+        path = Path(directory, "model.safetensors")
+        save_file(tensors, path)
+        placeholders = [{} for _ in range(28)]
+        for key, value in tensors.items():
+            if key.startswith("net.blocks."):
+                _, _, index, name = key.split(".", 3)
+                placeholders[int(index)][name] = torch.empty(
+                    value.shape, dtype=dtype, device="meta"
+                )
+
+        class HostAnima(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.host = torch.nn.Parameter(torch.zeros(1, dtype=dtype))
+                self.blocks = torch.nn.ModuleList(
+                    loader.CacheOnlyBlock(names) for names in placeholders
+                )
+
+        class HostModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.diffusion_model = HostAnima()
+
+        base_model = loader.CacheBackedModelPatcher(HostModel())
+        base_model.set_attachments(
+            SOURCE_PROVENANCE_KEY,
+            ModelSourceProvenance("fixture", str(path), _file_identity_token(path)),
+        )
+        runtime = SharedRuntime(path)
+        runtime.diagnostics.source_execution_fingerprint = "base-execution"
+        base_model.set_attachments(ATTACHMENT_KEY, loader.CacheRuntimeAttachment(runtime))
+        return path, base_model, runtime
+
+    def test_cache_backed_model_accepts_standard_lora_and_builds_runtime_lazily(self):
+        key = "diffusion_model.blocks.0.self_attn.q_proj.weight"
+        adapter = self.LoRAAdapter(
+            set(), (torch.tensor([[2.0]]), torch.tensor([[3.0]]), None, None, None, None)
+        )
+        built = []
+
+        def prepare(runtime, diffusion_model, *, cache_backed=False):
+            self.assertTrue(cache_backed)
+            provider = runtime.effective_tensor_provider
+            built.append((
+                runtime,
+                None if provider is None else provider("transformer_blocks.0.attn1.to_q.weight"),
+                None if provider is None else provider("transformer_blocks.0.attn1.to_k.weight"),
+            ))
+            runtime.effective_tensor_provider = None
+            runtime._runtime = mock.Mock(is_open=False)
+            runtime.diagnostics.lora_patch_count = runtime.lora_patch_count
+            runtime.diagnostics.source_execution_fingerprint = "base-execution"
+
+        with TemporaryDirectory() as directory, self.cache_loader_module() as loader:
+            path, base_model, base_runtime = self._cache_backed_lora_fixture(loader, directory)
+            self.assertEqual(base_model.model_size(), 2)
+            self.assertIn(key, base_model.model.state_dict())
+            block = base_model.model.diffusion_model.blocks[0]
+            # Bypass LoRA skips layers whose lookup raises AttributeError.
+            with self.assertRaisesRegex(RuntimeError, "bypass LoRA"):
+                getattr(block, "self_attn")
+            self.assertFalse(hasattr(block, "unrelated"))
+            lora_model = base_model.clone()
+            self.assertEqual(lora_model.add_patches({key: adapter}, 0.5), [key])
+            diffusion = base_model.model.diffusion_model
+            with (
+                mock.patch.object(SharedRuntime, "prepare", autospec=True, side_effect=prepare),
+                mock.patch.object(SharedRuntime, "suspend", autospec=True) as suspend,
+            ):
+                lora_model.pre_run()
+                lora_runtime = lora_model.get_attachment(ATTACHMENT_KEY).runtime
+                self.assertIsNot(lora_runtime, base_runtime)
+                self.assertEqual(lora_runtime.lora_patch_count, 1)
+                self.assertEqual(base_runtime.snapshot()["reference_count"], 1)
+                self.assertEqual(len(built), 1)
+                self.assertEqual(built[0][1].item(), 4.0)
+                self.assertEqual(built[0][1].dtype, torch.bfloat16)
+                self.assertEqual(built[0][2].item(), 0.0)
+                self.assertIs(diffusion.xdna_active_runtime, lora_runtime)
+
+                dispatch = loader.CacheBackedDiffusionWrapper()
+                executor = types.SimpleNamespace(class_obj=diffusion)
+                with mock.patch.object(
+                    SharedRuntime, "forward", autospec=True, return_value="output"
+                ) as forward:
+                    self.assertEqual(dispatch(executor, "x", "t", "c"), "output")
+                self.assertIs(forward.call_args.args[0], lora_runtime)
+
+                lora_model.cleanup()
+                self.assertIsNone(diffusion.xdna_active_runtime)
+                with self.assertRaisesRegex(RuntimeError, "through a ComfyUI sampler"):
+                    dispatch(executor, "x", "t", "c")
+
+                lora_model.pre_run()
+                self.assertEqual(len(built), 1)
+                again = lora_model.clone()
+                again.pre_run()
+                self.assertEqual(len(built), 1)
+                self.assertIs(again.get_attachment(ATTACHMENT_KEY).runtime, lora_runtime)
+
+                suspend.reset_mock()
+                base_model.pre_run()
+                self.assertEqual(len(built), 1)
+                suspend.assert_called_once_with(lora_runtime)
+                self.assertIs(diffusion.xdna_active_runtime, base_runtime)
+
+                changed = base_model.clone()
+                changed.add_patches({key: adapter}, 1.0)
+                with (
+                    mock.patch.object(
+                        loader, "_file_identity_token", return_value="replaced"
+                    ),
+                    self.assertRaisesRegex(RuntimeError, "changed after loading"),
+                ):
+                    changed.pre_run()
+                self.assertEqual(len(built), 1)
+
+                unsupported = base_model.clone()
+                unsupported.add_patches({key: object()})
+                with self.assertRaisesRegex(RuntimeError, "ordinary additive"):
+                    unsupported.pre_run()
+                self.assertIs(
+                    unsupported.get_attachment(ATTACHMENT_KEY).runtime, base_runtime
+                )
+            for model in (base_model, lora_model, again, changed, unsupported):
+                model.get_attachment(ATTACHMENT_KEY).cleanup()
+            self.assertEqual(base_runtime.snapshot()["state"], "closed")
+            self.assertEqual(lora_runtime.snapshot()["state"], "closed")
+
+    def test_suspend_releases_xrt_session_but_keeps_runtime_prepared(self):
+        runtime = SharedRuntime(Path("fixture.safetensors"))
+        chain = mock.Mock(is_open=True)
+        runtime._runtime = chain
+        runtime.diagnostics.state = "open"
+        runtime.suspend()
+        chain.close_session.assert_called_once_with()
+        chain.close.assert_not_called()
+        self.assertEqual(runtime.snapshot()["state"], "prepared")
+        runtime.close()
+        chain.close.assert_called_once_with()
 
     def test_cache_loader_closes_on_source_change_and_rejects_gpu(self):
         with self.cache_loader_module() as loader:
