@@ -20,8 +20,9 @@ def write_config(root, **values):
 class RuntimeConfigTest(unittest.TestCase):
     def test_int8_config_sets_launcher_environment_without_overriding(self):
         with tempfile.TemporaryDirectory() as directory:
+            sdk = Path(directory).resolve() / "sdk" / "xrt-2.21.75"
             path = write_config(directory, profile="int8-attn-l1k64-nq8pp",
-                                xrt_dev_dir="C:/sdk/xrt-2.21.75", triton_cache_dir="cache/triton")
+                                xrt_dev_dir=str(sdk), triton_cache_dir="cache/triton")
             runtime = path.parent.resolve()
             environ = {"ANIMA_XDNA_NUM_THREADS": "6"}
             messages = []
@@ -38,7 +39,7 @@ class RuntimeConfigTest(unittest.TestCase):
         self.assertEqual(environ["ANIMA_XDNA_GEMM_LAYOUT_DIR"],
                          str(runtime / "gemm-wide32-20261025" / "library"))
         self.assertEqual(environ["TRITON_CACHE_DIR"], str(runtime / "cache" / "triton"))
-        self.assertEqual(Path(environ["XRT_DEV_DIR"]), Path("C:/sdk/xrt-2.21.75"))
+        self.assertEqual(Path(environ["XRT_DEV_DIR"]), sdk)
         self.assertIn("ANIMA_XDNA_NUM_THREADS", messages[-1])
 
     def test_standard_config_leaves_optimized_profile_disabled(self):
