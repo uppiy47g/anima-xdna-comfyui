@@ -1,0 +1,156 @@
+{
+  "date": "2026-11-17",
+  "status": "measured_1024x1024_int8_air_attention_overlap",
+  "repository_base": "1147141",
+  "implementation": {
+    "resident_air_buffers": "each AIR runner allocates its query tiles, K/V and two output slots once as XRT buffer objects mapped as BF16 tensors; Q/K/V preparation writes into them directly; about 56 MB (self4096) and 28 MB (cross) replace the 40 MB and 12 MB sequential buffer sets, which are released",
+    "launch_api": "start(tile, slot, upload_kv) syncs K/V (first tile only) and the query tile and launches without waiting; finish waits and syncs the output slot back",
+    "schedule": "after the tiled QKV phase the NPU order per block is air0, air1, out0, air2, out1, air3, out2, out3; each finished AIR tile is quantized behind the next job before its output slot is reused; each out job's gated residual runs behind the next job; one NPU job in flight",
+    "error_handling": "if host work fails mid-schedule, the job in flight is waited for before the error propagates",
+    "finiteness": "the overlapped path skips AIR's separate finiteness passes: the fused Q/K/V preparation rejects nonfinite Q/K/V and the head-major quantization rejects nonfinite AIR output; the verified first prompt and 512x512 keep the sequential AIR call with its checks",
+    "overlap_gate": "unchanged: ANIMA_XDNA_INT8_OVERLAP (default 1; 0 disables), tiled blocks only, after the four verified forwards"
+  },
+  "configuration": {
+    "size": [1024, 1024],
+    "steps": 4,
+    "cfg": 1.0,
+    "seed": 700755787614899,
+    "sampler": "euler",
+    "scheduler": "simple",
+    "model": "anima_turboV11",
+    "loader": "Load Anima XDNA (Cache-backed)",
+    "profile": "int8-attn-l1k64-nq8pp",
+    "backend": "air (4096 keys)",
+    "vae": "bf16 channels-last clfix",
+    "adaln_device": "host",
+    "torch_threads": 10,
+    "torch_version": "2.14.1+cpu",
+    "cpu": "AMD Ryzen AI 9 365",
+    "device": "XDNA 2 npu2",
+    "system_physical_bytes": 25359659008,
+    "xrt_sdk": "2.21.75",
+    "process_model": "fresh standalone ComfyUI Python process per variant (real nodes, no HTTP server); the first run of every process includes the four verified forwards; the previous commit was re-measured in the same session from an export of that commit"
+  },
+  "private_artifacts": {
+    "implementation_zip": {
+      "members": 35,
+      "bytes": 17470236,
+      "sha256": "0fa4606d28534ae073c65f504e3903ac1859d17f173ba877e8dd50c7d3058542"
+    },
+    "measure_script_sha256": "c99814364920317ed3e6b1d687b5281bf82447c34b0608e7472f78c75e4420c2",
+    "air_probe_sha256": "40867cfaa994ccad14d655ff3de85a10056a6c49f804b7b1782fccbad8b22cb2",
+    "air_phase_probe_sha256": "8d8a1390b1eb3aab7ecbf2086ab6d8fb305e67509ea39e89d1a9b2bf601dd95e",
+    "concurrency_probe_sha256": "45b0ce18372ccaaa5ef9de633da515e978cb56e9975bf5aae17bb33f326e0b64",
+    "committed": false
+  },
+  "air_probe_ms_per_call": {
+    "inputs": "random BF16, 10 threads",
+    "self_4096_keys": {
+      "whole_call": 62.3,
+      "kernel_four_tiles": 46.65,
+      "finite_inputs": 4.48,
+      "finite_output": 4.44,
+      "query_layout_and_copies": 4.45,
+      "host_total_whole_minus_kernel": 15.6
+    },
+    "cross_512_keys": {
+      "whole_call": 19.8,
+      "kernel_four_tiles": 11.44,
+      "finite_inputs": 1.84,
+      "finite_output": 2.49,
+      "host_total_whole_minus_kernel": 8.4
+    },
+    "per_prompt_seconds_112_calls": {"self_kernel": 5.2, "cross_kernel": 1.3, "host": 2.7}
+  },
+  "concurrency_probe_ms": {
+    "air_tile_alone": 10.96,
+    "proj_out_gemm_alone": 3.53,
+    "back_to_back": 13.12,
+    "both_in_flight_separate_hw_contexts": 12.53,
+    "conclusion": "the NPU does not run two hardware contexts concurrently to any useful degree; keep one job in flight and hide host work"
+  },
+  "runs": {
+    "air_overlap_process_a": {
+      "sample_seconds": [54.55, 21.34, 22.66],
+      "decode_seconds": [5.67, 5.30, 5.29],
+      "block_wall_seconds_per_run": [54.06, 20.91, 22.22],
+      "latent_sha256": "0107a68286504e82851d9452240f3995a3d9ab0f48b0cc6ce228df2d66b102b0"
+    },
+    "air_overlap_process_b": {
+      "sample_seconds": [52.28, 21.22],
+      "decode_seconds": [5.87, 5.24],
+      "block_wall_seconds_per_run": [51.76, 20.78],
+      "latent_sha256": "0107a68286504e82851d9452240f3995a3d9ab0f48b0cc6ce228df2d66b102b0"
+    },
+    "previous_overlap_remeasured": {
+      "commit": "1147141",
+      "sample_seconds": [52.13, 25.54],
+      "decode_seconds": [5.66, 5.43],
+      "block_wall_seconds_per_run": [51.59, 25.07],
+      "latent_sha256": "0107a68286504e82851d9452240f3995a3d9ab0f48b0cc6ce228df2d66b102b0"
+    },
+    "previous_overlap_previous_section": {
+      "sample_seconds": [49.04, 23.43, 24.80],
+      "block_wall_seconds_per_run": [48.46, 22.96, 24.32],
+      "source": "evidence/int8-1024-tiled-overlap.json"
+    },
+    "sequential_previous_section": {
+      "sample_seconds": [48.99, 26.02, 27.63],
+      "source": "evidence/int8-1024-tiled-overlap.json"
+    },
+    "latents_bitwise_identical": true,
+    "cold_run_note": "every process this session, including the previous commit, ran the cold first prompt 2-5 s slower than the previous section, so the shift is machine state; the first prompt runs mostly the sequential verified path"
+  },
+  "exposed_npu_wait_seconds_per_warm_prompt": {
+    "air_overlap": {
+      "self_air": [5.56, 6.35, 5.55],
+      "cross_air": [1.32, 1.41, 1.31],
+      "attention_out": [1.24, 1.39, 1.24],
+      "sum": [8.12, 9.15, 8.10]
+    },
+    "previous_overlap": {
+      "self_air": [7.47, 8.07, 8.10],
+      "cross_air": [2.72, 2.52, 2.95],
+      "attention_out": [0.83, 0.95, 0.89],
+      "sum": [11.02, 11.54, 11.93],
+      "runs": "previous section runs 1 and 2, then the re-measured run 1"
+    },
+    "hidden_host_seconds_air_overlap_run1": {
+      "behind_self_air": 0.15,
+      "behind_cross_air": 0.19,
+      "behind_self_out": 0.25,
+      "behind_cross_out": 0.19
+    },
+    "air_above_probe_kernel_time": [0.4, 1.3],
+    "note": "output projections expose more wait because less host work sits behind each out job; net attention saving about 2-4 s per prompt"
+  },
+  "memory_gib_sampling_peaks": {
+    "air_overlap_process_a": {
+      "cold": {"working_set": 11.81, "private": 10.29, "minimum_system_available": 4.87},
+      "warm": {"working_set": 10.35, "private": 9.69, "minimum_system_available": 6.32}
+    },
+    "air_overlap_process_b": {
+      "cold": {"working_set": 11.94, "private": 10.36, "minimum_system_available": 4.73},
+      "warm": {"working_set": 10.34, "private": 9.68, "minimum_system_available": 6.34}
+    },
+    "previous_overlap_remeasured": {
+      "cold": {"working_set": 11.82, "private": 10.37, "minimum_system_available": 4.86},
+      "warm": {"working_set": 10.75, "private": 9.68, "minimum_system_available": 5.94}
+    }
+  },
+  "regression_512": {
+    "sample_seconds": [15.29, 5.64],
+    "previous_sample_seconds": [14.87, 5.57],
+    "latent_sha256": "4e4de4471ee4c36249a491d21676304c175f43b03ffe64d896df612cea2f8559",
+    "latent_bitwise_identical_to_previous": true,
+    "private_peak_gib": [8.01, 7.05],
+    "previous_private_peak_gib": [8.00, 7.03],
+    "note": "the 1024-token path does not use the overlapped schedule"
+  },
+  "limits": [
+    "one machine, seed and prompt; one to three warm runs per variant",
+    "no CFG > 1, LoRA or HTTP/UI measurement",
+    "warm times of the same code varied by up to 2.1 s between runs and processes",
+    "not tried: per-block cross-attention K/V caching; fewer per-tile buffer syncs"
+  ]
+}

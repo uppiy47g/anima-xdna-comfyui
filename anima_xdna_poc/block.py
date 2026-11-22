@@ -29,6 +29,27 @@ LinearPairRunner = Callable[
 AttentionRunner = Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]
 AdaLNRunner = Callable[[torch.Tensor, tuple[str, str]], torch.Tensor]
 
+# Largest token extent per XDNA dispatch. Larger images (for example the
+# 4096-token 1024x1024 latent) are tiled into the 1024-token kernel shapes that
+# are validated for 512x512, so resident weights and compiled kernels are
+# shared across resolutions. A single 4096x4096 attention chain crashes aircc.
+XDNA_TOKEN_TILE = 1024
+
+
+def _tile_ranges(size: int) -> tuple[tuple[int, int], ...]:
+    tile = XDNA_TOKEN_TILE
+    return tuple((start, min(start + tile, size)) for start in range(0, size, tile))
+
+
+def _row_tiles(rows: int) -> tuple[tuple[int, int], ...]:
+    # Resident Linear weights are bound to one row count, so tiles must be equal.
+    if rows > XDNA_TOKEN_TILE and rows % XDNA_TOKEN_TILE:
+        raise UnsupportedTensor(
+            f"XDNA row tiling requires a multiple of {XDNA_TOKEN_TILE} rows "
+            f"above {XDNA_TOKEN_TILE}; got {rows}"
+        )
+    return _tile_ranges(rows)
+
 
 @dataclass(frozen=True)
 class BlockInputs:
@@ -444,7 +465,8 @@ class _BlockExecution:
             h2d = (query.numel() + key.numel() + value.numel()) * 2
             d2h = output.numel() * 2
             self.metrics.append(StageMetric(
-                prefix + ".air_attention", self.runner_device, elapsed, 1,
+                prefix + ".air_attention", self.runner_device, elapsed,
+                len(_tile_ranges(query.shape[2])),
                 4 * cfg.num_heads * query.shape[2] * key.shape[2] * cfg.head_dim,
                 h2d + d2h, h2d, d2h,
             ))
@@ -457,6 +479,30 @@ class _BlockExecution:
             return self.linear(prefix + ".out", attended, prefix + ".to_out.0.weight")
 
         scale = cfg.head_dim**-0.5
+        pieces = [
+            self._attend(prefix, query[:, :, start:end], key, value, mask, scale)
+            for start, end in _tile_ranges(query.shape[2])
+        ]
+        attended = (
+            pieces[0]
+            if len(pieces) == 1
+            else self.host(
+                prefix + ".query_tile_concat", lambda: torch.cat(pieces, dim=1)
+            )
+        )
+        return self.linear(prefix + ".out", attended, prefix + ".to_out.0.weight")
+
+    def _attend(
+        self,
+        prefix: str,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        mask: Optional[torch.Tensor],
+        scale: float,
+    ) -> torch.Tensor:
+        cfg = self.config
+        rows = query.shape[2]
         if self.batched_runner is None:
             score_heads = []
             for head in range(cfg.num_heads):
@@ -496,25 +542,21 @@ class _BlockExecution:
                         _AttentionWeight(value[:, head].transpose(1, 2).squeeze(0)),
                     )
                 )
-            attended = self.host(
+            return self.host(
                 prefix + ".av_layout",
                 lambda: torch.stack(output_heads, dim=1)
                 .transpose(1, 2)
-                .reshape(1, hidden.shape[1], cfg.hidden_size),
+                .reshape(1, rows, cfg.hidden_size),
             )
-        else:
-            output = self.batched(
-                prefix + ".av_batched",
-                probabilities.squeeze(0),
-                value.squeeze(0),
-            )
-            attended = self.host(
-                prefix + ".av_layout",
-                lambda: output.transpose(0, 1).reshape(
-                    1, hidden.shape[1], cfg.hidden_size
-                ),
-            )
-        return self.linear(prefix + ".out", attended, prefix + ".to_out.0.weight")
+        output = self.batched(
+            prefix + ".av_batched",
+            probabilities.squeeze(0),
+            value.squeeze(0),
+        )
+        return self.host(
+            prefix + ".av_layout",
+            lambda: output.transpose(0, 1).reshape(1, rows, cfg.hidden_size),
+        )
 
     def batched(
         self,
@@ -535,7 +577,7 @@ class _BlockExecution:
                 name,
                 self.runner_device,
                 elapsed,
-                1,
+                getattr(self.batched_runner, "last_dispatches", 1),
                 2 * heads * rows * inner * columns,
                 (inputs.numel() + weights.numel() + result.numel()) * 2,
                 getattr(self.batched_runner, "last_h2d_bytes", 0),
@@ -652,56 +694,61 @@ def run_xdna_block(
         ) -> torch.Tensor:
             shape = value.shape
             flattened = value.reshape(-1, shape[-1])
-            partials = []
+            outputs = []
             profiles = []
-            for start in range(0, shape[-1], 2048):
-                end = min(start + 2048, shape[-1])
-                operation_key = f"{resident_key}:{name}:k{start}"
-                if (
-                    resident_key is not None
-                    and hasattr(active_session, "has_resident")
-                    and active_session.has_resident(operation_key)
-                ):
-                    dispatched = active_session.dispatch_resident_input(
-                        flattened[:, start:end],
-                        operation_key,
-                    )
-                else:
+            for row_start, row_end in _row_tiles(flattened.shape[0]):
+                rows = flattened[row_start:row_end]
+                partials = []
+                for start in range(0, shape[-1], 2048):
+                    end = min(start + 2048, shape[-1])
+                    operation_key = f"{resident_key}:{name}:k{start}"
                     if (
-                        packed_cache is not None
-                        and block_index is not None
-                        and weight_name is not None
+                        resident_key is not None
+                        and hasattr(active_session, "has_resident")
+                        and active_session.has_resident(operation_key)
                     ):
-                        prepared = packed_cache.prepared(
-                            block_index,
-                            weight_name,
-                            start,
-                            flattened[:, start:end],
-                            weight.shape[0],
-                        )
-                    else:
-                        prepared = prepare_linear(
-                            flattened[:, start:end],
-                            weight[:, start:end],
-                        )
-                    if resident_key is not None and hasattr(
-                        active_session, "dispatch_resident"
-                    ):
-                        dispatched = active_session.dispatch_resident(
-                            prepared,
+                        dispatched = active_session.dispatch_resident_input(
+                            rows[:, start:end],
                             operation_key,
                         )
                     else:
-                        dispatched = active_session.dispatch(prepared)
-                partials.append(
-                    dispatched.output_fp32.clone()
-                    if shape[-1] > 2048
-                    else dispatched.output_fp32
-                )
-                profiles.append(dispatched)
-                if dispatched.artifact_cache:
-                    caches.add(dispatched.artifact_cache)
-            runner.last_dispatches = len(partials)
+                        if (
+                            packed_cache is not None
+                            and block_index is not None
+                            and weight_name is not None
+                        ):
+                            prepared = packed_cache.prepared(
+                                block_index,
+                                weight_name,
+                                start,
+                                rows[:, start:end],
+                                weight.shape[0],
+                            )
+                        else:
+                            prepared = prepare_linear(
+                                rows[:, start:end],
+                                weight[:, start:end],
+                            )
+                        if resident_key is not None and hasattr(
+                            active_session, "dispatch_resident"
+                        ):
+                            dispatched = active_session.dispatch_resident(
+                                prepared,
+                                operation_key,
+                            )
+                        else:
+                            dispatched = active_session.dispatch(prepared)
+                    partials.append(
+                        dispatched.output_fp32.clone()
+                        if shape[-1] > 2048
+                        else dispatched.output_fp32
+                    )
+                    profiles.append(dispatched)
+                    if dispatched.artifact_cache:
+                        caches.add(dispatched.artifact_cache)
+                # Materialize before the next tile reuses resident output buffers.
+                outputs.append(torch.stack(partials).sum(dim=0).to(torch.bfloat16))
+            runner.last_dispatches = len(profiles)
             for field in (
                 "h2d_bytes",
                 "d2h_bytes",
@@ -715,32 +762,83 @@ def run_xdna_block(
             ):
                 setattr(runner, "last_" + field, sum(getattr(p, field) for p in profiles))
             runner.last_resident_hits = sum(p.resident_hit for p in profiles)
-            output = torch.stack(partials).sum(dim=0).to(torch.bfloat16)
+            output = outputs[0] if len(outputs) == 1 else torch.cat(outputs)
             return output.reshape(*shape[:-1], weight.shape[0])
+
+        def dispatch_batched_tile(
+            name: str,
+            value: torch.Tensor,
+            weight: torch.Tensor,
+        ):
+            if hasattr(active_session, "dispatch_head_chain"):
+                return active_session.dispatch_head_chain(
+                    value,
+                    weight,
+                    f"{resident_key or 'block'}:{name}",
+                )
+            if resident_key is not None and hasattr(
+                active_session, "dispatch_batched_resident"
+            ):
+                return active_session.dispatch_batched_resident(
+                    value,
+                    weight,
+                    f"{resident_key}:{name}",
+                )
+            return active_session.dispatch_batched(value, weight)
 
         def batched_runner(
             _: str,
             value: torch.Tensor,
             weight: torch.Tensor,
         ) -> torch.Tensor:
-            if hasattr(active_session, "dispatch_head_chain"):
-                dispatched = active_session.dispatch_head_chain(
-                    value,
-                    weight,
-                    f"{resident_key or 'block'}:{_}",
+            heads, rows, inner = value.shape
+            columns = weight.shape[-1]
+            tiles = [
+                (row_tile, column_tile, inner_tile)
+                for row_tile in _tile_ranges(rows)
+                for column_tile in _tile_ranges(columns)
+                for inner_tile in _tile_ranges(inner)
+            ]
+            profiles = []
+            output = None
+            if len(tiles) > 1:
+                output = torch.empty(heads, rows, columns, dtype=torch.bfloat16)
+            accumulated = None
+            for (row_start, row_end), (column_start, column_end), (
+                inner_start,
+                inner_end,
+            ) in tiles:
+                tile_name = (
+                    _
+                    if len(tiles) == 1
+                    else f"{_}:r{row_start}:c{column_start}:k{inner_start}"
                 )
-            elif resident_key is not None and hasattr(
-                active_session, "dispatch_batched_resident"
-            ):
-                dispatched = active_session.dispatch_batched_resident(
-                    value,
-                    weight,
-                    f"{resident_key}:{_}",
+                dispatched = dispatch_batched_tile(
+                    tile_name,
+                    value[:, row_start:row_end, inner_start:inner_end],
+                    weight[:, inner_start:inner_end, column_start:column_end],
                 )
-            else:
-                dispatched = active_session.dispatch_batched(value, weight)
-            if dispatched.artifact_cache:
-                caches.add(dispatched.artifact_cache)
+                profiles.append(dispatched)
+                if dispatched.artifact_cache:
+                    caches.add(dispatched.artifact_cache)
+                if output is None:
+                    continue
+                tile = (
+                    slice(None),
+                    slice(row_start, row_end),
+                    slice(column_start, column_end),
+                )
+                if inner_start == 0 and inner_end == inner:
+                    output[tile] = dispatched.output_bf16
+                    continue
+                # Inner tiles accumulate in FP32; outputs may alias reused buffers.
+                if inner_start == 0:
+                    accumulated = dispatched.output_fp32.clone()
+                else:
+                    accumulated += dispatched.output_fp32
+                if inner_end == inner:
+                    output[tile] = accumulated.to(torch.bfloat16)
+            batched_runner.last_dispatches = len(profiles)
             for field in (
                 "h2d_bytes",
                 "d2h_bytes",
@@ -752,9 +850,15 @@ def run_xdna_block(
                 "weight_population_ms",
                 "weight_population_bytes",
             ):
-                setattr(batched_runner, "last_" + field, getattr(dispatched, field))
-            batched_runner.last_resident_hits = int(dispatched.resident_hit)
-            return dispatched.output_bf16
+                setattr(
+                    batched_runner,
+                    "last_" + field,
+                    sum(getattr(p, field) for p in profiles),
+                )
+            batched_runner.last_resident_hits = sum(
+                int(p.resident_hit) for p in profiles
+            )
+            return profiles[0].output_bf16 if output is None else output
 
         def qkv_runner(
             prefix: str,
@@ -769,37 +873,69 @@ def run_xdna_block(
                 raise UnsupportedTensor(
                     "resident Q/K/V chaining requires a fingerprint-scoped XDNA session"
                 )
-            sources = (hidden, context, context)
-            prepared = []
-            for source, weight, weight_name in zip(
-                sources, projection_weights, weight_names
-            ):
-                flattened = source.reshape(-1, source.shape[-1])
-                if flattened.shape[1] > 2048:
-                    raise UnsupportedTensor(
-                        "resident Q/K/V chaining supports input widths up to 2048"
-                    )
-                if (
-                    packed_cache is not None
-                    and block_index is not None
-                ):
-                    item = packed_cache.prepared(
-                        block_index,
-                        weight_name,
-                        0,
-                        flattened,
-                        weight.shape[0],
-                    )
-                else:
-                    item = prepare_linear(flattened, weight)
-                prepared.append(item)
-            result = active_session.dispatch_qkv_chain(
-                tuple(prepared),
+            shared_input = hidden is context
+            flat_hidden = hidden.reshape(-1, hidden.shape[-1])
+            flat_context = context.reshape(-1, context.shape[-1])
+            chain_key = (
                 f"{packed_cache.manifest['cache_key'] if packed_cache is not None else resident_key}:"
-                f"{resident_key}:{prefix}:qkv",
-                shared_input=hidden is context,
+                f"{resident_key}:{prefix}:qkv"
             )
-            return result
+            results = []
+            for start, end in _row_tiles(flat_hidden.shape[0]):
+                tile = flat_hidden[start:end]
+                sources = (
+                    (tile, tile, tile)
+                    if shared_input
+                    else (tile, flat_context, flat_context)
+                )
+                prepared = []
+                for flattened, weight, weight_name in zip(
+                    sources, projection_weights, weight_names
+                ):
+                    if flattened.shape[1] > 2048:
+                        raise UnsupportedTensor(
+                            "resident Q/K/V chaining supports input widths up to 2048"
+                        )
+                    if (
+                        packed_cache is not None
+                        and block_index is not None
+                    ):
+                        item = packed_cache.prepared(
+                            block_index,
+                            weight_name,
+                            0,
+                            flattened,
+                            weight.shape[0],
+                        )
+                    else:
+                        item = prepare_linear(flattened, weight)
+                    prepared.append(item)
+                results.append(
+                    active_session.dispatch_qkv_chain(
+                        tuple(prepared),
+                        chain_key,
+                        shared_input=shared_input,
+                    )
+                )
+            if len(results) == 1:
+                return results[0]
+            merged = {
+                field: sum(result[field] for result in results)
+                for field in results[0]
+                if field != "outputs"
+            }
+            tiled = tuple(
+                torch.cat([result["outputs"][index] for result in results])
+                for index in range(3)
+            )
+            # Cross-attention K/V depend only on the context, so every tile
+            # recomputes the same values; keep the first tile's copy.
+            merged["outputs"] = (
+                tiled
+                if shared_input
+                else (tiled[0], *results[0]["outputs"][1:])
+            )
+            return merged
 
         def linear_pair_runner(
             prefix: str,

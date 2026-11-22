@@ -1,0 +1,94 @@
+{
+  "date": "2026-11-18",
+  "status": "passed",
+  "scope": "desktop_tracked_instance_cpu_npu_integration",
+  "versions": {
+    "desktop": "1.1.9",
+    "comfyui": "0.38.0",
+    "comfyui_commit": "170594057a22673349ddf0a3d88624b7fa5865bb",
+    "frontend": "1.53.10",
+    "python": "3.13.9",
+    "torch": "2.14.1+cpu",
+    "anima_runtime_commit": "0e115695c8373186463036629ad7477b6c8dbde4"
+  },
+  "configuration": {
+    "instance_type": "tracked_git",
+    "launch_mode": "window",
+    "python_environment": "existing_external_xdna_venv",
+    "host_device": "cpu",
+    "npu": "AMD XDNA 2",
+    "profile": "int8-attn-l1k64-nq8pp",
+    "attention": "air",
+    "air_self4096": true,
+    "adaln": "host",
+    "torch_threads": 10,
+    "vae_bf16_clfix": true,
+    "int8_overlap": true,
+    "model": "anima_turboV11.safetensors",
+    "loader": "LoadAnimaXDNACache",
+    "batch": 1,
+    "steps": 4,
+    "cfg": 1.0,
+    "sampler": "euler",
+    "scheduler": "simple"
+  },
+  "runs": [
+    {
+      "submission": "api",
+      "cache_state": "first_prompt",
+      "size": 1024,
+      "seed": 700755787614900,
+      "server_e2e_s": 74.892,
+      "latent_sha256": "ec56fcbbd25cae94a01026ff94d289c93c630ec943cc85f9d611a4a23d50e7c2",
+      "rgb_sha256": "83a5159e11e145dceb581b0ec7a666b38bd372eb87a907c052f6855d3519408e",
+      "latent_matches_launcher": true,
+      "rgb_matches_launcher": true
+    },
+    {
+      "submission": "api",
+      "cache_state": "resident",
+      "size": 1024,
+      "seed": 700755787614899,
+      "server_e2e_s": 26.041,
+      "latent_sha256": "0107a68286504e82851d9452240f3995a3d9ab0f48b0cc6ce228df2d66b102b0",
+      "rgb_sha256": "7bb6d1aeed05524df43f217df803465891af5b2bb9976ad01d1445f40e6dcfac",
+      "latent_matches_launcher": true,
+      "rgb_matches_launcher": true
+    },
+    {
+      "submission": "api",
+      "cache_state": "resident_resolution_change",
+      "size": 512,
+      "seed": 700755787614899,
+      "server_e2e_s": 7.092,
+      "latent_sha256": "4e4de4471ee4c36249a491d21676304c175f43b03ffe64d896df612cea2f8559",
+      "rgb_sha256": "e15a473efb7bc04da8532c078458a8047abaff6282e5755c885342db8a3457b6",
+      "latent_matches_launcher": true,
+      "rgb_matches_launcher": true
+    },
+    {
+      "submission": "embedded_frontend_app.queuePrompt",
+      "cache_state": "resident_resolution_change",
+      "size": 1024,
+      "seed": 700755787614899,
+      "server_e2e_s": 27.977,
+      "latent_sha256": "0107a68286504e82851d9452240f3995a3d9ab0f48b0cc6ce228df2d66b102b0",
+      "rgb_sha256": "7bb6d1aeed05524df43f217df803465891af5b2bb9976ad01d1445f40e6dcfac",
+      "latent_matches_launcher": true,
+      "rgb_matches_launcher": true
+    }
+  ],
+  "harness_sha256": {
+    "validate_api.py": "8caea701ea506c3d9a4a19251cfa53228b3918ca644c6bac99f97fcd3d78aeaa",
+    "frontend_run.js": "d3a399c302d56da2f69378107e1aa03d91dea0e870e7719603696b96f99658f6",
+    "collect_ui.py": "4e6735fc326c18e28f132a67e8a5ddf20d08e24ed64ab56765e2198778e63a40"
+  },
+  "limitations": [
+    "Individual functional checks, not a controlled Desktop/launcher performance comparison.",
+    "Server times include sampling, VAE decoding and image/latent saving, not Desktop startup.",
+    "Output parity is against the same experimental INT8/AIR profile, not standard BF16.",
+    "The Desktop-bundled backend and Python were not installed or validated.",
+    "No 1024x1024 CPU-only benchmark, Desktop-specific LoRA or other-model test.",
+    "Local paths, logs, screenshots and captured tensors are not published."
+  ]
+}

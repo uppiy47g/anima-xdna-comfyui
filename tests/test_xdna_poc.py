@@ -851,6 +851,35 @@ class PackedWeightCacheTests(unittest.TestCase):
             rebuilt.close()
             self.assertFalse(rebuilt_status.hit)
 
+    def test_released_mapping_remaps_lazily_and_rechecks_identity(self):
+        config = _tiny_block_config()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkpoint = root / "model.safetensors"
+            _save_blocks(checkpoint, config)
+            cache = PackedWeightCache(checkpoint, config, 0, 1, root / "cache")
+            status = cache.open()
+            expected = cache.tensor("0:attn1.to_q.weight:k0")
+            record = cache._lease._record
+
+            cache.release_mapping()
+            self.assertIsNone(cache._mapped)
+            self.assertIsNone(record.mapped)
+            self.assertTrue(
+                torch.equal(cache.tensor("0:attn1.to_q.weight:k0"), expected)
+            )
+            self.assertIsNotNone(record.mapped)
+
+            cache.release_mapping()
+            manifest_path = status.path / "manifest.json"
+            manifest_path.write_text(
+                manifest_path.read_text(encoding="utf-8") + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(CacheIntegrityError, "not verified"):
+                cache.tensor("0:attn1.to_q.weight:k0")
+            cache.close()
+
     def test_manifest_change_invalidates_process_local_verification(self):
         config = _tiny_block_config()
         with tempfile.TemporaryDirectory() as directory:
@@ -1309,6 +1338,99 @@ class XDNAPocUnitTests(unittest.TestCase):
 
 
 class AnimaBlockUnitTests(unittest.TestCase):
+    def test_large_images_tile_into_bounded_npu_dispatches(self):
+        from anima_xdna_poc.block import _row_tiles, run_xdna_block
+        from anima_xdna_poc.xdna import DispatchResult
+
+        class TilingSession:
+            """CPU stand-in that binds resident rows and reuses output buffers."""
+
+            def __init__(self):
+                self.resident = {}
+                self.buffers = {}
+                self.largest = 0
+
+            def _result(self, key, output):
+                buffer = self.buffers.setdefault((key, tuple(output.shape)), output.clone())
+                buffer.copy_(output)
+                return DispatchResult(buffer.to(torch.bfloat16), buffer, 0.0, None)
+
+            def has_resident(self, key):
+                return key in self.resident
+
+            def dispatch_resident(self, prepared, key):
+                weight = prepared.weight_k_n_bf16[
+                    : prepared.in_features, : prepared.out_features
+                ]
+                self.resident[key] = (weight, prepared.rows)
+                return self.dispatch_resident_input(
+                    prepared.input_bf16[: prepared.rows, : prepared.in_features], key
+                )
+
+            def dispatch_resident_input(self, value, key):
+                weight, rows = self.resident[key]
+                if value.shape[0] != rows:
+                    raise UnsupportedTensor("resident rows changed")
+                self.largest = max(self.largest, rows)
+                return self._result(key, value.float() @ weight.float())
+
+            def dispatch_head_chain(self, value, weight, key):
+                self.largest = max(self.largest, *value.shape[1:], weight.shape[2])
+                return self._result("head", value.float() @ weight.float())
+
+            def dispatch_qkv_chain(self, prepared, key, shared_input):
+                self.largest = max(self.largest, *(item.rows for item in prepared))
+                return {
+                    "outputs": tuple(cpu_linear(item) for item in prepared),
+                    "wall_ms": 0.0,
+                    "dispatches": 1,
+                    "h2d_bytes": 0,
+                    "d2h_bytes": 0,
+                    "allocation_count": 0,
+                    "resident_hits": 0,
+                    "weight_population_bytes": 0,
+                }
+
+        config = _tiny_block_config()
+        generator = torch.Generator().manual_seed(82)
+        tensors = {
+            name: (
+                torch.randn(tensor.shape, generator=generator) / tensor.shape[1] ** 0.5
+            ).to(torch.bfloat16)
+            if tensor.ndim == 2
+            else tensor
+            for name, tensor in _block_tensors(config).items()
+        }
+        weights = AnimaBlockWeights("transformer_blocks.0.", tensors)
+        inputs = deterministic_block_inputs(
+            config, 16, 3, seed=83, masked_context_tokens=1
+        )
+        reference = run_cpu_block(config, weights, inputs)
+        untiled = run_xdna_block(
+            config,
+            weights,
+            inputs,
+            session=TilingSession(),
+            resident_key="block0",
+            activation_chaining=False,
+        )
+        session = TilingSession()
+        with mock.patch("anima_xdna_poc.block.XDNA_TOKEN_TILE", 4):
+            tiled = run_xdna_block(
+                config,
+                weights,
+                inputs,
+                session=session,
+                resident_key="block0",
+                activation_chaining=False,
+            )
+            with self.assertRaisesRegex(UnsupportedTensor, "multiple of 4"):
+                _row_tiles(6)
+        self.assertLessEqual(session.largest, 4)
+        self.assertGreater(tiled.dispatch_count, untiled.dispatch_count)
+        torch.testing.assert_close(tiled.output, untiled.output, rtol=2e-2, atol=2e-3)
+        torch.testing.assert_close(tiled.output, reference.output, rtol=2e-2, atol=2e-3)
+
     def test_air_and_activation_chaining_are_forwarded_independently(self):
         from anima_xdna_poc.block import BlockResult, run_xdna_block
 

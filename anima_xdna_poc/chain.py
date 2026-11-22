@@ -146,12 +146,18 @@ class AnimaXDNAChainRuntime:
             self._packed_cache.execution_identity,
         )
 
-    def close(self):
+    def close_session(self):
+        """Release XRT resources and the payload mapping; reopening remaps lazily."""
         if self._air_attention is not None:
             self._air_attention.close()
         if self._session is not None:
             self._session.__exit__(None, None, None)
             self._session = None
+        if self._packed_cache is not None:
+            self._packed_cache.release_mapping()
+
+    def close(self):
+        self.close_session()
         if self._packed_cache is not None:
             self._packed_cache.close()
             self._packed_cache = None

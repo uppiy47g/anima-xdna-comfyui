@@ -34,7 +34,7 @@ This dated, non-exhaustive search is not an absolute novelty claim.
 | ComfyUI | `170594057a22673349ddf0a3d88624b7fa5865bb` |
 | Wrapper source | `737338d76bf2a7dcf9806aaba5d6d936499b95ab` |
 | Models | Anima Base v1.0, Turbo V1.1, and WAI Nova Anima Turbo LoRA Ver V1.0, BF16 transformer |
-| Shape | batch 1, latent `[1,16,1,64,64]`, 512×512, context `[1,512,1024]` |
+| Shape | batch 1, latent `[1,16,1,64,64]`, 512×512, context `[1,512,1024]`; 1024×1024 (`[1,16,1,128,128]`) with baseline attention or, experimentally, AIR attention or the INT8 profile, see the 2026-11-16 and 2026-11-17 sections |
 
 The exact structured measurements and artifact digests are in
 [`evidence/anima-xdna-validated.json`](evidence/anima-xdna-validated.json).
@@ -2809,6 +2809,1118 @@ is unchanged, so the recorded source hash is that of the documented file.
   the upsample restride when the VAE loads. Neither exists in the repository or
   the install.
 
+## Anima 1024x1024 by tiling XDNA dispatches (2026-11-16)
+
+This change makes the standard BF16 path generate 1024×1024 images: latent
+`[1,16,1,128,128]`, a 64×64 patch grid and 4096 image tokens. AIR attention
+and the INT8 profile were unchanged by it and remained 512×512-only; the
+[next section](#air-attention-at-4096-keys-for-1024x1024-2026-11-16) adds an
+AIR path for 4096 tokens.
+
+The compact results are in
+[`evidence/anima-1024-tiling.json`](evidence/anima-1024-tiling.json).
+
+**Result.**
+
+- **Numerics.** Base v1.0 on the deterministic synthetic 4096-token input
+  passes the strict 5% chain gate over 28 blocks. The worst block NRMS is
+  1.41% (block 13) and the final NRMS is 0.97%.
+- **ComfyUI.** A real ComfyUI Turbo V1.1 prompt produced a correct
+  1024×1024 image without fallback.
+- **Speed.** One 28-block pass takes 54.3 s, so a CFG 1 sampler step takes
+  about 55 s.
+- **512×512 behaviour.** The 1024-token path is bit-for-bit unchanged.
+
+### Design
+
+A direct 4096-token attention kernel crashes `aircc` (0xC0000005). Larger
+kernels would also need separate resident weight sets. Instead, every XDNA
+dispatch is split into 1024-token tiles:
+
+| Operation | 4096-token execution |
+|---|---|
+| Linear and Q/K/V projections | 4 row tiles of 1024 against the same resident weights |
+| Self-attention QK | per query tile, 1024 × 1024 per key tile |
+| Self-attention AV | per query tile, 4 key tiles summed in FP32 on the host |
+| Cross-attention | per query tile against the 512 context keys |
+| Query tiles | concatenated by a host operation before the output projection |
+
+Each tile uses a kernel shape that the 512×512 path already compiles and
+validates, so both resolutions share one weight cache and one kernel cache.
+A block takes 76 dispatches (2,128 per 28-block pass).
+
+Several invariants keep this safe:
+
+- Each tile's output is materialized before the next dispatch, because
+  resident output buffers are reused.
+- Row counts above 1024 must be a multiple of 1024; anything else raises
+  `UnsupportedTensor`.
+- At 4096 tokens, AIR attention raised an error that recommended
+  `ANIMA_XDNA_ATTENTION_BACKEND=baseline` (superseded by the next section).
+  The INT8 profile requires AIR and its fused host kernels accept at most 1024
+  rows, so it cannot run at 4096 tokens either.
+- With one tile, the dispatch sequence is the one used before this change.
+
+The ComfyUI wrapper accepts both latent shapes and derives the patch grid,
+token count, RoPE and the residual reshape from the latent.
+
+### Hardware chain validation (Base v1.0, synthetic input)
+
+| Blocks | Dispatches | Cached run | Worst block NRMS | Final NRMS | Gate |
+|---|---:|---:|---:|---:|---|
+| 0-1 | 76 | 2.04 s | 0.19% | 0.19% | match |
+| 0-4 | 304 | 6.86 s | 0.93% | 0.93% | match |
+| 0-28 | 2,128 | 54.27 s | 1.41% (block 13) | 0.97% | match |
+
+**Timing breakdown.** In the 28-block run:
+
+- Blocks take 1.80-2.10 s each.
+- Kernel execution and waits account for 20.5 s, and host operations for
+  11.7 s.
+- Every weight was a resident hit: 2,576 hits, with no allocation and no
+  weight population.
+- The one-time populate/validate step took 176 s, and the CPU oracle 107 s.
+
+**512×512 regression.** The same synthetic Base 28-block chain at 1024 tokens
+stops at block 21 under the strict 5% transient gate (NRMS 0.0715185,
+max_abs 189.5). An export of the unmodified repository head gives the
+identical failure. It is a pre-existing Base transient-gate behaviour, like
+the real-fixture Base failure documented above, and this change did not
+introduce it.
+
+### ComfyUI generation (Turbo V1.1)
+
+- **Software.** ComfyUI `170594057a22` with `--cpu`, an isolated base
+  directory and the repository worktree, with attention backend `baseline`
+  and host AdaLN.
+- **Workflow.** Load Anima (BF16) → Load/Attach XDNA (`Auto (from MODEL)`) →
+  KSampler, followed by the default FP32 VAE decode.
+- **Settings.** Euler/simple, 4 steps, CFG 1, seed 700755787614899,
+  `EmptyCosmosLatentVideo` at 1024×1024 with length 1, and the
+  `qwen_3_06b_base` text encoder.
+
+Results:
+
+- The prompt executed in **250.8 s**. That includes model loading, cache
+  verification, the first-use setup and the VAE decode.
+- The first sampler step took 66.6 s and later steps 53-54 s; tqdm reported
+  an average of 55.8 s/it.
+- The image is a correct 1024×1024 RGB image, and runtime status reported a
+  verified weight-cache hit.
+- Free system memory dropped to about 1.1 GB of 23.6 GB during sampling.
+
+**Using it in an existing install.** In a ComfyUI install, Python must import
+the updated `anima_xdna_poc`. An editable install or a `.pth` file that puts
+an older copy first on `sys.path` silently keeps the 512×512-only runtime;
+`PYTHONPATH` does not override a `.pth` insertion. Update the deployed custom
+node copy before starting ComfyUI.
+
+### Limits
+
+- **Scope.** One machine and one run per measurement; there is no
+  statistical claim.
+- **Base with CFG > 1.** Not run end to end. Two passes per step imply about
+  110 s per step.
+- **Inputs.** The chain gate used the synthetic input. No real captured
+  4096-token fixture exists.
+- **Memory.** The memory headroom on 24 GB systems is small. Close other
+  applications before generating at 1024×1024.
+
+## AIR attention at 4096 keys for 1024x1024 (2026-11-16)
+
+The tiling change above runs 1024×1024 with baseline attention only. This
+change adds an **opt-in experimental** AIR fused-attention path for the same
+4096 image tokens. It needs one more AIR artifact, `self4096`, that the
+repository generator [`examples/air_attention.py`](../examples/air_attention.py)
+builds with the `nq8pp` schedule of the
+[scale-out section](#air-attention-schedule-scale-out-kv-buffering-and-a-16-core-column-split-2026-11-06).
+The runtime dispatches it once per 1024-query tile. Baseline attention stays
+the default and there is no silent fallback. Usage is described in the
+[README](../anima_xdna_poc/README.md#air-attention-at-1024x1024).
+
+The compact results are in
+[`evidence/air-attention-4096-keys.json`](evidence/air-attention-4096-keys.json).
+
+**Result.**
+
+- **Numerics.** Base v1.0 on the deterministic synthetic 4096-token input
+  passes the 28-block chain with a 5% per-block gate and a stricter 2% final
+  gate. The worst block NRMS is 1.49% (block 13) and the final NRMS is 1.04%;
+  the tiled baseline-attention chain had 1.41% and 0.97%.
+- **Speed.** One 28-block pass takes 18.6-19.9 s, against 54.3 s with
+  baseline attention (2.7-2.9× faster), and needs 1,232 dispatches instead of
+  2,128.
+- **ComfyUI.** A real Turbo V1.1 prompt at 1024×1024 executed in 108.0 s cold
+  and 82.3 s warm, against 250.8 s cold with baseline attention.
+- **Quality.** AIR is not control-equivalent. For the same seed, the decoded
+  image differs from the baseline-attention image by a mean absolute error of
+  22.1/255. Both images are coherent and show no tile seams.
+- **512×512 behaviour.** Per-block error statistics of the AIR chain are
+  exactly equal with and without this change.
+- **INT8.** The INT8 profile stays 512×512-only.
+
+### Design
+
+Self-attention uses a new kernel with 1024 queries and 4096 keys. Its `nq8pp`
+schedule runs eight query cores per head and two heads at a time (16 cores),
+with two K/V core buffers, direct Q tiles and column-split memtile buffers.
+The nominal explicit core buffers total 53,504 bytes per core; they depend on
+the tile sizes only, not on the key count. Cross-attention keeps the unchanged
+512-key `cross` artifact. A 4096-token call is four dispatches of each kernel,
+one per 1024-query tile, and the four tiles of a call share one upload of K
+and V:
+
+| Dispatches per block | Tiled baseline | AIR |
+|---|---:|---:|
+| Linear and projections (4 row tiles) | 36 | 36 |
+| Self-attention | 32 | 4 |
+| Cross-attention | 8 | 4 |
+| Total | 76 | 44 |
+| 28-block pass | 2,128 | 1,232 |
+
+At 512×512 the AIR chain still takes 11 dispatches per block. The `aircc`
+crash noted in the tiling section came from an untiled 4096 × 4096 Triton QK
+head chain. `self4096` is a directly orchestrated MLIR-AIR kernel that reuses
+the pinned upstream microkernels, and it compiled in 25.0-27.4 s in the
+recorded builds.
+
+| Artifact | Keys | Used for | ELF SHA-256 |
+|---|---:|---|---|
+| `self4096` | 4096 | 1024×1024 self-attention (new) | `ba53bb0f0242c3858bb1de0fbc67187b354c38b8326dff92363c0a893b563f5c` |
+| `self` | 1024 | 512×512 self-attention (unchanged `nq8pp`) | `dde8ae3533003a61036ad18ae153a342743a3d05cf6ee4f56108a540cdfa8ef2` |
+| `cross` | 512 | cross-attention at both sizes (unchanged `nq8pp`) | `c849bec474984f677a34b18648f42e1749b2b71ff042ec090cc8033125dd2d34` |
+
+The `self4096` manifest records `kernel_sha256`
+`490249c83ab26777aeed6b044c6f1bca521d10a307932cff9dc01f8b07530943`, equal to
+that of the 1024- and 512-key `nq8pp` builds in the scale-out evidence. Three
+builds produced an identical `self4096` ELF: the validated artifact (built by
+the repository generator before the validation runs), the private variant
+builder of the scale-out section, and a fresh repository-generator rerun on
+the final tree, whose kernel digest matched as well. The `module_sha256` in a
+manifest is not an invariant: the MLIR embeds the kernel object path, so it
+differs between work directories while the kernel and ELF digests do not.
+
+Several invariants keep this safe:
+
+- K and V upload with the first tile of a call and are reused only by the
+  later tiles of that call (`static_indices` 1 and 2); nothing is reused
+  across calls.
+- Each tile's output is copied out before the next dispatch, because the
+  scratch output buffer is reused.
+- The backend accepts batch 1, 16 heads of depth 128, 1024 or 4096 image
+  tokens, a 512-token context and no mask. Anything else raises
+  `UnsupportedTensor`; there is no fallback.
+- Each resolution opens only its own artifacts: `self` and `cross` at
+  512×512, `self4096` and `cross` at 1024×1024. A missing `self4096` raises
+  `FileNotFoundError` when 1024×1024 is first used, and 512×512 does not need
+  it. A manifest whose key count does not match its role raises `ValueError`
+  and leaves the runners that are already open untouched.
+- The first use at each resolution logs one `EXPERIMENTAL AIR attention
+  ACTIVE` warning.
+- The INT8 profile requires 1024 image tokens and raises `UnsupportedTensor`
+  at other sizes, so it cannot silently run at 1024×1024.
+
+### Kernel micro-benchmark
+
+One artifact at a time ran through `MultiLaunchRunner` on random normal BF16
+Q/K/V (seed 7, scaled by the input scale) for 16 heads and 1024 queries. The
+error is against FP32 scaled-dot-product attention of the same BF16 inputs;
+the rounding floor is the NRMS of rounding that FP32 reference to BF16.
+"Device launch" is XRT start and wait only; "runner run" also includes host
+staging. Values are medians (min-max) in milliseconds over repeated launches;
+the run counts were not recorded:
+
+| Kernel | Input scale | Device launch | Runner run | NRMS | Rounding floor |
+|---|---:|---|---|---:|---:|
+| `self4096` (`nq8pp`, 4096 keys) | 1 | 9.77 (9.30-11.93) | 14.26 (14.11-14.51) | 4.482% | 0.165% |
+| Pinned schedule, 4096 keys | 1 | 24.52 (24.12-25.58) | 31.84 (26.50-36.58) | 4.482% | 0.165% |
+| `self4096` | 3 | 10.89 (10.43-11.94) | 14.41 (14.18-14.76) | 4.001% | 0.162% |
+| `self` (`nq8pp`, 1024 keys) | 1 | 4.27 (4.19-4.32) | 5.00 (4.81-5.21) | 4.085% | 0.166% |
+| `self` (`nq8pp`, 1024 keys) | 3 | 4.25 (4.12-4.34) | 5.25 (5.05-5.59) | 3.726% | 0.160% |
+
+- The pinned schedule (4 query cores, one K/V buffer and `pair` Q: the
+  production schedule of the scale-out section) is included for comparison
+  only; it did not run through the chain or ComfyUI. At the same NRMS, the
+  `nq8pp` kernel is about 2.5× faster by device launch (24.52 vs 9.77 ms) and
+  about 2.2× faster by runner run (31.84 vs 14.26 ms).
+- The NRMS is 23-27 times the rounding floor in every row, so the error does
+  not come from rounding the output to BF16. The manifest records the
+  precision: BF16 online-softmax state and block outputs, and BFP16-emulated
+  BF16 matrix multiplies. No amount is attributed to either.
+- Device time depends on host load; these are single-session medians.
+
+### Hardware chain validation (Base v1.0, synthetic input)
+
+All runs use `--image-tokens 4096`, the deterministic synthetic seed-0 input
+and a verified weight-cache hit. Block ranges are end-exclusive, and all three
+runs passed their gates:
+
+| Run | Dispatches | Cached runs | Worst block NRMS | Final NRMS | Gates (block/final) |
+|---|---:|---|---:|---:|---|
+| AIR, blocks 0-1 | 44 | 633.7 and 640.2 ms | 0.19% | 0.19% | 5% / 2% |
+| AIR, blocks 0-28 | 1,232 | 18.60 and 19.93 s | 1.49% (block 13) | 1.04% (block 27) | 5% / 2% |
+| Tiled baseline attention, blocks 0-28 | 2,128 | 54.27 s (one run) | 1.41% (block 13) | 0.97% | 5% / 5% |
+
+The baseline row is the run in the tiling section on the same input. The
+largest absolute error of the AIR chain is 0.1289 at block 13 and 0.3438 at the
+final block; the baseline had 0.1172 and 0.375 at the same blocks. The AIR
+runs are 2.72× (19.93 s) and 2.92× (18.60 s) faster than the baseline run.
+
+**Timing breakdown.** In the 28-block AIR run:
+
+- Blocks take 669.2-818.7 ms each (the first 688.1 ms), against 1.80-2.10 s
+  with baseline attention.
+- Every weight was a resident hit: 1,456 hits, with no allocation and no
+  weight population.
+- The one-time populate/validate step took 140.7 s and the CPU oracle 111.0 s
+  (176 s and 107 s with baseline attention).
+- The staging counters per 28-block pass were:
+
+  | Counter | Baseline attention | AIR |
+  |---|---:|---:|
+  | H2D staging | 38.64 GB | 6.34 GB (6.1× lower) |
+  | D2H staging | 66.71 GB | 15.03 GB (4.4× lower) |
+  | Host operations | 11,669.9 ms | 2,675.8 ms |
+  | Host copy | 154.4 ms | 162.6 ms |
+  | Cache sync | 184.6 ms | 178.7 ms |
+  | Resident hits | 2,576 | 1,456 |
+  | Kernel and wait | 20,494.2 ms | 5,098.7 ms (not comparable) |
+
+  Sizes are decimal gigabytes. The baseline stages score and probability
+  tensors through the host for scale and softmax; the fused kernel has no host
+  softmax stage. An AIR attention call is recorded as one stage: its wall time
+  is a stage time and its Q/K/V and output sizes count in the staging
+  counters, but it adds nothing to the kernel-and-wait counter. That counter
+  is therefore not comparable between the two runs; the staging counters, the
+  host-operation time and the stage profile below are.
+
+### Per-block stage profile
+
+This is one `--profile` run each, in stage wall milliseconds per block. The
+baseline column is the mean of blocks 0 and 1 of a two-block run without the
+CPU oracle (block wall 1,688.7 and 1,702.3 ms); the AIR column is block 0 of a
+one-block run (block wall 639.8 ms). The groups sum to the total up to
+rounding, which is slightly below the separately measured block wall time:
+
+| Group | Baseline attention | AIR |
+|---|---:|---:|
+| Self-attention, NPU | 709.1 | 74.6 (fused) |
+| Self-attention, host scale/softmax | 233.9 | - |
+| Cross-attention, NPU | 103.9 | 21.1 |
+| Cross-attention, host scale/softmax | 26.4 | - |
+| Linear and FFN, NPU | 465.5 | 454.4 |
+| Other host | 125.4 | 88.6 |
+| **Total** | 1,664.3 | 638.6 |
+
+- Attention is 1,073.3 ms (about 64%) of a baseline block, and
+  self-attention alone is 943.0 ms (about 57%). With AIR it is 95.7 ms, about
+  11× lower.
+- BF16 linears are 454.4 ms, about 71%, of an AIR block. This change leaves
+  them unchanged, and they are now the dominant cost.
+
+**512×512 regression.** The AIR chain at 1024 tokens (Base v1.0, synthetic
+input, blocks 0-4, both gates set to 1.0) ran twice from an export of the
+unmodified repository head and twice from the working tree, with one cached
+run each. Every run took 11 dispatches per block (44 in total). The per-block
+max_abs, mean_abs, RMS, reference RMS and NRMS are exactly equal between the
+head export and the working tree in both pairs; the worst is block 3 with
+NRMS 0.8475% (max_abs 0.0547). The cached runs took 568.4 and 572.4 ms for the
+head and 569.0 and 542.0 ms for this change. The second pair also printed the
+imported package path of each run. The AIR artifact directory of these runs
+was not recorded.
+
+### ComfyUI generation (Turbo V1.1)
+
+- **Software.** ComfyUI 0.38.0 (`170594057a22`) with `--cpu`, an isolated base
+  directory and the repository worktree, with host AdaLN, QKV chaining and
+  attention backend `air` (`baseline` for the control run).
+- **Workflow.** Load Anima (BF16) → Load/Attach Anima XDNA Model
+  (`Auto (from MODEL)`) → KSampler, followed by the default FP32 VAE decode.
+- **Settings.** Euler/simple, 4 steps, CFG 1, `EmptyCosmosLatentVideo` at
+  1024×1024 with length 1 and the `qwen_3_06b_base` text encoder. The
+  positive prompt is "a cheerful anime girl under cherry blossoms, detailed
+  illustration, soft daylight" and the negative prompt is "worst quality, low
+  quality, blurry, jpeg artifacts".
+
+| | Baseline attention, cold | AIR, cold | AIR, warm |
+|---|---:|---:|---:|
+| Seed | 700755787614899 | 700755787614899 | 700755787614900 |
+| Prompt executed | 250.8 s | 108.0 s (wall 110.1 s) | 82.3 s (wall 85.1 s) |
+| First sampler step | 66.6 s | 24.8 s | not recorded |
+| Later sampler steps | 53-54 s | 19.9 s (second step) | about 17.6 s |
+
+- "Cold" is the first prompt after the server starts: model loading, cache
+  verification, first-use setup and the VAE decode are included. "Warm" is a
+  second prompt on the same server. No warm baseline prompt was timed.
+- The cold prompt is 2.32× faster and the first step 2.7× faster. Later steps
+  are about 2.7× faster (19.9 vs 53-54 s) and the warm AIR steps about 3.0×
+  faster (17.6 s).
+- About 12 s of the warm prompt lies outside the four sampler steps (82.3 s
+  minus 4 × 17.6 s, an estimate). The FP32 VAE decode is part of it and was
+  not timed separately.
+- Runtime Status after both AIR prompts reported `attention_backend`
+  `air_experimental`, 8 calls, 8 chain runs, 7 resident reuses, 1,232
+  dispatches for the last call, 6.34 GB H2D and 15.03 GB D2H staging, 1,456
+  resident hits and no error. The first call took 24.7 s and the last call
+  17.6 s (chain 17.3 s, preprocess 0.24 s, postprocess 0.014 s).
+- Free system memory dropped to about 1 GiB of 23.6 GiB during sampling
+  (approximate).
+
+**Image comparison.** The cold AIR image and the cold baseline image use the
+same seed. Over the decoded 1024×1024×3 8-bit RGB pixels, the mean absolute
+error is 22.13/255, the RMS error 43.74 (NRMS 23.52%) and the PSNR 15.31 dB;
+4.54% of the pixels are identical. A visual check found both images coherent
+with no tile seams or artifacts: the composition matches and the details
+differ. The [512×512 AIR experiment](#numerical-outcome-not-production-ready)
+measured a fixed-seed latent NRMS of 29.035% and a decoded RGB MAE of
+15.975/255. Those figures are not directly comparable, because the resolution
+and the seed differ. The latent difference at 1024×1024 was not measured.
+
+**Using it in an existing install.** Python must import the updated
+`anima_xdna_poc`; see the tiling section above for the `.pth` and editable
+install caveat. An older copy keeps AIR 512×512-only, and a 1024×1024 prompt
+then raises an error. Put `self4096\` (with `aie.elf` and `manifest.json`)
+next to `self\` and `cross\` in the directory that
+`ANIMA_XDNA_AIR_ATTENTION_DIR` names, and set
+`ANIMA_XDNA_ATTENTION_BACKEND=air` before the server starts; the repository
+default stays baseline. Only a directory with the `nq8pp` `self`, `cross` and
+`self4096` was tested. A directory that mixes pinned-schedule artifacts with
+`self4096` was not.
+
+### Reproduction
+
+Set placeholders only in the current shell; do not commit paths or captures.
+Builds use the compiler environment of the earlier AIR work
+(`$compilerPython`); everything else uses the production Python venv
+(`$python`). `$repo` is this repository, `$airUpstream` the pinned upstream
+attention sources (the generator checks the `attn_npu2.cc` and `zero.cc`
+digests), `$airDir` an artifact directory that already holds the `nq8pp`
+`self\` and `cross\` artifacts (each with `aie.elf` and `manifest.json`),
+`$checkpoint` the Base v1.0 Diffusers transformer safetensors and `$scratch` a
+scratch directory:
+
+```powershell
+$env:XRT_DEV_DIR = "<XRT_SDK_DIR>"
+$env:TRITON_CACHE_DIR = "<TRITON_CACHE_DIR>"
+Set-Location $repo
+$chainMain = 'import sys; from anima_xdna_poc.cli import chain_main; sys.exit(chain_main(sys.argv[1:]))'
+
+# 1. Build self4096 (25-30 s).
+& $compilerPython -m examples.air_attention --keys 4096 --schedule nq8pp `
+  --parallel-heads 2 --source-dir $airUpstream --work-dir "$airDir\self4096"
+
+# 2. AIR chain: all 28 blocks, then a one-block stage profile.
+$env:ANIMA_XDNA_AIR_ATTENTION_DIR = $airDir
+$env:ANIMA_XDNA_ATTENTION_BACKEND = 'air'
+anima-xdna-chain $checkpoint --image-tokens 4096 --max-final-nrms 0.02
+anima-xdna-chain $checkpoint --image-tokens 4096 --start-block 0 --end-block 1 `
+  --max-final-nrms 0.02 --profile
+
+# 3. Baseline-attention chain and a two-block stage profile.
+$env:ANIMA_XDNA_ATTENTION_BACKEND = 'baseline'
+anima-xdna-chain $checkpoint --image-tokens 4096 --runs 1
+anima-xdna-chain $checkpoint --image-tokens 4096 --start-block 0 --end-block 2 `
+  --no-oracle --runs 1 --profile
+
+# 4. 512x512 regression: the head export and the working tree, same arguments.
+git -C $repo archive --format=zip --output "$scratch\head.zip" 571696a2e01a89e525a29bfd2c7670647e3545d7
+Expand-Archive "$scratch\head.zip" "$scratch\head"
+$regression = '--image-tokens', '1024', '--start-block', '0', '--end-block', '4',
+  '--warmups', '0', '--runs', '1', '--max-block-nrms', '1', '--max-final-nrms', '1'
+$env:ANIMA_XDNA_ATTENTION_BACKEND = 'air'
+foreach ($root in "$scratch\head", $repo) {
+  Set-Location $root
+  & $python -c $chainMain $checkpoint @regression
+}
+```
+
+`anima-xdna-chain` runs the installed package, which must be the updated one.
+From an uninstalled checkout, replace it with `& $python -c $chainMain` run
+from `$repo`. Step 4 uses that form so that each working directory supplies its
+own package. Run the step 4 loop twice and compare the printed per-block errors
+between the head export and the working tree.
+
+The kernel benchmark is the private `air_check.py` from the archive below. It
+takes `--artifact <directory> --scale <1 or 3> --out <json>` and uses seed 7,
+with defaults of 2 warmups and 8 runs; the other rows of the table change only
+the artifact and the scale. For ComfyUI, start a fresh isolated `--cpu` server
+for each backend (`baseline`, or `air` with `ANIMA_XDNA_AIR_ATTENTION_DIR` set
+to `$airDir`), submit the workflow above with seed 700755787614899 through the
+`/prompt` API and read the executed time and the sampler step times. On the AIR
+server, submit a second prompt with seed 700755787614900 for the warm time,
+then run a one-node Runtime Status prompt, and compare the two cold PNGs with a
+per-pixel script. The private drivers (`e2e_1024.py` for baseline attention,
+`e2e_air.py` for AIR, `status_air.py` and `compare_outputs.py`) are in the
+archive.
+
+`air4096\implementation.zip` (57 members, SHA-256
+`9cb34de96c27bb9e3fd260f4292d0d6ede03d2531380ce4c92572bce0a0d7bea`, stored in
+the evidence file as `implementation_archive_sha256`) pins the benches and
+builders, the ComfyUI drivers and comparison scripts, the saved chain,
+regression and baseline ComfyUI results with the two PNGs, the validated
+artifact directory, the other two `self4096` builds and the evidence generator.
+The archive is not committed.
+
+### Limits
+
+- **Scope.** One machine and one run per measurement; there is no statistical
+  claim. The AIR chain has two timed 28-block runs and the baseline chain one.
+- **Quality.** AIR remains opt-in and experimental, and BF16 online softmax is
+  not quality-equivalent to the control. The image comparison uses one seed;
+  there is no latent-space or CPU-reference comparison at 1024×1024.
+- **Warm baseline.** No warm baseline-attention prompt was timed, so the warm
+  comparison is AIR against the cold baseline.
+- **Gates.** The 28-block AIR run used the stricter 2% final gate and the
+  baseline run 5%. Both used 5% per block.
+- **Schedule.** Only `nq8pp` was validated through the chain and ComfyUI. The
+  pinned-schedule 4096-key kernel was only benchmarked as a kernel (31.84 vs
+  14.26 ms per runner run), and a mixed artifact directory is untested.
+- **Inputs.** The chain used the synthetic input; there is no real captured
+  4096-token fixture. Base with CFG > 1 was not run: two passes of 18.6-19.9 s
+  imply about 37-40 s per step.
+- **INT8.** The INT8 profile stays 512×512-only and now raises an explicit
+  error at other sizes.
+- **Install.** An existing install needs the updated node copy and a
+  `self4096` artifact in its AIR directory.
+- **Memory.** About 1 GiB of 23.6 GiB remained free during sampling.
+- **Saved logs.** The AIR ComfyUI timings and Runtime Status values come from
+  the driver's console output, which was not saved; the archive pins the
+  drivers and the cold-run PNG. The 4096 warning text was finalized after the
+  hardware chain and ComfyUI runs, so the saved chain stderr shows the earlier
+  wording (a log string only).
+- **What remains.** BF16 linears are about 71% of an AIR block, and 15.03 GB
+  of device-to-host staging per pass remains. This change addresses neither.
+
+## Cache-backed MODEL loader and 512x512 memory (2026-11-17)
+
+**Result.** The new opt-in **Load Anima XDNA (Cache-backed)** node avoids
+allocating ComfyUI's duplicate 28-block Parameters. In a paired 512x512
+Turbo V1.1 experiment, peak process working set fell from **15.357 GiB to
+11.757 GiB**, a **3.600 GiB (23.44%)** reduction. Both first and repeat
+generations matched the original loader's latents bitwise and its decoded
+RGB pixels exactly. This is a loader/storage change, not INT8 quantization.
+Evidence: [`evidence/cache-backed-loader-512-memory.json`](evidence/cache-backed-loader-512-memory.json).
+
+### Construction and safety
+
+The loader uses safetensors shape/dtype metadata to detect the native Anima
+architecture without creating block tensors. It constructs ComfyUI's Anima
+with zero host transformer blocks, loads only the 125 host Parameters, then
+installs 28 parameter-free block sentinels. A sentinel raises if executed:
+the existing diffusion wrapper must run those blocks from the verified XDNA
+cache. No full ComfyUI block MODEL is created and subsequently stripped, and
+no shared upstream MODEL is mutated.
+
+The existing cache builder and verifier still check source fingerprints,
+packed payloads and architecture; a missing cache is built using the normal
+streaming path. The original source checkpoint remains required. Host layers
+and cache are loaded from the same selected source, whose file identity is
+checked before and after preparation. Missing/unexpected host tensors,
+wrong shapes, extra block tensors, unsupported architectures and changed
+source files raise explicit errors.
+
+The patch/time embeddings, LLM adapter and final projection remain BF16
+Parameters. Their computation follows ComfyUI's `unet_manual_cast` policy,
+just like **Load Anima (BF16)**: FP32 host computation on this CPU. An initial
+prototype incorrectly set the compute dtype to `None`, causing output
+differences. That version was rejected; the measurements below are from the
+corrected implementation and a fresh matched pair.
+
+Normal MODEL clones share host layers and a reference-counted XDNA attachment.
+As first released, the loader refused live LoRA/weight patches, weight hooks,
+GPU placement and checkpoint export/merging; standard LoRA nodes are now
+supported by the [follow-up below](#cache-backed-loader-with-standard-lora-nodes-2026-11-17).
+Re-attaching this MODEL is rejected; it already contains the wrapper.
+Explicit unload releases an attachment, and the final reference closes cache
+and device resources. An unloaded attachment cannot sample again without
+reloading. The existing loader is unchanged.
+
+### Measurement
+
+Each variant ran in a separate fresh standalone ComfyUI Python process,
+invoking the actual loader, CLIP, KSampler and VAEDecode nodes. This was
+**not** an HTTP server/UI prompt-executor measurement. Each process generated
+two images sequentially with the same seed. The packed disk cache was a
+verified hit in both processes; "first" does not mean a cold disk-cache build.
+
+- Ryzen AI 9 365, XDNA 2 `npu2`, 25,359,659,008 physical RAM bytes.
+- ComfyUI `170594057a22673349ddf0a3d88624b7fa5865bb`, Python 3.13.9,
+  PyTorch `2.14.1+cpu`, XRT SDK 2.21.75.
+- Turbo V1.1, 512x512, 4 steps, Euler/simple, CFG 1, seed
+  `700755787614899`; Qwen 3 0.6B and the default FP32 Qwen Image VAE.
+- BF16 AIR `nq8pp` self/cross artifacts, host AdaLN, QKV chaining,
+  10 PyTorch intra-op threads and one inter-op thread. No INT8 profile,
+  GEMM-layout override or BF16 VAE patch.
+- Positive: "a cheerful anime girl under cherry blossoms, detailed
+  illustration, soft daylight". Negative: "worst quality, low quality,
+  blurry, jpeg artifacts".
+
+Windows `GetProcessMemoryInfo` supplied process-lifetime peak working set and
+peak private commit through final unload/GC. Current working set,
+`PrivateUsage` and system available physical memory were also sampled at a
+requested 50 ms interval; scheduling can lengthen the actual interval.
+
+| Metric | Original BF16 loader + attach | Cache-backed loader |
+|---|---:|---:|
+| ComfyUI block Parameter bytes | 3,875,565,568 | 0 |
+| ComfyUI non-block Parameter bytes | 306,572,288 | 306,572,288 |
+| Peak working set, bytes | 16,489,283,584 | 12,624,310,272 |
+| Peak working set, GiB | 15.357 | 11.757 |
+| Peak private commit, bytes | 16,061,812,736 | 9,940,877,312 |
+| Peak private commit, GiB | 14.959 | 9.258 |
+| First sampler, seconds | 22.152 | 20.425 |
+| Repeat sampler, seconds | 17.119 | 16.473 |
+
+Working set is resident RAM; private commit is a different OS quantity.
+The 5.701 GiB private-commit reduction includes allocation/lifetime effects
+and must not be presented as the amount of physical RAM saved. XRT BOs,
+mapped cache bytes and Parameter bytes are separate descriptions of memory:
+do not add them to the OS counters or to one another.
+
+Both variants ran four chains per image (eight total), with 308 dispatches
+per chain and no additional weight population in the last resident call.
+Within each process, the repeat latent was also bitwise identical to the
+first. Across loaders, both comparisons had latent max error/NRMS zero and
+RGB MAE zero. Explicit runtime unload closed both runtimes; after model GC,
+private commit was about 1.63 GiB (original) / 1.74 GiB (cache-backed).
+
+These are single observations, not a performance benchmark. Equal outputs
+establish parity with the **existing AIR path**, not equivalence to baseline
+attention or a CPU-only model.
+
+### Use and reproduction
+
+Update the node package actually imported by ComfyUI, then restart with
+`--cpu`. Replace the original loader/attach pair with
+**Load Anima XDNA (Cache-backed)** (`LoadAnimaXDNACache`), select the same
+native checkpoint, and connect `MODEL` directly to KSampler.
+`rebuild_cache`, `cache_dir` and `qkv_chaining` retain their existing meanings.
+The Runtime Status node reports `model_block_parameters_omitted=true`,
+zero block Parameter bytes and policy `cache_backed_no_comfy_block_parameters`.
+
+To reproduce the pair, use the same environment/artifacts and settings
+above, and separate fresh processes. In one, call
+`LoadAnimaBF16.load` followed by `LoadAttachAnimaXDNAModel.attach`; in the
+other, call `LoadAnimaXDNACache.load`. Use the real `CLIPLoader`,
+`CLIPTextEncode`, `EmptyCosmosLatentVideo`, `KSampler` and `VAEDecode` nodes
+in both, retain the same objects between two same-seed generations, record
+OS counters during loading/sampling/decoding, and compare saved latent
+tensors and RGB arrays. Do not compare PNG file bytes, since metadata can
+differ. End with explicit runtime unload, model unload and GC.
+
+The private `implementation.zip` archive has 18 members, 2,707,934 bytes and
+SHA-256 `d182c741b15842ae127eca463238a35a99aea75b2d97aa46e4e2575b55c70d5e`.
+It pins the measurement/recording scripts, lifecycle smoke, corrected-pair
+console logs, memory traces, latents and PNGs. It contains no model weights
+and is not committed. Keep paths and captures local; use placeholders when
+adapting the scripts.
+
+**Limits.** One machine, checkpoint, seed and process pair. No 1024x1024
+memory run, cold-cache-build peak, INT8 combination, CFG > 1, live-LoRA or
+CPU-only reference was measured. System available memory includes other
+applications and the OS cache, so it is only observational. The normal
+installed node copy and production launcher were not modified.
+
+## Cache-backed loader with standard LoRA nodes (2026-11-17)
+
+**Result.** Standard **Load LoRA** / **Load LoRA Model Only** nodes can now
+follow **Load Anima XDNA (Cache-backed)**. In a 512x512 Turbo V1.1 run with
+one LoRA, peak process working set was **11.917 GiB**, versus **16.520 GiB**
+for the original BF16 loader + LoRA + attach workflow (4.604 GiB / 27.9%
+less). All 11 LoRA latents across four processes, including repeats and
+LoRA prompts after switching, were bitwise identical, as were their RGB
+pixels. The base prompt after switching matched the earlier cache-backed
+base latent bitwise. Evidence:
+[`evidence/cache-backed-lora-512.json`](evidence/cache-backed-lora-512.json).
+
+### Design
+
+- **Keys.** Each parameter-free block sentinel exposes its 20 tensors as BF16
+  `meta` placeholders in `state_dict`. ComfyUI's standard LoRA key map and
+  `add_patches` therefore accept block keys, while no block storage is
+  allocated. Host-layer patches are applied by ComfyUI normally; block
+  patches are never applied by ComfyUI, because the sentinels have no
+  Parameters, and are consumed by the XDNA runtime instead.
+- **Runtime.** `pre_run` selects a runtime by the MODEL's `patches_uuid`.
+  An unpatched MODEL uses the base runtime. A patched MODEL validates the
+  same patch contract as the original attach path, reads base block tensors
+  from the original checkpoint on demand (file identity re-checked), and
+  builds or reuses the effective BF16 packed cache keyed by the checkpoint
+  and LoRA content. One runtime per patch set is shared by later prompts
+  and clones. The lookup is dynamic, because ComfyUI copies wrappers before
+  `pre_run`.
+- **Switching.** The newly selected runtime suspends the previously resident
+  one. Its AIR runners, XRT buffers and session close, and its packed-cache
+  mapping is released. The next use remaps through the in-process verified
+  lease and re-checks the payload identity; it does not re-verify the full
+  payload.
+- **Contract.** Supported patches are the original workflow's: ordinary
+  additive 2-D `LoRAAdapter` and the hybrid Turbo Q/K-norm `diff`, at any
+  finite strength. LoHa/LoKr/OFT/DoRA, reshape/mid-weight LoRA, other block
+  diff/bias patches, weight hooks, bypass LoRA injection (block submodule
+  lookup raises), GPU placement and checkpoint saving/merging raise instead
+  of being ignored. The original loader is
+  unchanged.
+
+A development run without the mapping release showed why it is needed:
+after switching from LoRA to base, the suspended LoRA payload stayed mapped
+and peak working set rose to 15.804 GiB. With the release, the whole
+four-prompt run peaked at 11.917 GiB with unchanged times and outputs.
+
+### Measurement
+
+Settings, environment, prompts and memory counters match the
+[cache-backed memory experiment](#cache-backed-model-loader-and-512x512-memory-2026-11-17).
+The LoRA file was `anima-highres-aesthetic-boost.safetensors`: 138,662,176
+bytes, SHA-256
+`db5b2dcc4e1afa215058b7a85fb9377124c2e9aabd48c25e595af7199207c299`,
+448 block patches, no host-layer keys, `LoraLoaderModelOnly` strength 1.0.
+Each variant ran in a fresh standalone ComfyUI Python process using the real
+nodes (not HTTP/UI). Order: cache cold, original, cache warm without mapping
+release, then cache warm with the final code. The original workflow sampled
+LoRA twice; cache-backed runs sampled LoRA, LoRA, base, LoRA with the same
+seed, keeping the base MODEL for switching.
+
+| Metric | Original BF16 + LoRA + attach | Cache-backed + LoRA |
+|---|---:|---:|
+| Peak working set through LoRA prompts, bytes | 17,738,522,624 | 12,795,494,400 |
+| Peak working set, GiB | 16.520 | 11.917 |
+| Peak private commit, bytes | 22,681,952,256 | 15,806,545,920 |
+| Minimum system available, LoRA prompts | 204,800 bytes | 6.097 GiB |
+| Loader seconds | 27.66 | 7.31 |
+| First LoRA sampler seconds | 26.6 | 35.8 |
+| Repeat LoRA sampler seconds | 16.2 | 15.7 |
+| Base after switch / LoRA again, seconds | — | 21.5 / 18.5 |
+
+The original workflow verifies the effective cache during attach (inside
+"Loader seconds"); the cache-backed loader does it lazily in the first LoRA
+prompt (warm hit: 15.5 s, of which 12.7 s identifies the effective tensors).
+In the cold run, the first LoRA prompt took 46.0 s, including a 24.9 s
+effective-cache build; later prompts took 15.6 / 23.8 / 18.6 s. All
+runtimes closed after explicit unload.
+
+The original run exhausted available memory, so its working set was limited
+by paging; treat the difference as observational. Cache-backed LoRA peak
+working set is only 0.16 GiB above the earlier cache-backed base-only run.
+Its higher peak private commit (14.721 versus 9.258 GiB) is attributed to the
+existing effective-cache identification, which recomputes and hashes every
+effective tensor even on a cache hit; the original LoRA workflow shares that
+path. The peak was transient: 50 ms `PrivateUsage` samples never exceeded
+10,103,123,968 bytes.
+
+### Use
+
+Connect **Load Anima XDNA (Cache-backed)** → **Load LoRA** /
+**Load LoRA Model Only** (chaining allowed) → KSampler under ComfyUI
+`--cpu`. Do not attach again. Expect the first prompt with a new LoRA or
+strength to take longer; repeats reuse its runtime. **Anima XDNA Runtime
+Status** reports the base runtime for a LoRA MODEL until it has sampled once.
+
+The private `implementation-lora.zip` archive has 42 members, 9,266,331
+bytes and SHA-256
+`dd30d8b430fa3d933afa6548f24d95c169d462c215a6d2234f51194dd4e8eb3d`. It
+pins the measurement/recording scripts, console logs, result and memory
+traces, latents and PNGs for the four runs, without model or LoRA weights,
+and is not committed.
+
+**Limits.** One machine, checkpoint, LoRA, seed and run per variant. No
+1024x1024, CFG > 1, chained-LoRA, host-key LoRA or CPU-only measurement.
+Post-GC counters were recorded but not compared. System available memory
+includes other applications and the OS cache.
+
+## INT8 at 1024x1024 with host/NPU overlap (2026-11-17)
+
+**Result.** The INT8 profile now accepts 4096 image tokens (1024×1024). With
+**Load Anima XDNA (Cache-backed)**, Turbo V1.1 and four Euler steps at CFG 1,
+a warm prompt takes **23.4–24.8 s** sampling (about 5.8 s per step) plus
+about 6.8 s decode. The first prompt of a fresh process takes about **49 s**
+sampling, against **71.4 s** for cache-backed AIR BF16 in a fresh process,
+because the first four forwards run the verified sequential path with
+boundary checks. For context, the earlier legacy-loader AIR BF16 whole
+prompt took 108.0 s cold and 82.3 s warm (not directly comparable: it
+includes loading, text encoding and decode). Overlapping host work with the
+NPU is bitwise identical to the sequential INT8 schedule and shortens warm
+block time by about **10%** (2.6–2.8 s). INT8 is **not** quality-equivalent
+to BF16 (see below). Evidence:
+[`evidence/int8-1024-tiled-overlap.json`](evidence/int8-1024-tiled-overlap.json).
+
+### Tiled INT8
+
+The 512×512 INT8 kernels (1024-row GEMMs, 1024-key projections) run once per
+1024-row tile of the 4096-token block, as in the
+[tiling section](#anima-1024x1024-by-tiling-xdna-dispatches-2026-11-16). The
+fused host kernels keep their 1024-row shape and are called per tile into
+slices of one output tensor. Attention between the tiled QKV and output
+projections is AIR BF16 at 4096 keys, so every tile's K/V must exist before
+the first query tile. This needs the `self4096` artifact in
+`ANIMA_XDNA_AIR_ATTENTION_DIR` (see
+[AIR attention at 4096 keys](#air-attention-at-4096-keys-for-1024x1024-2026-11-16)).
+It is validated when present and optional for 512×512; a 1024×1024 run
+without it fails when the AIR attention runner opens it. Masked attention and
+token counts other than 1024 and 4096 are rejected with explicit errors;
+there is no fallback.
+
+### Host/NPU overlap
+
+A probe showed that `pyxrt`'s `wait2()` holds the GIL: a monitor thread
+stalled for up to 4.75 ms during a 4.53 ms NPU job, and a worker-thread
+variant took 5.03 ms, the sum of the NPU (4.53 ms) and host (0.47 ms) times. The working pattern is single-threaded: `run.start()`,
+host work for the previous job, then `run.wait2()`. With 1.25 ms of host work
+per 1024×2048×8192 job, a serial 5.51 ms pair became 4.33 ms, against 4.53
+ms for the NPU alone.
+
+Only one NPU job is ever in flight. Runners used by the overlapped schedule
+lazily allocate a second output buffer (slot = tile % 2), so a finished
+tile's accumulator stays valid while the next tile runs; inputs are copied
+into the input buffer at `start`. Schedule per block:
+
+- **QKV:** start QKV(t+1), then run `qkv_prepare(t)`.
+- **Attention output:** quantize tile t+1 while out(t) runs, and run the
+  gated residual of tile t while out(t+1) runs.
+- **MLP:** NPU order `in0, in1, out0, in2, out1, …`; GELU of a finished `in`
+  job and the gated residual of a finished `out` job run behind the next job.
+  The GELU output is consumed by the `out` launch of its own tile before
+  another GELU can replace it; the code asserts this.
+- **Not overlapped:** the AIR attention itself (about 10.2–10.6 s per warm
+  prompt, 44% of overlapped block time). The host is idle during it. The
+  [next section](#air-attention-overlap-at-1024x1024-2026-11-17) overlaps it.
+
+Overlap is active when `ANIMA_XDNA_INT8_OVERLAP` is not `0` (default `1`),
+only for tiled blocks, and only after the verified first prompt (its four
+forwards run the sequential schedule with boundary checks).
+
+### Measurement
+
+Each variant ran in a fresh standalone ComfyUI Python process with the real
+nodes (not an HTTP/UI prompt-executor run): Ryzen AI 9 365, 25,359,659,008
+physical RAM bytes, Turbo V1.1, seed `700755787614899`, four Euler/simple
+steps, CFG 1, `int8-attn-l1k64-nq8pp`, AIR `nq8pp`, host AdaLN, BF16
+channels-last VAE and the prompts of the previous sections.
+
+| Variant | Sampling seconds (run 0 / 1 / 2) | Latent |
+|---|---:|---|
+| INT8, sequential (`…OVERLAP=0`) | 48.99 / 26.02 / 27.63 | `0107a682…` |
+| INT8, overlapped | 49.04 / 23.43 / 24.80 | `0107a682…` |
+| AIR BF16, cache-backed (one run) | 71.40 | different |
+
+All eight 1024×1024 INT8 latents are bitwise identical, including an earlier
+two-run sequential process (50.54 / 25.91 s) that used the default at the
+time. Warm sampling ranges do not overlap between the two schedules
+(23.4–24.8 s against 25.9–27.6 s). Overlapped warm block time was 22.96 and
+24.32 s, against 25.54 and 27.16 s sequentially. Host time hidden behind the
+NPU in the first overlapped warm run was 1.16 s (attn1 QKV), 0.57 s (attn2
+QKV), 0.45 s / 0.39 s (attn1 / attn2 output), 0.31 s (MLP in) and 0.64 s (MLP
+out). Attn1 QKV is host-bound: per-tile host preparation is longer than the
+NPU job, so a faster NPU would not help it. The 512×512 INT8 run with the
+flag set was bitwise identical to the sequential one (latent `4e4de447…`;
+14.9 / 5.6 s against 16.0 / 5.5 s sampling): the 1024-token path does not use
+the overlapped schedule.
+
+Memory peaks during sampling (GiB, 23.6 GiB total; one process per variant;
+sampled every 0.1–0.2 s):
+
+| Metric | AIR BF16 | INT8 cold | INT8 warm |
+|---|---:|---:|---:|
+| Peak working set | 13.10 | 11.77 | 10.66 |
+| Peak private bytes | 11.35 | 10.34 | 9.57 |
+| Minimum system available | 3.63 | 5.07 | 6.13 |
+
+The overlapped process measured the same within noise (cold 11.79 GiB working
+set, 5.09 GiB minimum available; warm 10.69–10.75 GiB and 6.09–6.16 GiB).
+Lifetime peak working set including decode was 13.49 GiB for AIR BF16 and
+11.78–11.81 GiB for INT8. The packed BF16 cache is a file-backed mapping that
+counts toward working set, which is why INT8 lowers private bytes (about
+1.0 GiB cold, 1.8 GiB warm) more than it lowers the cache-backed working set.
+The cold/warm difference was not decomposed. The memory saving is therefore
+modest: it moves the cache-backed 1024×1024 run from 3.6 GiB to 5–6 GiB of
+free system memory, and no INT8 execution cache or BF16-mapping release was
+attempted.
+
+**Quality.** Against the AIR BF16 image of the same seed, the decoded
+1024×1024 INT8 RGB differs by MAE 24.32/255, normalized RMS 24.94% (relative
+to the reference RMS) and PSNR 14.87 dB. INT8 is therefore a different,
+faster result, not an equivalent one; no visual-quality judgment,
+latent-space comparison or multi-seed statistics were made. Use the BF16 path
+where fidelity matters.
+
+### Use
+
+- Requires the `self4096` AIR artifact next to `self` and `cross` in
+  `ANIMA_XDNA_AIR_ATTENTION_DIR`, as for 1024×1024 AIR BF16, plus the usual
+  INT8 environment (the INT8 profile already requires
+  `ANIMA_XDNA_ATTENTION_BACKEND=air`).
+- Set `ANIMA_XDNA_INT8_OVERLAP=0` to run the sequential schedule.
+- Existing installs need the new code and `self4096` copied in; this change
+  does not modify an installed ComfyUI copy.
+
+The private `implementation-int8-1024.zip` archive has 46 members, 23,372,218
+bytes and SHA-256
+`d232b98f2f224d823e36032f07987270d742ef792dab069bcd4e756f4daf1fcc`. It pins
+the measurement script (SHA-256
+`c99814364920317ed3e6b1d687b5281bf82447c34b0608e7472f78c75e4420c2`), the
+overlap probe (SHA-256
+`a946879bdf303efcb1eead54289d8498db8e0fafc5cf71c703d857f2c8d026fa`),
+console logs, result/memory traces, latents and PNGs, without model weights,
+and is not committed. Keep paths and captures local.
+
+**Limits.** One machine, seed and prompt; two to three runs per setting. No
+CFG > 1, LoRA, CPU-only or HTTP/UI 1024×1024 measurement. The BF16 baseline
+is one cold run. Separate processes may differ by thermal state or
+background load, so the roughly 10% gain is a measured range, not a bound.
+
+## AIR attention overlap at 1024x1024 (2026-11-17)
+
+**Result.** In the overlapped INT8 1024×1024 schedule, AIR attention tiles now
+alternate with the attention output projection on the NPU, and AIR's host
+work runs behind the next NPU job. Warm sampling was **21.2–22.7 s** (three
+warm prompts in two fresh processes), against 23.4–24.8 s for the previous
+overlapped schedule and 25.5 s for that schedule re-measured in the same
+session. Against the sequential schedule (25.9–27.6 s warm), mean warm
+sampling is about 18% lower. Exposed AIR time per warm prompt fell from
+10.2–11.1 s to 6.9–7.8 s. All 1024×1024 latents remain bitwise identical
+(`0107a682…`), and 512×512 is unchanged. Evidence:
+[`evidence/int8-1024-air-overlap.json`](evidence/int8-1024-air-overlap.json).
+
+### Where AIR time went
+
+A private probe of one AIR call with random BF16 inputs (10 threads) split
+the time like this:
+
+| Part (ms per call) | Self, 4096 keys | Cross, 512 keys |
+|---|---:|---:|
+| Whole call | 62.3 | 19.8 |
+| Kernel, four 1024-row tiles | 46.65 | 11.44 |
+| Finiteness checks (inputs + output) | 4.48 + 4.44 | 1.84 + 2.49 |
+| Query layout and copies into/out of the buffers | 4.45 | not split |
+| Host total (whole call minus kernel) | ≈15.6 | ≈8.4 |
+
+Over 112 block calls per prompt, the kernels alone take about 5.2 s (self)
+plus 1.3 s (cross), and the host part about 2.7 s, all of it with the NPU idle.
+
+A second probe launched an AIR tile and an INT8 `proj_out` GEMM on separate
+hardware contexts at the same time. Together they took 12.53 ms, against
+13.12 ms back to back and 10.96 ms for the AIR tile alone, so the NPU does
+not run them concurrently to any useful degree. The schedule therefore keeps
+one NPU job in flight and hides host work, not NPU work.
+
+### Design
+
+- **Resident AIR buffers.** Each AIR runner allocates its query tiles, K/V and
+  two output slots once as XRT buffer objects mapped as BF16 tensors. The
+  host-side Q/K/V preparation writes straight into them, so the staging copies
+  disappear. `start(tile, slot, upload_kv)` syncs K/V (first tile only) and the
+  query tile, then launches without waiting. `finish` waits and syncs the output
+  slot back. The buffers take about 56 MB (self) and 28 MB (cross) and replace
+  the 40 MB and 12 MB sequential buffer sets, which are released.
+- **Schedule.** After the tiled QKV phase, the NPU order per block is `air0,
+  air1, out0, air2, out1, air3, out2, out3`, the same two-stage order as the
+  MLP. Each finished AIR tile is quantized behind the next job, before AIR
+  writes that output slot again. Each `out` job's gated residual also runs
+  behind the next job. The `out` launch must consume its own tile's
+  quantization; the code asserts this. If host work fails mid-schedule, the
+  job in flight is waited for before the error propagates.
+- **Finiteness.** The overlapped path drops AIR's separate finiteness passes.
+  The fused Q/K/V preparation already rejects non-finite Q/K/V, and the
+  head-major quantization of the AIR output rejects any non-finite value with
+  an error. The verified first prompt still uses the sequential AIR call with
+  its checks, and so does 512×512.
+
+The gate is unchanged: overlap runs when `ANIMA_XDNA_INT8_OVERLAP` is not `0`
+(default `1`), only for tiled blocks, and only after the four verified
+forwards.
+
+### Measurement
+
+The setup matched the previous section: a fresh standalone ComfyUI process
+per variant with the real nodes, **Load Anima XDNA (Cache-backed)**, Turbo
+V1.1, seed `700755787614899`, four Euler/simple steps, CFG 1,
+`int8-attn-l1k64-nq8pp` and AIR `nq8pp`. To separate code from machine state,
+the previous commit was re-measured in the same session from an export of
+that commit.
+
+| Variant | Sampling s (run 0 / 1 / 2) | Warm block s | Latent |
+|---|---:|---:|---|
+| AIR overlap, process A | 54.55 / 21.34 / 22.66 | 20.91 / 22.22 | `0107a682…` |
+| AIR overlap, process B | 52.28 / 21.22 | 20.78 | `0107a682…` |
+| Previous overlap, re-measured | 52.13 / 25.54 | 25.07 | `0107a682…` |
+| Previous overlap, previous section | 49.04 / 23.43 / 24.80 | 22.96 / 24.32 | `0107a682…` |
+
+The cold first prompt was 2–5 s slower in every process measured this
+session, including the previous commit (52.1 s), so that shift comes from
+machine state, not this change. The first prompt runs mostly the sequential
+verified path, so it is not expected to gain much.
+
+Exposed NPU wait per warm prompt (s):
+
+| Stage | AIR overlap | Previous overlap |
+|---|---:|---:|
+| Self-attention AIR | 5.55–6.35 | 7.47–8.10 |
+| Cross-attention AIR | 1.31–1.41 | 2.52–2.95 |
+| Attention output projections | 1.24–1.39 | 0.83–0.95 |
+| Sum | 8.10–9.15 | 11.02–11.94 |
+
+The output projections now expose more wait, because less host work sits
+behind each `out` job. The net attention saving is about 2–4 s per prompt.
+Host work hidden behind AIR in a warm prompt was 0.15 s (self) and 0.19 s
+(cross); host work hidden behind the output projections was 0.25 s and
+0.19 s. Exposed AIR time is now within 0.4–1.3 s of the probe's kernel-only
+time (6.5 s). What remains is mostly the per-tile buffer syncs and launch.
+
+Sampling-phase memory peaks were unchanged within noise. In process A, the
+cold run peaked at 11.81 GiB working set and 10.29 GiB private, with
+4.87 GiB minimum available. Warm runs peaked at 10.35 GiB, 9.69 GiB and
+6.32 GiB. The re-measured previous commit gave 11.82 / 10.37 / 4.86 GiB cold
+and 10.75 / 9.68 / 5.94 GiB warm.
+
+At 512×512 the overlap does not apply. One process gave 15.29 / 5.64 s
+sampling (previous: 14.87 / 5.57 s), latent `4e4de447…` bitwise identical,
+and 8.01 / 7.05 GiB private peaks (previous: 8.00 / 7.03 GiB).
+
+### Use and reproduction
+
+No new setting: `ANIMA_XDNA_INT8_OVERLAP=0` still selects the sequential
+schedule. As before, 1024×1024 needs `self4096` beside `self` and `cross`, and
+an installed ComfyUI copy needs the new code copied in.
+
+The private `implementation-air-overlap.zip` archive has 35 members, 17,470,236
+bytes and SHA-256
+`0fa4606d28534ae073c65f504e3903ac1859d17f173ba877e8dd50c7d3058542`. It pins:
+
+- the code patch against the previous commit;
+- the unchanged measurement script (SHA-256
+  `c99814364920317ed3e6b1d687b5281bf82447c34b0608e7472f78c75e4420c2`);
+- the AIR probes (SHA-256
+  `40867cfaa994ccad14d655ff3de85a10056a6c49f804b7b1782fccbad8b22cb2` and
+  `8d8a1390b1eb3aab7ecbf2086ab6d8fb305e67509ea39e89d1a9b2bf601dd95e`);
+- the concurrency probe (SHA-256
+  `45b0ce18372ccaaa5ef9de633da515e978cb56e9975bf5aae17bb33f326e0b64`);
+- console logs, result and memory traces, latents and PNGs.
+
+It contains no model weights and is not committed. Keep paths and captures
+local.
+
+**Limits.** One machine, seed and prompt; one to three warm runs per variant.
+No CFG > 1, LoRA or HTTP/UI measurement. Warm times of the same code varied
+by up to 2.1 s between runs and processes, so the gain is a measured range,
+not a bound. Ideas not tried: caching cross-attention K/V per
+block (the cross QKV projection recomputes the context K/V for every tile)
+and fewer per-tile buffer syncs.
+
+## Comfy Desktop CPU/NPU integration (2026-11-18)
+
+**Scope.** Comfy Desktop 1.1.9 launched the existing ComfyUI 0.38.0
+(`170594057a22673349ddf0a3d88624b7fa5865bb`) Git installation with frontend
+1.53.10, Python 3.13.9 and PyTorch 2.14.1+cpu. The Anima runtime was unchanged
+from `0e115695c8373186463036629ad7477b6c8dbde4`. This validates Desktop's
+tracked-instance integration, not an upgrade to Desktop's bundled backend
+or Python. The existing GPU instance and command-line launchers were retained.
+
+**Configuration.** Desktop's Add Existing Instance action registered the
+existing installation and external XDNA virtual environment. Startup Args
+explicitly included `--cpu`, loopback listening, `--preview-method none`
+and `--cache-classic`. Instance environment variables reproduced the
+`int8-attn-l1k64-nq8pp` launcher, including host AdaLN, 10 threads, AIR
+`self4096` and the BF16/clfix Qwen Image VAE. Desktop generated its own
+model-path YAML and used the existing shared model/input/output directories.
+No GPU backend, runtime code modification or NPU power-mode change was needed.
+See the [setup guide](comfy-desktop.md) for the complete settings.
+
+**Validation.** The actual Desktop-launched Python process and
+`/system_stats` both confirmed CPU mode and the intended interpreter.
+The runtime log confirmed INT8/AIR hooks, cache-backed block-parameter
+omission, 4096-token AIR execution and successful first-prompt INT8 checks.
+The following prompts used Anima Turbo V1.1, Load Anima XDNA (Cache-backed),
+batch 1, four Euler/simple steps and CFG 1:
+
+| Submission | Resolution | Server execution time | Match to prior launcher output |
+|---|---|---:|---|
+| API, first prompt in the process | 1024x1024 | 74.892 s | Exact latent and RGB |
+| API, resident runtime | 1024x1024 | 26.041 s | Exact latent and RGB |
+| API, resolution regression | 512x512 | 7.092 s | Exact latent and RGB |
+| Embedded Desktop frontend, `app.queuePrompt` | 1024x1024 | 27.977 s | Exact latent and RGB |
+
+Each row ran the sampler rather than returning a cached sampler result.
+The embedded frontend loaded the cache-backed node, submitted the workflow,
+and displayed its decoded image. A separate 1024x1024 UI workflow was saved
+without replacing existing workflows.
+
+Times come from ComfyUI history's `execution_start`/`execution_success`
+timestamps and include VAE decoding and image/latent saving, but not Desktop
+startup or time spent opening the UI. These are individual functional checks,
+not a controlled speed comparison with the previously observed 33-second
+command-line runs. Do not attribute the timing difference to Desktop.
+There was no 1024x1024 CPU-only benchmark. Desktop-specific LoRA and
+other-model validation were not part of this check. Exact output parity
+refers to the same experimental INT8/AIR profile, not standard BF16 quality.
+
+Compact hashes and settings are in
+[`evidence/comfy-desktop-integration.json`](evidence/comfy-desktop-integration.json).
+The local API harness, frontend submission script and result collector are
+pinned there by SHA-256. Machine paths, logs, workflow captures, latents and
+screenshots remain local and are not committed.
+
+## One-shot Windows installer validation (2026-11-23)
+
+**Scope.** `tools/install_windows.ps1 -RuntimeProfile int8` built a separate,
+new installation on the same machine as the Desktop record above. It used
+Python 3.13.9 from python.org, ComfyUI
+`170594057a22673349ddf0a3d88624b7fa5865bb` with the installer's startup patch,
+PyTorch 2.14.1+cpu, the XRT SDK 2.21.75 and the alpha.3 runtime bundle
+(`anima-xdna-int8-runtime-0.2.0-alpha.3-win-x64.zip`, SHA-256
+`d5d98af3f8b6264ccd3a903581fe76a70223bafbb9692ef8e6c3bfd93aeb9d6f`), supplied
+locally with `-RuntimeBundlePath` before the release existed. The four
+toolchain wheels came from a local `-WheelDirectory` at the versions in
+`tools/windows-cp313-constraints.txt`. Three were the published upstream
+wheels; the validated `mlir-air` nightly is no longer published upstream, so
+it was repacked from the validated environment's installed files. This
+validates the installer with these inputs, not wheel availability for other
+users. The existing deployed installation, its Desktop instance and models
+were not modified; `-ModelsDirectory` pointed to the existing model root.
+
+**Installer result.** The final run reused the ComfyUI checkout and virtual
+environment from an earlier interrupted run and exited with code 0. The probe
+reported target `npu2` and runtime `xrt`, and the `--quick-test-for-ci` load
+reported the installer-written `xdna-runtime\anima-xdna.json`. That file
+contains only the profile, XRT SDK path and a relative Triton cache directory.
+
+**Generation parity.** The server was started as Desktop starts it, with
+`main.py --cpu --listen 127.0.0.1 --preview-method none --cache-classic` and
+without `XRT_DEV_DIR`, `PYTHONUTF8` or any `ANIMA_XDNA_*` variable. The
+custom node applied the configuration file. The Triton cache started empty
+and compiled without `PYTHONUTF8`. The local API harness used Anima Turbo
+V1.1, Load Anima XDNA (Cache-backed), batch 1, four Euler/simple steps and
+CFG 1:
+
+| Prompt | Resolution | Server time, run 1 | Server time, run 2 | Match to Desktop record |
+|---|---|---:|---:|---|
+| First prompt in the process (run 1), new seed (run 2) | 1024x1024 | 78.37 s | 59.16 s | Exact latent and RGB |
+| Resident runtime | 1024x1024 | 59.27 s | 59.11 s | Exact latent and RGB |
+| Resolution regression | 512x512 | 12.55 s | 13.06 s | Exact latent and RGB |
+
+The two runs were in one server process. The run 1 first prompt includes the
+Triton compilation and first-prompt INT8 checks. The new installation was not
+registered in Comfy Desktop for this check; the server command matches the
+Startup Args documented in the [setup guide](comfy-desktop.md).
+
+**Timing.** These times are much slower than the Desktop record
+(26.0 s at 1024x1024 and 7.1 s at 512x512 for the resident runtime). Warm
+1024x1024 sampling ran at about 13.3 s/it. The configuration file is not the
+cause: restarting the same installation with the eleven explicit Desktop
+variables, differing only in a separate Triton cache, gave 14.1 s/it,
+62.88 s at 1024x1024 and 13.48 s at 512x512, with the same output hashes. The
+runtime bundle payload, host DLLs and Python package versions were identical
+to the Desktop-validated installation. The cause was not identified.
+During one 1024x1024 sampling run, about 1.6–3.4 GB of memory was available
+and the disk read about 230–280 MB/s for about 16 s, which is consistent with
+memory pressure from other running applications but was not confirmed. The
+Desktop-validated installation was not rerun for a same-day comparison. No
+NPU power-mode or other system setting was changed, and there was no
+1024x1024 CPU-only run.
+
+Compact hashes and settings are in
+[`evidence/one-shot-installer-validation.json`](evidence/one-shot-installer-validation.json).
+Machine paths, logs, latents and images remain local and are not committed.
+
 ## Public verification ladder
 
 Set placeholders only in the current shell; do not commit paths or captures.
@@ -2851,10 +3963,13 @@ $env:ANIMA_XDNA_CHAIN_FIXTURE = "<CAPTURED_REAL_BLOCK_INPUT_PT>"
 ## Limitations and troubleshooting
 
 Only Base v1.0, Turbo V1.1, WAI Nova Anima Turbo LoRA Ver V1.0, Radiance
-Turbo Anima v2.0, and the fixed shape above are validated. Other Preview/Aesthetic
-checkpoints, LoRA/LLLite/ModelPatcher transformer patches, INT8, training,
-other resolutions, other context sizes, and user batches above one are
-rejected. CFG batch 2 is executed sequentially on the single-tenant NPU.
+Turbo Anima v2.0, and the fixed shapes above are validated. Other Preview/Aesthetic
+checkpoints, unsupported LoRA types, LLLite, runtime ModelPatcher transformer
+patches, INT8 outside the experimental profile, training,
+resolutions other than 512×512 and 1024×1024 (baseline attention, or AIR or
+INT8 with a `self4096` artifact), other
+context sizes, and user batches above one are rejected. CFG batch 2 is
+executed sequentially on the single-tenant NPU.
 
 ## WAI Nova Anima Turbo LoRA Ver V1.0
 
@@ -2915,8 +4030,8 @@ BF16 packed cache and that the F16 checkpoint remained unchanged.
 - **Checkpoint mismatch:** choose the exact matching Base source, or use the
   same native Turbo file for MODEL and XDNA source. The full digest check is
   intentionally expensive once per attachment and cannot be disabled.
-- **Unsupported patches:** remove LoRA/LLLite; they are rejected rather than
-  ignored.
+- **Unsupported patches:** remove unsupported LoRA types or LLLite; they are
+  rejected rather than ignored.
 - **Cache corruption:** run `anima-xdna-cache verify <checkpoint>`, then an
   explicit `rebuild` if verification reports the exact failure.
 - **Low Task Manager utilization:** use CLI dispatch/kernel timings and wrapper

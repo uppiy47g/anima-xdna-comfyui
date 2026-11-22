@@ -201,8 +201,10 @@ class PublicReleaseTests(unittest.TestCase):
             re.compile("rgm" + "47", re.IGNORECASE),
             re.compile("session" + "-state", re.IGNORECASE),
             re.compile("Amuse" + "_v3", re.IGNORECASE),
-            re.compile("Comfy" + " Desktop", re.IGNORECASE),
-            re.compile("Comfy" + "-Desktop", re.IGNORECASE),
+            re.compile(
+                r"AppData[\\/]+(?:Local|Roaming)[\\/]+Comfy(?: Desktop|-Desktop)",
+                re.IGNORECASE,
+            ),
         )
         suffixes = {".py", ".md", ".json", ".yaml", ".yml", ".toml", ".ps1", ".txt"}
         for path in ROOT.rglob("*"):

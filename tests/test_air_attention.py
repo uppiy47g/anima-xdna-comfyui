@@ -71,6 +71,25 @@ class AIRAttentionTests(unittest.TestCase):
             execution.attention("attn2", hidden, context, None, torch.ones(1))
         attention.assert_called_once()
 
+    def test_air_metric_counts_one_dispatch_per_query_tile(self):
+        cfg = SimpleNamespace(num_heads=16, head_dim=128, hidden_size=2048)
+        hidden = torch.zeros(1, 4096, 2048, dtype=torch.bfloat16)
+        context = torch.zeros(1, 512, 2048, dtype=torch.bfloat16)
+        attention = Mock(return_value=torch.ones(16, 4096, 128, dtype=torch.bfloat16))
+        execution = _BlockExecution(
+            cfg, None, Mock(), "xdna2", Mock(), attention_runner=attention,
+        )
+        execution.qkv = Mock(return_value=(hidden, context, context))
+        execution.rms_norm = Mock(side_effect=lambda name, value, weight: value)
+        execution.linear = Mock(side_effect=lambda name, value, weight: value)
+        execution.attention("attn2", hidden, context, None, None)
+        self.assertEqual([tuple(a.shape) for a in attention.call_args.args], [
+            (16, 4096, 128), (16, 512, 128), (16, 512, 128),
+        ])
+        metric = next(m for m in execution.metrics if m.name == "attn2.air_attention")
+        self.assertEqual((metric.dispatches, metric.h2d_bytes, metric.d2h_bytes),
+                         (4, 20 * 1024**2, 16 * 1024**2))
+
     def test_configuration_selects_air_or_explicit_baseline(self):
         env = {
             "ANIMA_XDNA_AIR_ATTENTION_DIR": "private-artifacts",
@@ -113,14 +132,15 @@ class AIRAttentionTests(unittest.TestCase):
         self.assertIn("$env:ANIMA_XDNA_ATTENTION_BACKEND = $AttentionBackend", launcher)
         self.assertIn('if ($AttentionBackend -eq "air")', launcher)
         self.assertIn("-AttentionBackend air requires -AIRAttentionDirectory.", launcher)
-        self.assertIn('version = "0.2.0a2"', (root / "pyproject.toml").read_text())
+        self.assertIn('version = "0.2.0a3"', (root / "pyproject.toml").read_text())
         notes = (root / "docs" / "releases" / "0.2.0-alpha.1.md").read_text()
         for warning in ("29.035%", "15.975/255", "27.095", "18.765", "28.98"):
             self.assertIn(warning, notes)
         runtime_notes = (root / "docs" / "releases" / "0.2.0-alpha.2.md").read_text()
         self.assertIn("versioned Windows x64 runtime bundle", runtime_notes)
+        self.assertIn("self4096", (root / "docs" / "releases" / "0.2.0-alpha.3.md").read_text())
         installer = (root / "tools" / "install_int8_runtime.ps1").read_text()
-        self.assertIn('$releaseTag = "v0.2.0-alpha.2"', installer)
+        self.assertIn('$releaseTag = "v0.2.0-alpha.3"', installer)
         self.assertIn("$asset.digest", installer)
 
     def test_backend_rejects_masks_and_cleans_partial_loads(self):
@@ -141,6 +161,80 @@ class AIRAttentionTests(unittest.TestCase):
                 backend._open()
         first.close.assert_called_once()
         self.assertEqual(backend.runners, {})
+
+    def test_backend_validates_and_routes_by_resolution(self):
+        backend = AIRAttentionBackend(Path("private-artifacts"))
+        config = SimpleNamespace(num_heads=16, head_dim=128)
+
+        def inputs(tokens, context=512):
+            return SimpleNamespace(
+                hidden_states=torch.empty(1, tokens, 1),
+                encoder_hidden_states=torch.empty(1, context, 1),
+                attention_mask=None,
+            )
+
+        for tokens in (1024, 4096):
+            backend.validate(config, inputs(tokens))
+        for tokens, context in ((2048, 512), (512, 512), (4096, 256)):
+            with self.subTest(tokens=tokens, context=context):
+                with self.assertRaisesRegex(UnsupportedTensor, "1024 or 4096 image tokens"):
+                    backend.validate(config, inputs(tokens, context))
+
+        runners = {keys: Mock(shape=AttentionShape(keys)) for keys in (512, 1024, 4096)}
+        for keys, runner in runners.items():
+            runner.run.return_value = keys
+        backend.runners.update(runners)
+        backend._announced.update((1024, 4096))
+
+        def call(tokens, keys):
+            return backend(torch.empty(1, tokens, 1), torch.empty(1, keys, 1), torch.empty(1, keys, 1))
+
+        self.assertEqual(call(1024, 1024), 1024)
+        self.assertEqual(call(1024, 512), 512)
+        self.assertEqual(call(4096, 4096), 4096)
+        self.assertEqual(call(4096, 512), 512)
+        for tokens, keys in ((2048, 2048), (4096, 1024), (1024, 4096), (4096, 256)):
+            with self.subTest(tokens=tokens, keys=keys):
+                with self.assertRaisesRegex(UnsupportedTensor, "unsupported AIR attention shape"):
+                    call(tokens, keys)
+
+    def test_backend_opens_each_resolution_once_and_shares_cross_attention(self):
+        backend = AIRAttentionBackend(Path("private-artifacts"))
+        opened = []
+        wrong_keys = {"self4096": 1024}
+
+        def open_runner(manifest):
+            name = manifest.parent.name
+            opened.append(name)
+            keys = {"self": 1024, "self4096": 4096, "cross": 512}[name]
+            return Mock(shape=AttentionShape(wrong_keys.get(name, keys)))
+
+        with patch("anima_xdna_poc.air_attention.AIRAttention", side_effect=open_runner):
+            with self.assertLogs("anima_xdna_poc.air_attention", "WARNING") as logs:
+                backend._open(1024)
+                backend._open(1024)
+            self.assertEqual(len(logs.output), 1)
+            self.assertIn("29.035%", logs.output[0])
+            resident = dict(backend.runners)
+            self.assertEqual(sorted(resident), [512, 1024])
+
+            with self.assertRaisesRegex(ValueError, "incorrect key length"):
+                backend._open(4096)
+            self.assertEqual(backend.runners, resident)
+            for runner in resident.values():
+                runner.close.assert_not_called()
+
+            wrong_keys.clear()
+            with self.assertLogs("anima_xdna_poc.air_attention", "WARNING") as logs:
+                backend._open(4096)
+            self.assertIn("1024x1024", logs.output[0])
+            self.assertIn("not quality-equivalent", logs.output[0])
+        self.assertEqual(opened, ["self", "cross", "self4096", "self4096"])
+        self.assertEqual(sorted(backend.runners), [512, 1024, 4096])
+        self.assertIs(backend.runners[512], resident[512])
+        backend.close()
+        self.assertEqual(backend.runners, {})
+        self.assertEqual(backend._announced, set())
 
     def test_elf_is_digest_verified_before_opening_xrt(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -275,7 +369,9 @@ class AIRAttentionTests(unittest.TestCase):
                         self.assertEqual(low["d2h_sync_bytes"], (96 if self_attention else 64) * 1024**2)
 
     def test_fixed_shape_and_host_sync_budget(self):
-        for keys, h2d in ((512, 8 * 1024**2), (1024, 12 * 1024**2)):
+        for keys, h2d in (
+            (512, 8 * 1024**2), (1024, 12 * 1024**2), (4096, 36 * 1024**2),
+        ):
             shape = AttentionShape(keys)
             self.assertEqual(shape.h2d_bytes, h2d)
             self.assertEqual(shape.d2h_bytes, 4 * 1024**2)
@@ -322,11 +418,106 @@ class AIRAttentionTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     attention.run(invalid, k, k)
 
+    def test_long_query_is_tiled_and_reuses_key_value_only_within_a_call(self):
+        attention = AIRAttention.__new__(AIRAttention)
+        attention.shape = AttentionShape(512)
+        calls = []
+
+        def run(arrays, **kwargs):
+            calls.append(kwargs)
+            self.assertEqual(kwargs["bo_key"], "attention")
+            self.assertEqual(kwargs["intermediate_indices"], {3})
+            self.assertEqual(kwargs["output_indices"], {3})
+            arrays[3][...] = arrays[0]
+            return {3: arrays[3]}
+
+        attention.runner = Mock()
+        attention.runner.run.side_effect = run
+        q = torch.randn(16, 4096, 128).to(torch.bfloat16)
+        k = torch.ones(16, 512, 128, dtype=torch.bfloat16)
+        output = attention.run(q, k, k)
+        self.assertEqual(output.shape, q.shape)
+        self.assertTrue(torch.equal(output, q))
+        self.assertEqual(
+            [kwargs.get("static_indices") for kwargs in calls], [None, {1, 2}, {1, 2}, {1, 2}],
+        )
+        calls.clear()
+        attention.run(q, k, k)
+        self.assertIsNone(calls[0].get("static_indices"))
+        with self.assertRaises(ValueError):
+            attention.run(q[:, :1536], k, k)
+        with self.assertRaises(ValueError):
+            attention.run(q[:, :, :64], k, k)
+
+    def test_resident_launches_reuse_key_value_and_alternate_output_slots(self):
+        syncs = []
+
+        class FakeBO:
+            def __init__(self, size):
+                self.memory = bytearray(size)
+
+            def map(self):
+                return memoryview(self.memory)
+
+            def sync(self, direction):
+                syncs.append((direction, self))
+
+        class FakeRun:
+            def __init__(self, kernel):
+                self.args = {}
+
+            def set_arg(self, index, bo):
+                self.args[index] = bo
+
+            def start(self):
+                self.args[3].memory[:] = self.args[0].memory
+
+            def wait2(self):
+                pass
+
+        xrt = SimpleNamespace(
+            ext=SimpleNamespace(bo=lambda device, size: FakeBO(size)), run=FakeRun,
+            xclBOSyncDirection=SimpleNamespace(XCL_BO_SYNC_BO_TO_DEVICE="h2d", XCL_BO_SYNC_BO_FROM_DEVICE="d2h"),
+        )
+        attention = AIRAttention.__new__(AIRAttention)
+        attention.shape = AttentionShape(512)
+        attention.runner = SimpleNamespace(_xrt=xrt, device=None, kernel=None, _bos={"attention": None}, unload=Mock())
+        attention._init_resident()
+
+        queries, key, value = attention.resident(2)
+        self.assertEqual(attention.runner._bos, {})
+        self.assertEqual([tuple(q.shape) for q in queries], [(16, 1024, 128)] * 2)
+        self.assertEqual((tuple(key.shape), key.dtype), ((16, 512, 128), torch.bfloat16))
+        self.assertEqual([d for d, _ in syncs], ["h2d", "h2d"])
+        syncs.clear()
+        queries[0].fill_(1)
+        queries[1].fill_(2)
+        first = attention.finish(attention.start(0, 0, True))
+        second = attention.finish(attention.start(1, 1, False))
+        self.assertTrue(bool((first == 1).all()) and bool((second == 2).all()))
+        kv = attention._kv_bos
+        self.assertEqual(syncs, [
+            ("h2d", kv[0]), ("h2d", kv[1]), ("h2d", attention._query_bos[0]), ("d2h", attention._output_bos[0]),
+            ("h2d", attention._query_bos[1]), ("d2h", attention._output_bos[1]),
+        ])
+        attention.runner._bos["attention"] = None
+        self.assertIs(attention.resident(1)[0][0], queries[0])
+        self.assertEqual(attention.runner._bos, {})
+        for invalid in ((2, 0, False), (0, 2, False)):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                attention.start(*invalid)
+        with self.assertRaises(ValueError):
+            attention.resident(5)
+        attention.close()
+        self.assertEqual((attention._queries, attention._output_bos), ([], []))
+        attention.runner.unload.assert_called_once()
+
     @unittest.skipUnless(importlib.util.find_spec("air"), "MLIR-AIR bindings not installed")
     def test_direct_air_module_keeps_intermediates_on_device(self):
-        for keys in (512, 1024):
-            with self.subTest(keys=keys), tempfile.TemporaryDirectory() as directory:
-                module = build_module(AttentionShape(keys), Path(directory) / "attention.o")
+        for keys, query_cores in ((512, 4), (1024, 4), (1024, 8), (4096, 8)):
+            with self.subTest(keys=keys, query_cores=query_cores), tempfile.TemporaryDirectory() as directory:
+                shape = AttentionShape(keys, query_cores=query_cores)
+                module = build_module(shape, Path(directory) / "attention.o")
                 self.assertTrue(module.operation.verify())
                 text = str(module)
                 entry = next(

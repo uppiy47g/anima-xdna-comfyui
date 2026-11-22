@@ -1,0 +1,540 @@
+{
+  "experiment": "AIR fused attention extended to 4096 keys (nq8pp schedule: 8 query cores x 2 parallel heads, resident K/V) for Anima 1024x1024 output (latent [1,16,1,128,128], 4096 image tokens), compared with the tiled baseline-attention path",
+  "date": "2026-11-16",
+  "repository_base": "571696a2e01a89e525a29bfd2c7670647e3545d7",
+  "deployed": false,
+  "configuration": {
+    "cpu": "AMD Ryzen AI 9 365 (Zen 5), XDNA 2 npu2",
+    "system_memory_gib": 23.6,
+    "python": "3.13.9",
+    "torch_version": "2.14.1+cpu",
+    "torch_threads": 10,
+    "triton_xdna": "3.6.0.2026093004+75679dc",
+    "xrt_sdk": "2.21.75",
+    "comfyui_version": "0.38.0",
+    "comfyui_commit": "170594057a22673349ddf0a3d88624b7fa5865bb",
+    "attention_backend": "air",
+    "adaln_device": "host",
+    "qkv_chaining": true
+  },
+  "design": {
+    "self_attention": "1024-query dispatches against the 4096-key self4096 artifact; K and V (4096 keys) stay resident for the 4 query tiles of one call",
+    "cross_attention": "1024-query dispatches against the unchanged 512-key cross artifact",
+    "air_dispatches_per_block": 8,
+    "dispatches_per_block": 44.0,
+    "baseline_dispatches_per_block": 76.0,
+    "kv_reuse": "static_indices {1, 2} on tiles after the first within one call; never across calls",
+    "schedule": "nq8pp: 8 query cores per head x 2 parallel heads, kv_buffers 2, direct Q, column L2 splits",
+    "core_working_bytes": 53504,
+    "artifacts": {
+      "self4096": {
+        "keys": 4096,
+        "schedule": "nq8pp",
+        "elf_sha256": "ba53bb0f0242c3858bb1de0fbc67187b354c38b8326dff92363c0a893b563f5c",
+        "kernel_sha256": "490249c83ab26777aeed6b044c6f1bca521d10a307932cff9dc01f8b07530943",
+        "upstream_commit": "508ca731ef0384fd3729ac1688e0b5d9a0ef5efe",
+        "module_sha256": "7cfecc3cde4ce1f967c35de308053752fb28f97110bb8415ae8a98afde61e418",
+        "module_sha256_note": "digest of the MLIR text, which embeds the kernel object path; it differs between work directories while the kernel and ELF digests do not",
+        "generator": "python -m examples.air_attention --keys 4096 --schedule nq8pp --parallel-heads 2",
+        "compile_wall_ms": [
+          27433,
+          25023
+        ],
+        "elf_rebuilds": {
+          "validated_artifact": "built by the repository generator before the validation runs",
+          "private_variant_builder_elf_sha256": "ba53bb0f0242c3858bb1de0fbc67187b354c38b8326dff92363c0a893b563f5c",
+          "repository_generator_rerun_elf_sha256": "ba53bb0f0242c3858bb1de0fbc67187b354c38b8326dff92363c0a893b563f5c",
+          "repository_generator_rerun": "fresh work directory, final working tree; ELF and kernel digests equal"
+        }
+      },
+      "self": {
+        "keys": 1024,
+        "elf_sha256": "dde8ae3533003a61036ad18ae153a342743a3d05cf6ee4f56108a540cdfa8ef2",
+        "role": "512x512 self-attention (unchanged)"
+      },
+      "cross": {
+        "keys": 512,
+        "elf_sha256": "c849bec474984f677a34b18648f42e1749b2b71ff042ec090cc8033125dd2d34",
+        "role": "cross-attention at both resolutions (unchanged)"
+      }
+    },
+    "int8_profile": "remains 512x512-only; an explicit 1024-token guard now rejects 4096 tokens",
+    "fallback": "none; a missing artifact or an unsupported token count raises"
+  },
+  "kernel_bench": {
+    "method": "one artifact through MultiLaunchRunner on random normal BF16 Q/K/V (seed 7, scaled by input_scale), 16 heads x 1024 queries; error against FP32 SDPA of the same BF16 inputs; median, min and max over repeated launches (device launch = XRT start/wait only; runner run = host staging included)",
+    "results": [
+      {
+        "label": "nq8pp, 4096 keys (self4096)",
+        "elf_sha256": "ba53bb0f0242c3858bb1de0fbc67187b354c38b8326dff92363c0a893b563f5c",
+        "keys": 4096,
+        "query_cores": 8,
+        "parallel_heads": 2,
+        "kv_buffers": 2,
+        "q_mode": "direct",
+        "input_scale": 1.0,
+        "device_launch_ms": {
+          "median": 9.77,
+          "min": 9.3,
+          "max": 11.93
+        },
+        "runner_run_ms": {
+          "median": 14.26,
+          "min": 14.11,
+          "max": 14.51
+        },
+        "nrms_vs_fp32_sdpa": 0.04482,
+        "bf16_rounding_floor_nrms": 0.00165
+      },
+      {
+        "label": "base nq4, 4096 keys (not used by the chain runs)",
+        "elf_sha256": "c9807500b0d2e79ee373d9f7bb7bcfd57a5fb432681ae5617d9b0f3758967bca",
+        "keys": 4096,
+        "query_cores": 4,
+        "parallel_heads": 2,
+        "kv_buffers": 1,
+        "q_mode": "pair",
+        "input_scale": 1.0,
+        "device_launch_ms": {
+          "median": 24.52,
+          "min": 24.12,
+          "max": 25.58
+        },
+        "runner_run_ms": {
+          "median": 31.84,
+          "min": 26.5,
+          "max": 36.58
+        },
+        "nrms_vs_fp32_sdpa": 0.04482,
+        "bf16_rounding_floor_nrms": 0.00165
+      },
+      {
+        "label": "nq8pp, 4096 keys, inputs scaled by 3",
+        "elf_sha256": "ba53bb0f0242c3858bb1de0fbc67187b354c38b8326dff92363c0a893b563f5c",
+        "keys": 4096,
+        "query_cores": 8,
+        "parallel_heads": 2,
+        "kv_buffers": 2,
+        "q_mode": "direct",
+        "input_scale": 3.0,
+        "device_launch_ms": {
+          "median": 10.89,
+          "min": 10.43,
+          "max": 11.94
+        },
+        "runner_run_ms": {
+          "median": 14.41,
+          "min": 14.18,
+          "max": 14.76
+        },
+        "nrms_vs_fp32_sdpa": 0.04001,
+        "bf16_rounding_floor_nrms": 0.00162
+      },
+      {
+        "label": "nq8pp, 1024 keys (512x512 self)",
+        "elf_sha256": "dde8ae3533003a61036ad18ae153a342743a3d05cf6ee4f56108a540cdfa8ef2",
+        "keys": 1024,
+        "query_cores": 8,
+        "parallel_heads": 2,
+        "kv_buffers": 2,
+        "q_mode": "direct",
+        "input_scale": 1.0,
+        "device_launch_ms": {
+          "median": 4.27,
+          "min": 4.19,
+          "max": 4.32
+        },
+        "runner_run_ms": {
+          "median": 5.0,
+          "min": 4.81,
+          "max": 5.21
+        },
+        "nrms_vs_fp32_sdpa": 0.04085,
+        "bf16_rounding_floor_nrms": 0.00166
+      },
+      {
+        "label": "nq8pp, 1024 keys (512x512 self), inputs scaled by 3",
+        "elf_sha256": "dde8ae3533003a61036ad18ae153a342743a3d05cf6ee4f56108a540cdfa8ef2",
+        "keys": 1024,
+        "query_cores": 8,
+        "parallel_heads": 2,
+        "kv_buffers": 2,
+        "q_mode": "direct",
+        "input_scale": 3.0,
+        "device_launch_ms": {
+          "median": 4.25,
+          "min": 4.12,
+          "max": 4.34
+        },
+        "runner_run_ms": {
+          "median": 5.25,
+          "min": 5.05,
+          "max": 5.59
+        },
+        "nrms_vs_fp32_sdpa": 0.03726,
+        "bf16_rounding_floor_nrms": 0.0016
+      }
+    ]
+  },
+  "chain_validation_base_v1_0": [
+    {
+      "label": "1 block (AIR)",
+      "status": "match",
+      "input": "deterministic synthetic",
+      "block_range": [
+        0,
+        1
+      ],
+      "numerical_gate": {
+        "max_block_normalized_rms": 0.05,
+        "max_final_normalized_rms": 0.02
+      },
+      "weight_cache_key": "4a92deb26817ab4b9aa294e7bf3301f90daecaec62aaf2f961dc4b765bb2a8e2",
+      "weight_cache_hit": "verified hit",
+      "dispatches": 44,
+      "dispatches_per_block": 44.0,
+      "cached_run_ms": [
+        633.7,
+        640.2
+      ],
+      "steady_median_ms": 640.2,
+      "worst_block_error": {
+        "block": 0,
+        "max_abs_error": 0.0009765625,
+        "normalized_rms_error": 0.0019007150077882346
+      },
+      "final_error": {
+        "block": 0,
+        "max_abs_error": 0.0009765625,
+        "normalized_rms_error": 0.0019007150077882346
+      }
+    },
+    {
+      "label": "28 blocks (AIR)",
+      "status": "match",
+      "input": "deterministic synthetic",
+      "block_range": [
+        0,
+        28
+      ],
+      "numerical_gate": {
+        "max_block_normalized_rms": 0.05,
+        "max_final_normalized_rms": 0.02
+      },
+      "weight_cache_key": "4a92deb26817ab4b9aa294e7bf3301f90daecaec62aaf2f961dc4b765bb2a8e2",
+      "weight_cache_hit": "verified hit",
+      "dispatches": 1232,
+      "dispatches_per_block": 44.0,
+      "cached_run_ms": [
+        18604.8,
+        19928.1
+      ],
+      "steady_median_ms": 19928.1,
+      "worst_block_error": {
+        "block": 13,
+        "max_abs_error": 0.12890625,
+        "normalized_rms_error": 0.014910870588014661
+      },
+      "final_error": {
+        "block": 27,
+        "max_abs_error": 0.34375,
+        "normalized_rms_error": 0.01037614701935067
+      }
+    }
+  ],
+  "chain_28_block_detail": {
+    "populate_or_validate_ms": 140686.1,
+    "cpu_oracle_ms": 110951.9,
+    "cached_run_ms": [
+      18604.8,
+      19928.1
+    ],
+    "block_wall_ms": [
+      688.1,
+      692.5,
+      706.2,
+      686.6,
+      687.5,
+      726.4,
+      689.9,
+      702.7,
+      706.9,
+      720.1,
+      693.2,
+      697.9,
+      703.0,
+      686.8,
+      676.2,
+      713.5,
+      734.3,
+      769.3,
+      818.7,
+      771.6,
+      742.5,
+      781.0,
+      705.5,
+      670.8,
+      705.6,
+      669.2,
+      672.1,
+      690.3
+    ],
+    "block_wall_ms_range": [
+      669.2,
+      818.7
+    ],
+    "block_normalized_rms": [
+      0.001901,
+      0.003333,
+      0.006429,
+      0.0095,
+      0.01032,
+      0.010168,
+      0.010182,
+      0.010365,
+      0.010885,
+      0.012111,
+      0.012688,
+      0.012482,
+      0.013149,
+      0.014911,
+      0.013668,
+      0.010849,
+      0.008862,
+      0.008211,
+      0.008258,
+      0.008412,
+      0.008673,
+      0.008825,
+      0.009151,
+      0.009228,
+      0.009386,
+      0.009577,
+      0.009854,
+      0.010376
+    ],
+    "profile": {
+      "kernel_and_wait_ms": 5098.7,
+      "host_operations_ms": 2675.8,
+      "host_copy_ms": 162.6,
+      "cache_sync_ms": 178.7,
+      "resident_hits": 1456,
+      "allocations": 0,
+      "weight_population_bytes": 0,
+      "h2d_staging_bytes": 6341787648,
+      "d2h_staging_bytes": 15032385536,
+      "npu_logical_flops": 17918603558912
+    },
+    "profile_accounting": "an AIR attention call is recorded as one stage: its wall time is a stage time and its Q/K/V and output sizes count in the h2d and d2h staging counters, but it adds nothing to kernel_and_wait_ms; kernel_and_wait_ms is therefore not comparable between the baseline and AIR runs, while the staging counters and host_operations_ms are"
+  },
+  "baseline_28_block_reference": {
+    "label": "28 blocks (tiled baseline attention)",
+    "numerical_gate": {
+      "max_block_normalized_rms": 0.05,
+      "max_final_normalized_rms": 0.05
+    },
+    "dispatches": 2128,
+    "dispatches_per_block": 76.0,
+    "cached_run_ms": 54271.2,
+    "timed_runs": 1,
+    "worst_block_error": {
+      "block": 13,
+      "max_abs_error": 0.1171875,
+      "normalized_rms_error": 0.014112028122484153
+    },
+    "final_error": {
+      "block": 27,
+      "max_abs_error": 0.375,
+      "normalized_rms_error": 0.009730532743078937
+    },
+    "profile": {
+      "kernel_and_wait_ms": 20494.2,
+      "host_operations_ms": 11669.9,
+      "host_copy_ms": 154.4,
+      "cache_sync_ms": 184.6,
+      "resident_hits": 2576,
+      "allocations": 0,
+      "weight_population_bytes": 0,
+      "h2d_staging_bytes": 38637928448,
+      "d2h_staging_bytes": 66706210816,
+      "npu_logical_flops": 17918603558912
+    },
+    "source": "docs/evidence/anima-1024-tiling.json (same deterministic synthetic input)"
+  },
+  "stage_profile": {
+    "note": "stage wall time per block from one --profile run each; the groups sum to total_stage_wall_ms, which is slightly below the separately measured block_wall_ms",
+    "baseline_attention_blocks_0_1": {
+      "blocks_profiled": 2,
+      "block_wall_ms": [
+        1688.7,
+        1702.3
+      ],
+      "mean_stage_wall_ms_per_block": {
+        "cross_attention_npu": 103.9,
+        "cross_attention_softmax_scale_host": 26.4,
+        "linear_npu": 465.5,
+        "other_host": 125.4,
+        "self_attention_npu": 709.1,
+        "self_attention_softmax_scale_host": 233.9,
+        "total_stage_wall_ms": 1664.3
+      }
+    },
+    "air_block_0": {
+      "blocks_profiled": 1,
+      "block_wall_ms": [
+        639.8
+      ],
+      "mean_stage_wall_ms_per_block": {
+        "cross_attention_npu": 21.1,
+        "linear_npu": 454.4,
+        "other_host": 88.6,
+        "self_attention_npu": 74.6,
+        "total_stage_wall_ms": 638.6
+      }
+    }
+  },
+  "regression_512x512": {
+    "model": "Base v1.0",
+    "input": "deterministic synthetic",
+    "attention_backend": "air",
+    "image_tokens": 1024,
+    "block_range": [
+      0,
+      4
+    ],
+    "numerical_gate": {
+      "max_block_normalized_rms": 1.0,
+      "max_final_normalized_rms": 1.0
+    },
+    "dispatches": 44,
+    "dispatches_per_block": 11.0,
+    "cached_run_ms": {
+      "unmodified_head": [
+        568.4,
+        572.4
+      ],
+      "this_change": [
+        569.0,
+        542.0
+      ]
+    },
+    "runs_per_variant": 2,
+    "provenance": "the unmodified HEAD was exported to a separate directory and run from it; the second pair of runs printed the imported package path to confirm the HEAD export and the working tree were used respectively",
+    "per_block_errors_identical": true,
+    "compared_fields": [
+      "max_abs_error",
+      "mean_abs_error",
+      "rms_error",
+      "reference_rms",
+      "normalized_rms_error"
+    ],
+    "worst_block_error": {
+      "block": 3,
+      "max_abs_error": 0.0546875,
+      "mean_abs_error": 0.00048368386342190206,
+      "rms_error": 0.0013860512990504503,
+      "normalized_rms_error": 0.008475277184030388
+    },
+    "interpretation": "the 512x512 AIR path gives exactly equal per-block error statistics with and without this change; the gates were relaxed to 1.0 so that the comparison cannot stop early"
+  },
+  "comfyui_generation": {
+    "model": "Turbo V1.1 (native, BF16, Load Anima (BF16) + Load/Attach XDNA)",
+    "model_fingerprint": "066b4281037504b1b7200ecd65b4182fc765ed882ecd5ca650db7308246a8dee",
+    "text_encoder": "qwen_3_06b_base",
+    "vae": "qwen_image_vae (default FP32 decode)",
+    "latent": [
+      1,
+      16,
+      1,
+      128,
+      128
+    ],
+    "image": [
+      1024,
+      1024
+    ],
+    "sampler": "euler",
+    "scheduler": "simple",
+    "steps": 4,
+    "cfg": 1.0,
+    "launch": "--cpu, isolated base directory, host AdaLN; ANIMA_XDNA_ATTENTION_BACKEND=air for the AIR runs and baseline for the baseline run",
+    "runs": {
+      "baseline_attention_cold": {
+        "seed": 700755787614899,
+        "prompt_executed_s": 250.76,
+        "sampler_step_s": {
+          "first": 66.6,
+          "subsequent": "53-54",
+          "tqdm_reported_average": 55.8
+        },
+        "source": "docs/evidence/anima-1024-tiling.json"
+      },
+      "air_cold": {
+        "seed": 700755787614899,
+        "prompt_executed_s": 108.0,
+        "wall_s": 110.1,
+        "sampler_step_s": {
+          "first": 24.8,
+          "second": 19.9
+        }
+      },
+      "air_warm": {
+        "seed": 700755787614900,
+        "prompt_executed_s": 82.3,
+        "wall_s": 85.1,
+        "sampler_step_s": {
+          "steady": 17.6
+        }
+      }
+    },
+    "runtime_status_after_both_runs": {
+      "attention_backend": "air_experimental",
+      "calls": 8,
+      "chain_runs": 8,
+      "resident_reuses": 7,
+      "first_call_total_ms": 24747,
+      "first_chain_ms": 24587,
+      "last_total_ms": 17551,
+      "last_chain_ms": 17284,
+      "last_preprocess_ms": 236,
+      "last_postprocess_ms": 14,
+      "last_dispatches": 1232,
+      "last_h2d_gb_decimal": 6.34,
+      "last_d2h_gb_decimal": 15.03,
+      "last_resident_hits": 1456,
+      "last_error": null
+    },
+    "free_memory_during_sampling": "about 1 GiB of 23.6 GiB (approximate)",
+    "output_png_sha256": {
+      "baseline_attention_cold": "0497c9528e3db67c3cb98869219c8b22c55f1f3f074aeb04ccb2e85208cd8f14",
+      "air_cold": "38aa1806233405e0e8073c719d3b32d6e4071b25a33877325b88100badc54e65"
+    },
+    "result": "correct 1024x1024 RGB image; no fallback; verified weight-cache hit"
+  },
+  "image_comparison_air_cold_vs_baseline_cold": {
+    "seed": 700755787614899,
+    "metric_space": "decoded RGB, 8-bit, 1024x1024x3",
+    "mean_abs_error_of_255": 22.12762673695882,
+    "rms_error": 43.739918450039816,
+    "nrms_percent": 23.52152594561265,
+    "psnr_db": 15.313244228853744,
+    "identical_pixels_percent": 4.542350769042969,
+    "visual_check": "both images are coherent with no tile seams or artifacts; the composition matches and details differ",
+    "reference_512x512": "fixed-seed latent NRMS 29.035% and decoded RGB MAE 15.975/255 against the control (docs/anima-xdna-reproducibility.md)",
+    "latent_comparison": "not measured at 1024x1024"
+  },
+  "limits": [
+    "One machine, one run per measurement; no statistical claim.",
+    "AIR remains opt-in and experimental; BF16 online softmax is not quality-equivalent to the baseline-attention control.",
+    "The image comparison uses one seed. No latent-space comparison and no CPU-reference run exist at 1024x1024.",
+    "No warm baseline-attention time was measured, so the warm comparison is AIR against the cold baseline.",
+    "The AIR ComfyUI timings and Runtime Status values were recorded from the driver's console output, which was not saved to a file; the archive pins the driver and the cold-run PNG.",
+    "The 28-block AIR run used the stricter 2% final gate; the baseline run used 5%. Both used 5% per block.",
+    "Only the nq8pp schedule was validated through the chain and ComfyUI; the base 4096-key schedule was only benchmarked as a kernel.",
+    "The INT8 profile stays 512x512-only.",
+    "An existing install needs the updated node copy and a self4096 artifact in its AIR directory.",
+    "About 1 GiB of 23.6 GiB remained free during sampling."
+  ],
+  "implementation_archive_sha256": "9cb34de96c27bb9e3fd260f4292d0d6ede03d2531380ce4c92572bce0a0d7bea",
+  "implementation_archive_members": 57
+}

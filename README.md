@@ -126,6 +126,67 @@ contexts and XRT buffers remain resident across denoising steps. The regular
 launcher uses baseline attention by default. Direct AIR attention is a
 separate experimental opt-in.
 
+#### Cache-backed MODEL loader
+
+**Load Anima XDNA (Cache-backed)** can replace **Load Anima (BF16)** plus
+**Load/Attach Anima XDNA Model**. It loads only the host layers and executes
+the 28 blocks from the verified packed-weight cache, avoiding the duplicate
+ComfyUI block Parameters. Connect its MODEL directly to the sampler in
+ComfyUI `--cpu`. The original checkpoint is still required. This is not
+INT8 conversion; BF16 weights and the existing CPU compute policy are retained.
+
+Standard **Load LoRA** / **Load LoRA Model Only** nodes can be placed after
+this loader, with the same supported LoRA types as the original workflow.
+The first prompt with a new LoRA builds or verifies its effective packed
+cache; base and LoRA MODELs can then be switched without reloading. Weight
+hooks, bypass LoRA nodes, unsupported LoRA types and saving this
+execution-only MODEL as a checkpoint are rejected. See the
+[cache-backed loader guide](comfyui_xdna_nodes/README.md#cache-backed-execution-only-loader).
+
+In one matched 512×512 Turbo/AIR run, peak process working set fell from
+15.36 to 11.76 GiB (3.60 GiB / 23.4% less), with bitwise-identical latents
+and pixel-identical images. This is not a 1024×1024 measurement; see the
+[memory experiment](docs/anima-xdna-reproducibility.md#cache-backed-model-loader-and-512x512-memory-2026-11-17).
+With one 512×512 LoRA, peak working set was 11.92 GiB versus 16.52 GiB for
+the original LoRA workflow, again with bitwise-identical latents; see the
+[LoRA experiment](docs/anima-xdna-reproducibility.md#cache-backed-loader-with-standard-lora-nodes-2026-11-17).
+
+#### 1024×1024 output
+
+The standard path also accepts a 1024×1024 latent (`[1,16,1,128,128]`, 4096
+image tokens). Every XDNA dispatch is split into the 1024-row and 1024-key
+kernel shapes that are validated at 512×512, so both resolutions share the
+resident weights and the compiled kernels. A block uses 76 dispatches. Row
+counts that do not tile evenly raise an error; there is no CPU fallback.
+
+- **Attention backend.** Baseline attention (leave
+  `ANIMA_XDNA_ATTENTION_BACKEND` unset or set it to `baseline`) is the default
+  and the reference path. Experimental AIR attention
+  (`ANIMA_XDNA_ATTENTION_BACKEND=air`) also accepts 4096 tokens, but needs an
+  additional `self4096` artifact beside the `self` and `cross` ones; see the
+  [AIR attention at 1024×1024](anima_xdna_poc/README.md#air-attention-at-1024x1024)
+  section. The experimental INT8 profile also accepts 4096 tokens when AIR
+  attention has the `self4096` artifact; see
+  [INT8 at 1024x1024](#int8-at-1024x1024) below.
+- **Speed.** With baseline attention on the test machine, one 28-block pass
+  takes about 54 s. A sampler step therefore takes about 55 s with CFG 1 and
+  roughly twice as long with CFG > 1. A 4-step Turbo V1.1 prompt took 251 s,
+  including loading and VAE decoding. With AIR attention, a 28-block pass
+  takes about 19 s (44 dispatches per block instead of 76) and the same
+  prompt took 108 s on the first run and 82 s on a second run with a
+  different seed.
+- **AIR quality.** AIR attention is **not** quality-equivalent. For one fixed
+  seed, the decoded 1024×1024 image differs from the baseline-attention image
+  by MAE 22.1/255 (PSNR 15.3 dB): the composition matches and neither image
+  shows tile seams, but details change. A latent-space comparison at 1024×1024
+  was not measured. Keep baseline attention for quality-sensitive work.
+- **Memory.** Host memory use is much higher than at 512×512. On a 24 GB
+  system, about 1 GB remained free during sampling.
+
+See the [1024×1024 tiling section](docs/anima-xdna-reproducibility.md#anima-1024x1024-by-tiling-xdna-dispatches-2026-11-16)
+and the [AIR 4096-key section](docs/anima-xdna-reproducibility.md#air-attention-at-4096-keys-for-1024x1024-2026-11-16)
+of the reproducibility report.
+
 ### Experimental INT8/AIR profile
 
 The `int8-attn-l1k64-nq8pp` profile is deliberately separate from the standard
@@ -147,6 +208,30 @@ boundaries on the first four forwards, and raises errors instead of silently
 falling back on unsupported cases. This fixed-shape experimental profile is
 not a general quantization mode.
 
+#### INT8 at 1024x1024
+
+The profile also runs 1024×1024 (4096 tokens) by running its 512×512 INT8
+kernels once per 1024-row tile. It needs the AIR `self4096` artifact beside
+`self` and `cross` (without it a 1024×1024 run stops with an explicit error),
+and works best with **Load Anima XDNA (Cache-backed)**. On the test machine a
+4-step, CFG 1 Turbo V1.1 prompt took about 49–55 s for sampling in a fresh process
+(the first prompt runs the checked, sequential path) and 21.2–22.7 s on warm
+prompts, plus about 5–7 s VAE decode; cache-backed AIR BF16 took 71 s for
+sampling in a fresh process. Peak working set while sampling was 10.3–11.9 GiB
+instead of 13.1 GiB, leaving about 4.7–6.3 GiB of system memory free. INT8 is **not**
+quality-equivalent: for one fixed seed the decoded image differs from the AIR
+BF16 image by MAE 24.3/255 (PSNR 14.9 dB).
+
+After the checked first prompt, the host work around each NPU job (norm,
+quantization, GELU, gated residual, AIR input/output handling) runs while the
+next NPU job executes, and AIR attention tiles alternate with the attention
+output projection on the NPU. The output is bitwise identical to the
+sequential schedule and warm sampling was about 18% faster. It is on by
+default; set `ANIMA_XDNA_INT8_OVERLAP=0` to use the sequential schedule.
+Details, limits and the single-machine caveats are in the reproducibility
+report: [host/NPU overlap](docs/anima-xdna-reproducibility.md#int8-at-1024x1024-with-hostnpu-overlap-2026-11-17)
+and [AIR attention overlap](docs/anima-xdna-reproducibility.md#air-attention-overlap-at-1024x1024-2026-11-17).
+
 ## Supported configuration
 
 The validated configuration is:
@@ -160,8 +245,11 @@ The validated configuration is:
   `170594057a22673349ddf0a3d88624b7fa5865bb`.
 - Anima Base v1.0, Turbo V1.1, the validated WAI Nova Anima Turbo LoRA
   Ver V1.0 full checkpoint, or Radiance Turbo Anima v2.0.
-- Batch 1, 512×512 output, 1024 image tokens and adapted Qwen context
-  `[1, 512, 1024]`.
+- Batch 1 and adapted Qwen context `[1, 512, 1024]`, with either 512×512
+  output (1024 image tokens) or, on the standard BF16 path, 1024×1024 output
+  (4096 image tokens) with baseline attention or the experimental AIR
+  attention that has a `self4096` artifact. The experimental INT8 profile
+  also accepts 1024×1024 with the `self4096` artifact.
 - BF16 execution weights and block activations; the sampler latent is FP32.
 
 Compatible F16 or F32 Anima sources are normalized to BF16 when the local
@@ -182,6 +270,68 @@ included in the Python wheel or source archive. Obtain model files from their
 authorized sources and review their licenses separately.
 
 ## Installation
+
+### One-shot Windows installer
+
+`tools\install_windows.ps1` builds a dedicated CPU + NPU installation in one
+directory: ComfyUI at the validated commit, a 64-bit Python 3.13 virtual
+environment with CPU PyTorch, the Triton-XDNA toolchain, this custom node,
+the XRT SDK 2.21.75 and, for the INT8 profile, the
+[experimental INT8/AIR runtime bundle](#enabling-the-experimental-int8-profile).
+Other Python and ComfyUI installations are not modified.
+
+Prerequisites:
+
+- Windows x64 with an AMD XDNA 2 NPU and the AMD Ryzen AI NPU driver
+  (`C:\Windows\System32\AMD\xrt-smi.exe` must exist).
+- Git for Windows.
+- Visual Studio 2022 Build Tools with the **Desktop development with C++**
+  workload. Triton-XDNA compiles its launcher with MSVC.
+- 64-bit Python 3.13 from python.org, found through the `py` launcher or
+  passed with `-PythonExe`.
+- The four Triton-XDNA toolchain wheels (`triton-xdna`, `mlir-air`,
+  `mlir-aie-no-rtti`, `llvm-aie`) in one local directory, at the exact
+  versions in [`tools/windows-cp313-constraints.txt`](tools/windows-cp313-constraints.txt).
+  The installer does not download them. Upstream nightly wheels rotate, and
+  the validated `mlir-air` nightly is no longer published upstream.
+
+Clone the repository anywhere and run the installer from its root:
+
+```powershell
+git clone https://github.com/uppiy47g/anima-xdna-comfyui.git
+cd anima-xdna-comfyui
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\install_windows.ps1 `
+  -RuntimeProfile int8 -WheelDirectory "<WHEEL_DIR>" -ModelsDirectory "<MODELS_DIR>"
+```
+
+Use `-RuntimeProfile standard` for the standard BF16 path only. The
+installation goes to `%USERPROFILE%\ComfyUI-AnimaXDNA` unless `-InstallRoot`
+names another new or empty directory; prefer an ASCII path. `-ModelsDirectory`
+is optional and writes an `extra_model_paths.yaml` for a directory containing
+`diffusion_models`, `text_encoders`, `vae` and `loras` folders. No models are
+downloaded. `-RuntimeBundlePath` uses a local copy of the release bundle,
+`-XrtSdkDirectory` an existing XRT SDK, and `-NumThreads` overrides the
+10 host threads. Rerunning into the same directory reuses its ComfyUI checkout
+and virtual environment.
+
+The installer probes the NPU, requires target `npu2` and runtime `xrt`, and
+loads ComfyUI with the node once (`--quick-test-for-ci`). It writes:
+
+- `run-xdna.ps1`, a command-line launcher on `127.0.0.1:8190`.
+- `xdna-runtime\anima-xdna.json`, the runtime profile, XRT SDK location and
+  Triton cache directory. The custom node reads this file at startup, so
+  neither the launcher nor Comfy Desktop needs environment variables.
+  Variables that are already set take precedence; `ANIMA_XDNA_CONFIG` selects
+  a different file.
+- The **Anima XDNA Cache-backed 1024** workflow in `user\default\workflows`.
+
+To use it from Comfy Desktop, choose **Add Existing Instance**, select the
+installation directory and its `.venv`, and set the `--cpu` startup
+arguments shown at the end of the installer output; see
+[Comfy Desktop](#comfy-desktop). The first prompt in a new installation also
+compiles Triton kernels into the cache and is slower.
+
+### Manual installation
 
 Use an isolated ComfyUI installation and install the node into the same Python
 environment that starts ComfyUI. Clone the repository using the expected
@@ -223,6 +373,18 @@ standard ComfyUI path with:
 This launcher binds to localhost and uses `--cpu` for the host pipeline. The
 repository registers only Anima XDNA nodes; no LoRA Bridge converter or
 activation-capture package is needed.
+
+### Comfy Desktop
+
+The Desktop window can run a CPU + NPU installation as a
+**Tracked / Git Clone** instance. Select its XDNA virtual environment and keep
+`--cpu` in **Manage > Startup Args**. An installation created by the one-shot
+installer needs nothing else. Desktop does not run the PowerShell launchers;
+for a manual installation, provide their settings with an
+`xdna-runtime\anima-xdna.json` file or with instance environment variables.
+Existing GPU instances and the validated Python/XRT stack need not change.
+See the [Desktop setup guide](docs/comfy-desktop.md) for INT8/AIR settings,
+shared model storage, 512x512/1024x1024 use and rollback.
 
 ## Using the standard path
 
@@ -273,10 +435,13 @@ being silently ignored.
 
 ## Enabling the experimental INT8 profile
 
-First install the custom node and the ABI-matched Windows XRT, `pyxrt`,
-Triton-XDNA/MLIR/LLVM-AIE dependencies as described above. The profile bundle
-does not install ComfyUI, Python, the AMD driver/XRT stack, model weights, or
-the Python dependencies. It supplies the fixed-shape INT8/AIR artifacts, the
+The [one-shot installer](#one-shot-windows-installer) with
+`-RuntimeProfile int8` performs all of the following steps. For a manual
+installation, first install the custom node and the ABI-matched Windows XRT,
+`pyxrt`, Triton-XDNA/MLIR/LLVM-AIE dependencies as described above. The
+profile bundle does not install ComfyUI, Python, the AMD driver/XRT stack,
+model weights, or the Python dependencies. It supplies the fixed-shape
+INT8/AIR artifacts, including the `self4096` AIR artifact for 1024x1024, the
 four prebuilt host-kernel DLLs, and the profile launcher.
 
 Stop ComfyUI, open PowerShell in the custom-node checkout, and run:
@@ -286,7 +451,7 @@ Stop ComfyUI, open PowerShell in the custom-node checkout, and run:
 ```
 
 The installer downloads the version-pinned bundle from the
-[GitHub prerelease](https://github.com/uppiy47g/anima-xdna-comfyui/releases/tag/v0.2.0-alpha.2),
+[GitHub prerelease](https://github.com/uppiy47g/anima-xdna-comfyui/releases/tag/v0.2.0-alpha.3),
 checks its GitHub SHA-256 digest and every payload file, then installs the
 runtime under `<COMFYUI_ROOT>\xdna-runtime`, copies the DLLs into this node,
 and places `run-xdna-int8.ps1` beside the existing `run-xdna.ps1`. Replaced

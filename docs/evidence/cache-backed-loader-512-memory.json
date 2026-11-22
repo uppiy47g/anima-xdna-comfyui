@@ -1,0 +1,319 @@
+{
+  "date": "2026-11-17",
+  "status": "measured_512x512_cache_backed_loader",
+  "repository_base": "cc0dbad",
+  "implementation": {
+    "source": "native Anima checkpoint; source file identity checked before and after preparation",
+    "blocks": "metadata-only shapes for detection; zero ComfyUI block Parameters allocated; verified BF16 cache supplies CPU/NPU block execution",
+    "host": "BF16 host weights; same ComfyUI CPU manual-cast policy as original loader (FP32 on this machine)",
+    "unsupported": [
+      "live LoRA/weight patches",
+      "weight hooks",
+      "GPU host placement",
+      "checkpoint saving/merging"
+    ],
+    "original_loader_unchanged": true
+  },
+  "configuration": {
+    "size": [
+      512,
+      512
+    ],
+    "steps": 4,
+    "cfg": 1.0,
+    "seed": 700755787614899,
+    "sampler": "euler",
+    "scheduler": "simple",
+    "model": "anima_turboV11",
+    "backend": "air",
+    "torch_threads": 10,
+    "vae": "default_fp32",
+    "torch_version": "2.14.1+cpu",
+    "python": "3.13.9 (tags/v3.13.9:8183fa5, Oct 14 2025, 14:09:13) [MSC v.1944 64 bit (AMD64)]",
+    "comfyui_commit": "170594057a22673349ddf0a3d88624b7fa5865bb",
+    "cpu": "AMD Ryzen AI 9 365",
+    "device": "XDNA 2 npu2",
+    "system_physical_bytes": 25359659008,
+    "xrt_sdk": "2.21.75",
+    "triton_xdna": "3.6.0.2026093004+75679dc",
+    "air_schedule": "nq8pp (self and cross)",
+    "adaln_device": "host",
+    "optimized_int8_profile": false,
+    "gemm_layout_override": false,
+    "disk_weight_cache": "verified warm hit in both fresh processes",
+    "block_fingerprint": "066b4281037504b1b7200ecd65b4182fc765ed882ecd5ca650db7308246a8dee",
+    "positive": "a cheerful anime girl under cherry blossoms, detailed illustration, soft daylight",
+    "negative": "worst quality, low quality, blurry, jpeg artifacts"
+  },
+  "methodology": {
+    "execution": "Separate fresh standalone ComfyUI Python processes invoking the actual loader, CLIP, KSampler and VAEDecode nodes, not an HTTP server or GUI measurement. Legacy first, cache-backed second; two sequential same-seed generations in each.",
+    "memory": "Windows GetProcessMemoryInfo PROCESS_MEMORY_COUNTERS_EX: PeakWorkingSetSize and PeakPagefileUsage through explicit unload/GC. Current PrivateUsage and WorkingSetSize and GlobalMemoryStatusEx available physical memory sampled every 50 ms; actual intervals may be longer under load.",
+    "accounting": "Working set (resident RAM) and private commit are distinct. Do not add XRT BO, mmap or parameter-byte counts to these OS counters. System available memory includes other processes and the OS cache.",
+    "scope": "One machine, checkpoint, seed and process pair; this is a memory/output parity check, not a statistically controlled speed comparison."
+  },
+  "measurements": {
+    "legacy": {
+      "node": "LoadAnimaBF16 + LoadAttachAnimaXDNAModel",
+      "host_compute_dtype": "torch.float32",
+      "loader_attach_seconds": 13.781729300000052,
+      "comfy_block_parameter_bytes": 3875565568,
+      "comfy_block_unique_storage_bytes": 3875565568,
+      "comfy_nonblock_parameter_bytes": 306572288,
+      "cache_hit": true,
+      "peak_working_set_bytes": 16489283584,
+      "peak_private_commit_bytes": 16061812736,
+      "phase_sampled_peaks": {
+        "conditioning": {
+          "private_bytes": 10185981952,
+          "working_set_bytes": 7120523264,
+          "minimum_system_available_bytes": 9637539840,
+          "samples": 22
+        },
+        "decode_0": {
+          "private_bytes": 16028258304,
+          "working_set_bytes": 16396288000,
+          "minimum_system_available_bytes": 511320064,
+          "samples": 64
+        },
+        "decode_1": {
+          "private_bytes": 15951749120,
+          "working_set_bytes": 16489086976,
+          "minimum_system_available_bytes": 371093504,
+          "samples": 59
+        },
+        "imports": {
+          "private_bytes": 1041801216,
+          "working_set_bytes": 437587968,
+          "minimum_system_available_bytes": 16059555840,
+          "samples": 185
+        },
+        "loader": {
+          "private_bytes": 11725836288,
+          "working_set_bytes": 8693022720,
+          "minimum_system_available_bytes": 8144576512,
+          "samples": 223
+        },
+        "sample_0": {
+          "private_bytes": 14834438144,
+          "working_set_bytes": 15550394368,
+          "minimum_system_available_bytes": 1256595456,
+          "samples": 365
+        },
+        "sample_1": {
+          "private_bytes": 15876022272,
+          "working_set_bytes": 16280010752,
+          "minimum_system_available_bytes": 611409920,
+          "samples": 283
+        },
+        "unload": {
+          "private_bytes": 14547296256,
+          "working_set_bytes": 15121084416,
+          "minimum_system_available_bytes": 1824444416,
+          "samples": 24
+        }
+      },
+      "marks": {
+        "before_loader": {
+          "t_s": 11.56525309999995,
+          "private_bytes": 1041801216,
+          "working_set_bytes": 437587968,
+          "peak_private_bytes_lifetime": 1041809408,
+          "peak_working_set_bytes_lifetime": 437587968,
+          "system_available_bytes": 16413184000,
+          "system_total_bytes": 25359659008,
+          "page_fault_count": 124021
+        },
+        "after_attach": {
+          "t_s": 25.34723509999992,
+          "private_bytes": 7552487424,
+          "working_set_bytes": 4641906688,
+          "peak_private_bytes_lifetime": 15918587904,
+          "peak_working_set_bytes_lifetime": 8814575616,
+          "system_available_bytes": 12117291008,
+          "system_total_bytes": 25359659008,
+          "page_fault_count": 4097588
+        },
+        "after_model_gc": {
+          "t_s": 75.60263829999997,
+          "private_bytes": 1748434944,
+          "working_set_bytes": 1172836352,
+          "peak_private_bytes_lifetime": 16061812736,
+          "peak_working_set_bytes_lifetime": 16489283584,
+          "system_available_bytes": 15799885824,
+          "system_total_bytes": 25359659008,
+          "page_fault_count": 17328162
+        }
+      },
+      "runs": [
+        {
+          "sampler_seconds": 22.152047699999912,
+          "vae_decode_including_first_load_seconds": 3.746565799999985,
+          "dispatches_per_chain": 308,
+          "chain_runs_total": 4,
+          "last_weight_population_bytes": 0
+        },
+        {
+          "sampler_seconds": 17.119305899999972,
+          "vae_decode_including_first_load_seconds": 3.4024656000000277,
+          "dispatches_per_chain": 308,
+          "chain_runs_total": 8,
+          "last_weight_population_bytes": 0
+        }
+      ],
+      "runtime_closed_after_explicit_unload": true,
+      "repeat_latent_bitwise_equal": true
+    },
+    "cache": {
+      "node": "LoadAnimaXDNACache",
+      "host_compute_dtype": "torch.float32",
+      "loader_attach_seconds": 11.861065800000006,
+      "comfy_block_parameter_bytes": 0,
+      "comfy_block_unique_storage_bytes": 0,
+      "comfy_nonblock_parameter_bytes": 306572288,
+      "cache_hit": true,
+      "peak_working_set_bytes": 12624310272,
+      "peak_private_commit_bytes": 9940877312,
+      "phase_sampled_peaks": {
+        "conditioning": {
+          "private_bytes": 4063936512,
+          "working_set_bytes": 3132350464,
+          "minimum_system_available_bytes": 13817565184,
+          "samples": 26
+        },
+        "decode_0": {
+          "private_bytes": 9940877312,
+          "working_set_bytes": 12508192768,
+          "minimum_system_available_bytes": 5092098048,
+          "samples": 64
+        },
+        "decode_1": {
+          "private_bytes": 9903243264,
+          "working_set_bytes": 12623622144,
+          "minimum_system_available_bytes": 4945543168,
+          "samples": 58
+        },
+        "imports": {
+          "private_bytes": 1041756160,
+          "working_set_bytes": 437583872,
+          "minimum_system_available_bytes": 16500183040,
+          "samples": 185
+        },
+        "loader": {
+          "private_bytes": 5604904960,
+          "working_set_bytes": 4618354688,
+          "minimum_system_available_bytes": 12312858624,
+          "samples": 200
+        },
+        "sample_0": {
+          "private_bytes": 8717316096,
+          "working_set_bytes": 11684040704,
+          "minimum_system_available_bytes": 5242638336,
+          "samples": 337
+        },
+        "sample_1": {
+          "private_bytes": 9764995072,
+          "working_set_bytes": 12400885760,
+          "minimum_system_available_bytes": 5181972480,
+          "samples": 270
+        },
+        "unload": {
+          "private_bytes": 8582008832,
+          "working_set_bytes": 11371081728,
+          "minimum_system_available_bytes": 7376691200,
+          "samples": 18
+        }
+      },
+      "marks": {
+        "before_loader": {
+          "t_s": 11.6362934,
+          "private_bytes": 1041756160,
+          "working_set_bytes": 437583872,
+          "peak_private_bytes_lifetime": 1041764352,
+          "peak_working_set_bytes_lifetime": 437583872,
+          "system_available_bytes": 16500183040,
+          "system_total_bytes": 25359659008,
+          "page_fault_count": 124432
+        },
+        "after_attach": {
+          "t_s": 23.49753009999995,
+          "private_bytes": 1429569536,
+          "working_set_bytes": 756658176,
+          "peak_private_bytes_lifetime": 9795665920,
+          "peak_working_set_bytes_lifetime": 4632195072,
+          "system_available_bytes": 16178999296,
+          "system_total_bytes": 25359659008,
+          "page_fault_count": 2198510
+        },
+        "after_model_gc": {
+          "t_s": 71.29120310000008,
+          "private_bytes": 1867866112,
+          "working_set_bytes": 1267240960,
+          "peak_private_bytes_lifetime": 9940877312,
+          "peak_working_set_bytes_lifetime": 12624310272,
+          "system_available_bytes": 16296050688,
+          "system_total_bytes": 25359659008,
+          "page_fault_count": 15076881
+        }
+      },
+      "runs": [
+        {
+          "sampler_seconds": 20.425384099999974,
+          "vae_decode_including_first_load_seconds": 3.781514299999799,
+          "dispatches_per_chain": 308,
+          "chain_runs_total": 4,
+          "last_weight_population_bytes": 0
+        },
+        {
+          "sampler_seconds": 16.47300180000002,
+          "vae_decode_including_first_load_seconds": 3.365165500000103,
+          "dispatches_per_chain": 308,
+          "chain_runs_total": 8,
+          "last_weight_population_bytes": 0
+        }
+      ],
+      "runtime_closed_after_explicit_unload": true,
+      "repeat_latent_bitwise_equal": true
+    }
+  },
+  "output_comparisons": {
+    "0": {
+      "latent_bitwise_equal": true,
+      "latent_max_abs": 0.0,
+      "latent_nrms": 0.0,
+      "rgb_pixel_equal": true,
+      "rgb_mae_255": 0.0,
+      "rgb_sha256": "e991714d06d158d3462752f9ea311f7f339eb76ea2c6f7de2e93400c708fbb48"
+    },
+    "1": {
+      "latent_bitwise_equal": true,
+      "latent_max_abs": 0.0,
+      "latent_nrms": 0.0,
+      "rgb_pixel_equal": true,
+      "rgb_mae_255": 0.0,
+      "rgb_sha256": "e991714d06d158d3462752f9ea311f7f339eb76ea2c6f7de2e93400c708fbb48"
+    }
+  },
+  "development_correction": "An initial rejected prototype set CPU compute_dtype=None and changed output. The final implementation uses ComfyUI unet_manual_cast just like its existing loader; only the corrected matched pair is reported here.",
+  "limits": [
+    "No 1024x1024 memory test and no CPU-only reference run.",
+    "No cold disk-cache build peak was measured.",
+    "The measured path uses BF16 AIR with FP32 VAE; INT8, other checkpoints, live LoRA and CFG>1 were not exercised.",
+    "Equal outputs establish parity with the existing AIR path, not equivalence to baseline attention or stock CPU generation.",
+    "System available RAM is observational; other applications and file-cache residency can change it.",
+    "No production-install or launcher changes were made."
+  ],
+  "private_archive": {
+    "name": "implementation.zip",
+    "sha256": "d182c741b15842ae127eca463238a35a99aea75b2d97aa46e4e2575b55c70d5e",
+    "members": 18,
+    "bytes": 2707934,
+    "committed": false,
+    "contents": "Measurement and recording scripts, loader lifecycle smoke, complete corrected-pair logs, memory traces, latent tensors and two PNGs per loader. No model weights."
+  },
+  "reductions": {
+    "peak_working_set_bytes": 3864973312,
+    "peak_working_set_percent": 23.43930403228851,
+    "peak_private_commit_bytes": 6120935424,
+    "comfy_block_parameter_bytes": 3875565568
+  }
+}

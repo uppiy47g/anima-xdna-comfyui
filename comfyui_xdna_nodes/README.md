@@ -46,9 +46,28 @@ back to CPU.
   **Load Anima (BF16)** (explicit ComfyUI `dtype=torch.bfloat16`)
 - matching read-only XDNA source: validated Diffusers/native Base for Base,
   or the same native Turbo checkpoint for Turbo
-- batch 1, latent `[1,16,1,64,64]`, 512x512 output
+- batch 1, latent `[1,16,1,64,64]` (512x512 output) or `[1,16,1,128,128]`
+  (1024x1024 output: baseline attention, or experimental AIR attention with a
+  `self4096` artifact; the experimental INT8 profile also accepts it, see
+  below)
 - adapted Qwen context `[1,512,1024]`
 - BF16 model weights and block activations, FP32 sampler latent
+
+At 1024x1024 the wrapper derives the 64x64 patch grid, 4096 image tokens and
+RoPE from the latent. The runtime splits every XDNA dispatch into the
+1024-token kernel shapes used at 512x512. Start ComfyUI with
+`ANIMA_XDNA_ATTENTION_BACKEND` unset or set to `baseline` for the reference
+path: a 4-step, CFG 1 Turbo V1.1 1024x1024 prompt completed in 251 s (about
+55 s per step). Experimental AIR attention
+(`ANIMA_XDNA_ATTENTION_BACKEND=air`) also accepts 4096 tokens when the AIR
+artifact directory has a `self4096` artifact beside `self` and `cross`; the
+same prompt then took 108 s on the first run and 82 s on a second run with
+another seed (about 18 s per step). AIR is not quality-equivalent (see
+[AIR attention at 1024x1024](../anima_xdna_poc/README.md#air-attention-at-1024x1024)),
+and a missing `self4096` artifact stops the run with an explicit error. The
+experimental INT8 profile also runs 4096 tokens with the `self4096` artifact
+(see below). Expect roughly twice
+the step time with CFG > 1, and much higher host memory use than at 512x512.
 
 Preview/Aesthetic checkpoints, LoRA patches, LLLite, other
 batch/resolution/context sizes, and training are rejected. The normal ComfyUI
@@ -99,14 +118,32 @@ generation took 17.93 s; a same-process repeat reproduced the latent bitwise
 and took 5.79 s for sampling plus 1.51 s for VAE decode (7.30 s total). These
 are single-run smoke measurements, not a controlled benchmark or a quality
 equivalence claim.
+
+At 1024x1024 the profile runs its 512x512 INT8 kernels once per 1024-row tile
+and needs the AIR `self4096` artifact beside `self` and `cross` in the AIR
+directory. The alpha.3 runtime bundle installed by `install_int8_runtime.ps1`
+includes it; an installation from the alpha.2 bundle needs a `self4096`
+directory added to that AIR directory by hand. The
+checked first prompt in a process runs sequentially, and later prompts overlap
+host work with NPU jobs, including AIR attention (bitwise identical results,
+about 18% faster warm sampling); set
+`ANIMA_XDNA_INT8_OVERLAP=0` to disable the overlap. INT8 at 1024x1024 is not
+quality-equivalent to BF16 AIR (one fixed-seed decoded image: MAE 24.3/255).
+See the root README and the
+[reproducibility report](../docs/anima-xdna-reproducibility.md#air-attention-overlap-at-1024x1024-2026-11-17).
 For an F16 or F32 source, matching is performed after the same explicit BF16
 normalization used by the XDNA packed cache. Raw source hashes and dtypes still
 remain part of the cache identity.
 
 ## Installation
 
-Place or clone this repository below `ComfyUI\custom_nodes`, then install it in
-the same Python environment that starts ComfyUI:
+On Windows, the
+[one-shot installer](../README.md#one-shot-windows-installer)
+(`tools\install_windows.ps1`) creates a dedicated ComfyUI installation with
+this node, its Python dependencies, the XRT SDK and the runtime
+configuration. To install manually instead, place or clone this repository
+below `ComfyUI\custom_nodes`, then install it in the same Python environment
+that starts ComfyUI:
 
 ```powershell
 git clone https://github.com/uppiy47g/anima-xdna-comfyui.git `
@@ -117,10 +154,79 @@ python -m pip install -e .
 
 That environment also needs the Windows XRT SDK/`pyxrt`, Triton-XDNA and its
 matching MLIR wheels. Set `XRT_DEV_DIR` to the XRT SDK directory before
-starting ComfyUI. The packed cache defaults to
+starting ComfyUI, or provide it in `xdna-runtime\anima-xdna.json` below the
+ComfyUI root, which the node reads at startup. The packed cache defaults to
 `%USERPROFILE%\.cache\anima-xdna\weights`.
 
+For a Desktop window around this same CPU + NPU backend, follow the
+[Comfy Desktop guide](../docs/comfy-desktop.md). Register the existing
+environment rather than installing the node into a GPU Python environment;
+the `--cpu` requirement remains unchanged.
+
 ## Nodes
+
+### Cache-backed, execution-only loader
+
+**Load Anima XDNA (Cache-backed)** (`LoadAnimaXDNACache`) is an opt-in
+replacement for the **Load Anima (BF16)** + **Load/Attach Anima XDNA Model**
+pair. Select a native Anima safetensors checkpoint and connect its `MODEL`
+directly to the sampler. Do not attach it again. It requires ComfyUI `--cpu`;
+attention selection and the existing runtime environment are unchanged.
+
+The loader reads tensor shapes without materializing block tensors, constructs
+only the host layers, and loads their BF16 weights. The 28 transformer blocks
+execute from the existing verified packed-weight cache, built automatically
+when absent. Input/time embeddings, the LLM adapter, and final projection stay
+on the host, using ComfyUI's normal CPU compute-dtype policy. The original
+checkpoint is still required and is never modified. The cache is not a
+standalone checkpoint or a new quantization format.
+
+This MODEL has no ComfyUI block Parameters, not a full MODEL whose weights
+were deleted after loading. **Anima XDNA Runtime Status** reports
+`model_block_parameters_omitted=true`, zero block Parameter bytes, and the
+`cache_backed_no_comfy_block_parameters` memory policy. XRT weight buffers and
+the mapped cache remain separate allocations; do not add their byte counts
+to process memory counters.
+
+Normal MODEL clones share the host module and reference-counted XDNA runtime.
+**Unload Anima XDNA Runtime** releases one attachment; the final reference
+closes the cache and device resources. Reload the MODEL before using an
+explicitly unloaded attachment again.
+
+Standard **Load LoRA** or **Load LoRA Model Only** nodes can follow this
+loader, chained as usual. The MODEL exposes the block keys as BF16 meta
+placeholders, so ComfyUI's normal LoRA key mapping accepts block patches
+without allocating block weights. ComfyUI applies host-layer patches; block
+patches are consumed by XDNA. Before a patched MODEL first samples, the loader
+validates its patches, reads base block tensors from the original checkpoint
+on demand, and builds or reuses the effective-weight packed cache exactly as
+the original attach path does. The supported patch types and strengths are
+the same as in the [original workflow](#original-loader-and-attach-workflow);
+unsupported types raise before NPU dispatch.
+
+Each distinct patch set gets one runtime, reused across prompts and clones.
+When a different MODEL samples, for example switching from a LoRA back to the
+base, the previously resident runtime is suspended: its XRT buffers close and
+its cache mapping is released, then remapped with an identity check on next
+use. The first prompt with a new LoRA therefore includes the effective-cache
+build (about 25 s at 512x512) or verification (about 16 s); repeat prompts do
+not. **Anima XDNA Runtime Status** shows the base runtime for a LoRA MODEL
+until that MODEL has sampled once.
+
+Weight hooks, bypass LoRA nodes (**Load LoRA (Bypass) (For debugging)** and
+its Model Only variant), GPU placement and checkpoint saving or merging are
+rejected rather than silently ignoring missing blocks. Full checkpoints that already
+contain merged weights can be selected normally. This loader does not change
+AIR's numerical limitations.
+
+The [512x512 memory experiment](../docs/anima-xdna-reproducibility.md#cache-backed-model-loader-and-512x512-memory-2026-11-17)
+measured a 3.60 GiB reduction in peak process working set, with identical
+latents and pixels. A 1024x1024 memory comparison was not run. With one
+LoRA, the [LoRA experiment](../docs/anima-xdna-reproducibility.md#cache-backed-loader-with-standard-lora-nodes-2026-11-17)
+measured 11.92 GiB versus 16.52 GiB for the original LoRA workflow, with
+identical latents, including after base/LoRA switching.
+
+### Original loader and attach workflow
 
 1. Load the native Anima MODEL with **Load Anima (BF16)**. Its selector
    includes both `diffusion_models:` transformer files and `checkpoints:`

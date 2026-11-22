@@ -1,0 +1,245 @@
+{
+  "experiment": "Anima 1024x1024 output (latent [1,16,1,128,128], 4096 image tokens) on the standard BF16 path with baseline attention, by tiling every XDNA dispatch into the 1024-row / 1024-key kernel shapes already validated at 512x512",
+  "date": "2026-11-16",
+  "repository_base": "5a37a5602d45550103c7cb6946486bffd768e89f",
+  "deployed": false,
+  "configuration": {
+    "cpu": "AMD Ryzen AI 9 365 (Zen 5), XDNA 2 npu2",
+    "system_memory_gib": 23.6,
+    "python": "3.13.9",
+    "torch_version": "2.14.1+cpu",
+    "torch_threads": 10,
+    "triton_xdna": "3.6.0.2026093004+75679dc",
+    "xrt_sdk": "2.21.75",
+    "comfyui_version": "0.38.0",
+    "comfyui_commit": "170594057a22673349ddf0a3d88624b7fa5865bb",
+    "attention_backend": "baseline",
+    "adaln_device": "host",
+    "qkv_chaining": true
+  },
+  "tiling": {
+    "token_tile": 1024,
+    "linear_rows": "4096 rows -> 4 row tiles of 1024; resident weights reused per tile",
+    "self_attention_qk": "per query tile: (16 heads, 1024 queries, 1024-key tiles, 256 padded depth)",
+    "self_attention_av": "per query tile: 4 inner (key) tiles of 1024, FP32 host accumulation",
+    "cross_attention": "per query tile: 512 context keys, unchanged kernel shapes",
+    "air_and_int8": "at the time of this change: unchanged and 512x512-only; AIR rejects 4096 tokens with an explicit error naming the baseline backend, and INT8 requires AIR (AIR at 4096 tokens was added afterwards, see air-attention-4096-keys.json; INT8 stays 512x512-only)",
+    "fallback": "none; row counts above 1024 that are not a multiple of 1024 raise UnsupportedTensor"
+  },
+  "chain_validation_base_v1_0": [
+    {
+      "label": "1 block",
+      "status": "match",
+      "input": "deterministic synthetic",
+      "block_range": [
+        0,
+        1
+      ],
+      "numerical_gate": {
+        "max_block_normalized_rms": 0.05,
+        "max_final_normalized_rms": 0.05
+      },
+      "weight_cache_key": "4a92deb26817ab4b9aa294e7bf3301f90daecaec62aaf2f961dc4b765bb2a8e2",
+      "weight_cache_hit": "verified hit",
+      "dispatches": 76,
+      "dispatches_per_block": 76.0,
+      "steady_median_ms": 2040.4,
+      "worst_block_error": {
+        "block": 0,
+        "max_abs_error": 0.0009765625,
+        "normalized_rms_error": 0.0018830703657004007
+      },
+      "final_error": {
+        "block": 0,
+        "max_abs_error": 0.0009765625,
+        "normalized_rms_error": 0.0018830703657004007
+      }
+    },
+    {
+      "label": "4 blocks",
+      "status": "match",
+      "input": "deterministic synthetic",
+      "block_range": [
+        0,
+        4
+      ],
+      "numerical_gate": {
+        "max_block_normalized_rms": 0.05,
+        "max_final_normalized_rms": 0.05
+      },
+      "weight_cache_key": "4a92deb26817ab4b9aa294e7bf3301f90daecaec62aaf2f961dc4b765bb2a8e2",
+      "weight_cache_hit": "verified hit",
+      "dispatches": 304,
+      "dispatches_per_block": 76.0,
+      "steady_median_ms": 6860.5,
+      "worst_block_error": {
+        "block": 3,
+        "max_abs_error": 0.01171875,
+        "normalized_rms_error": 0.00933868851720495
+      },
+      "final_error": {
+        "block": 3,
+        "max_abs_error": 0.01171875,
+        "normalized_rms_error": 0.00933868851720495
+      }
+    },
+    {
+      "label": "28 blocks",
+      "status": "match",
+      "input": "deterministic synthetic",
+      "block_range": [
+        0,
+        28
+      ],
+      "numerical_gate": {
+        "max_block_normalized_rms": 0.05,
+        "max_final_normalized_rms": 0.05
+      },
+      "weight_cache_key": "4a92deb26817ab4b9aa294e7bf3301f90daecaec62aaf2f961dc4b765bb2a8e2",
+      "weight_cache_hit": "verified hit",
+      "dispatches": 2128,
+      "dispatches_per_block": 76.0,
+      "steady_median_ms": 54271.2,
+      "worst_block_error": {
+        "block": 13,
+        "max_abs_error": 0.1171875,
+        "normalized_rms_error": 0.014112028122484153
+      },
+      "final_error": {
+        "block": 27,
+        "max_abs_error": 0.375,
+        "normalized_rms_error": 0.009730532743078937
+      }
+    }
+  ],
+  "chain_28_block_detail": {
+    "populate_or_validate_ms": 176091.3,
+    "cpu_oracle_ms": 107268.7,
+    "cached_run_ms": 54271.2,
+    "block_wall_ms": [
+      2071.4,
+      2099.5,
+      2014.0,
+      2029.4,
+      1961.3,
+      2038.4,
+      1959.2,
+      1980.0,
+      2082.4,
+      1890.4,
+      1852.2,
+      1876.7,
+      1852.8,
+      1801.0,
+      1997.7,
+      1888.4,
+      1873.3,
+      1985.0,
+      1975.0,
+      1819.7,
+      1845.4,
+      1874.0,
+      1838.8,
+      1868.6,
+      1871.5,
+      1951.6,
+      2023.5,
+      1931.1
+    ],
+    "block_normalized_rms": [
+      0.001883,
+      0.003253,
+      0.006343,
+      0.009339,
+      0.010134,
+      0.009975,
+      0.009965,
+      0.010136,
+      0.010564,
+      0.011657,
+      0.012233,
+      0.011877,
+      0.012474,
+      0.014112,
+      0.013044,
+      0.010253,
+      0.008327,
+      0.007705,
+      0.00779,
+      0.007954,
+      0.00819,
+      0.008343,
+      0.008667,
+      0.008752,
+      0.008906,
+      0.009093,
+      0.009345,
+      0.009731
+    ],
+    "profile": {
+      "kernel_and_wait_ms": 20494.2,
+      "host_operations_ms": 11669.9,
+      "host_copy_ms": 154.4,
+      "cache_sync_ms": 184.6,
+      "resident_hits": 2576,
+      "allocations": 0,
+      "weight_population_bytes": 0,
+      "h2d_staging_bytes": 38637928448,
+      "d2h_staging_bytes": 66706210816,
+      "npu_logical_flops": 17918603558912
+    }
+  },
+  "regression_512x512": {
+    "model": "Base v1.0",
+    "input": "deterministic synthetic",
+    "image_tokens": 1024,
+    "block_range": [
+      0,
+      28
+    ],
+    "result": "fail (strict 5% transient gate)",
+    "first_failing_block": 21,
+    "normalized_rms_error": 0.0715185,
+    "max_abs_error": 189.5,
+    "unmodified_head_result": "identical failure (block 21, 0.0715185, max_abs 189.5)",
+    "interpretation": "pre-existing Base transient-gate behaviour; the 1024-token path is unchanged by tiling (a single tile reproduces the old dispatch sequence)"
+  },
+  "comfyui_generation": {
+    "model": "Turbo V1.1 (native, BF16, Load Anima (BF16) + Load/Attach XDNA)",
+    "model_fingerprint": "066b4281037504b1b7200ecd65b4182fc765ed882ecd5ca650db7308246a8dee",
+    "text_encoder": "qwen_3_06b_base",
+    "vae": "qwen_image_vae (default FP32 decode)",
+    "latent": [
+      1,
+      16,
+      1,
+      128,
+      128
+    ],
+    "image": [
+      1024,
+      1024
+    ],
+    "sampler": "euler",
+    "scheduler": "simple",
+    "steps": 4,
+    "cfg": 1.0,
+    "seed": 700755787614899,
+    "launch": "--cpu, isolated base directory, ANIMA_XDNA_ATTENTION_BACKEND=baseline",
+    "prompt_executed_s": 250.76,
+    "sampler_step_s": {
+      "first": 66.6,
+      "subsequent": "53-54",
+      "tqdm_reported_average": 55.8
+    },
+    "minimum_free_memory_gib": 1.1,
+    "output_png_sha256": "0497c9528e3db67c3cb98869219c8b22c55f1f3f074aeb04ccb2e85208cd8f14",
+    "result": "correct 1024x1024 RGB image; no fallback; verified weight-cache hit"
+  },
+  "limits": [
+    "One machine, one run per measurement; no statistical claim.",
+    "Base with CFG > 1 at 1024x1024 was not run end to end; two chain passes per step imply about 110 s per step.",
+    "At the time of this change AIR attention and the INT8 profile were not available at 1024x1024; AIR attention at 1024x1024 was added afterwards (air-attention-4096-keys.json) and the INT8 profile is still 512x512-only.",
+    "Peak host memory is much higher than at 512x512; about 1.1 GiB of 23.6 GiB remained free during sampling."
+  ]
+}
