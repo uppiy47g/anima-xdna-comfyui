@@ -271,6 +271,68 @@ authorized sources and review their licenses separately.
 
 ## Installation
 
+### One-shot Windows installer
+
+`tools\install_windows.ps1` builds a dedicated CPU + NPU installation in one
+directory: ComfyUI at the validated commit, a 64-bit Python 3.13 virtual
+environment with CPU PyTorch, the Triton-XDNA toolchain, this custom node,
+the XRT SDK 2.21.75 and, for the INT8 profile, the
+[experimental INT8/AIR runtime bundle](#enabling-the-experimental-int8-profile).
+Other Python and ComfyUI installations are not modified.
+
+Prerequisites:
+
+- Windows x64 with an AMD XDNA 2 NPU and the AMD Ryzen AI NPU driver
+  (`C:\Windows\System32\AMD\xrt-smi.exe` must exist).
+- Git for Windows.
+- Visual Studio 2022 Build Tools with the **Desktop development with C++**
+  workload. Triton-XDNA compiles its launcher with MSVC.
+- 64-bit Python 3.13 from python.org, found through the `py` launcher or
+  passed with `-PythonExe`.
+- The four Triton-XDNA toolchain wheels (`triton-xdna`, `mlir-air`,
+  `mlir-aie-no-rtti`, `llvm-aie`) in one local directory, at the exact
+  versions in [`tools/windows-cp313-constraints.txt`](tools/windows-cp313-constraints.txt).
+  The installer does not download them. Upstream nightly wheels rotate, and
+  the validated `mlir-air` nightly is no longer published upstream.
+
+Clone the repository anywhere and run the installer from its root:
+
+```powershell
+git clone https://github.com/uppiy47g/anima-xdna-comfyui.git
+cd anima-xdna-comfyui
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\install_windows.ps1 `
+  -RuntimeProfile int8 -WheelDirectory "<WHEEL_DIR>" -ModelsDirectory "<MODELS_DIR>"
+```
+
+Use `-RuntimeProfile standard` for the standard BF16 path only. The
+installation goes to `%USERPROFILE%\ComfyUI-AnimaXDNA` unless `-InstallRoot`
+names another new or empty directory; prefer an ASCII path. `-ModelsDirectory`
+is optional and writes an `extra_model_paths.yaml` for a directory containing
+`diffusion_models`, `text_encoders`, `vae` and `loras` folders. No models are
+downloaded. `-RuntimeBundlePath` uses a local copy of the release bundle,
+`-XrtSdkDirectory` an existing XRT SDK, and `-NumThreads` overrides the
+10 host threads. Rerunning into the same directory reuses its ComfyUI checkout
+and virtual environment.
+
+The installer probes the NPU, requires target `npu2` and runtime `xrt`, and
+loads ComfyUI with the node once (`--quick-test-for-ci`). It writes:
+
+- `run-xdna.ps1`, a command-line launcher on `127.0.0.1:8190`.
+- `xdna-runtime\anima-xdna.json`, the runtime profile, XRT SDK location and
+  Triton cache directory. The custom node reads this file at startup, so
+  neither the launcher nor Comfy Desktop needs environment variables.
+  Variables that are already set take precedence; `ANIMA_XDNA_CONFIG` selects
+  a different file.
+- The **Anima XDNA Cache-backed 1024** workflow in `user\default\workflows`.
+
+To use it from Comfy Desktop, choose **Add Existing Instance**, select the
+installation directory and its `.venv`, and set the `--cpu` startup
+arguments shown at the end of the installer output; see
+[Comfy Desktop](#comfy-desktop). The first prompt in a new installation also
+compiles Triton kernels into the cache and is slower.
+
+### Manual installation
+
 Use an isolated ComfyUI installation and install the node into the same Python
 environment that starts ComfyUI. Clone the repository using the expected
 custom-node directory name:
@@ -311,6 +373,18 @@ standard ComfyUI path with:
 This launcher binds to localhost and uses `--cpu` for the host pipeline. The
 repository registers only Anima XDNA nodes; no LoRA Bridge converter or
 activation-capture package is needed.
+
+### Comfy Desktop
+
+The Desktop window can run a CPU + NPU installation as a
+**Tracked / Git Clone** instance. Select its XDNA virtual environment and keep
+`--cpu` in **Manage > Startup Args**. An installation created by the one-shot
+installer needs nothing else. Desktop does not run the PowerShell launchers;
+for a manual installation, provide their settings with an
+`xdna-runtime\anima-xdna.json` file or with instance environment variables.
+Existing GPU instances and the validated Python/XRT stack need not change.
+See the [Desktop setup guide](docs/comfy-desktop.md) for INT8/AIR settings,
+shared model storage, 512x512/1024x1024 use and rollback.
 
 ## Using the standard path
 
@@ -361,10 +435,13 @@ being silently ignored.
 
 ## Enabling the experimental INT8 profile
 
-First install the custom node and the ABI-matched Windows XRT, `pyxrt`,
-Triton-XDNA/MLIR/LLVM-AIE dependencies as described above. The profile bundle
-does not install ComfyUI, Python, the AMD driver/XRT stack, model weights, or
-the Python dependencies. It supplies the fixed-shape INT8/AIR artifacts, the
+The [one-shot installer](#one-shot-windows-installer) with
+`-RuntimeProfile int8` performs all of the following steps. For a manual
+installation, first install the custom node and the ABI-matched Windows XRT,
+`pyxrt`, Triton-XDNA/MLIR/LLVM-AIE dependencies as described above. The
+profile bundle does not install ComfyUI, Python, the AMD driver/XRT stack,
+model weights, or the Python dependencies. It supplies the fixed-shape
+INT8/AIR artifacts, including the `self4096` AIR artifact for 1024x1024, the
 four prebuilt host-kernel DLLs, and the profile launcher.
 
 Stop ComfyUI, open PowerShell in the custom-node checkout, and run:
@@ -374,7 +451,7 @@ Stop ComfyUI, open PowerShell in the custom-node checkout, and run:
 ```
 
 The installer downloads the version-pinned bundle from the
-[GitHub prerelease](https://github.com/uppiy47g/anima-xdna-comfyui/releases/tag/v0.2.0-alpha.2),
+[GitHub prerelease](https://github.com/uppiy47g/anima-xdna-comfyui/releases/tag/v0.2.0-alpha.3),
 checks its GitHub SHA-256 digest and every payload file, then installs the
 runtime under `<COMFYUI_ROOT>\xdna-runtime`, copies the DLLs into this node,
 and places `run-xdna-int8.ps1` beside the existing `run-xdna.ps1`. Replaced

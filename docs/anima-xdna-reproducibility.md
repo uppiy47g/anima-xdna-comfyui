@@ -3806,6 +3806,121 @@ not a bound. Ideas not tried: caching cross-attention K/V per
 block (the cross QKV projection recomputes the context K/V for every tile)
 and fewer per-tile buffer syncs.
 
+## Comfy Desktop CPU/NPU integration (2026-11-18)
+
+**Scope.** Comfy Desktop 1.1.9 launched the existing ComfyUI 0.38.0
+(`170594057a22673349ddf0a3d88624b7fa5865bb`) Git installation with frontend
+1.53.10, Python 3.13.9 and PyTorch 2.14.1+cpu. The Anima runtime was unchanged
+from `0e115695c8373186463036629ad7477b6c8dbde4`. This validates Desktop's
+tracked-instance integration, not an upgrade to Desktop's bundled backend
+or Python. The existing GPU instance and command-line launchers were retained.
+
+**Configuration.** Desktop's Add Existing Instance action registered the
+existing installation and external XDNA virtual environment. Startup Args
+explicitly included `--cpu`, loopback listening, `--preview-method none`
+and `--cache-classic`. Instance environment variables reproduced the
+`int8-attn-l1k64-nq8pp` launcher, including host AdaLN, 10 threads, AIR
+`self4096` and the BF16/clfix Qwen Image VAE. Desktop generated its own
+model-path YAML and used the existing shared model/input/output directories.
+No GPU backend, runtime code modification or NPU power-mode change was needed.
+See the [setup guide](comfy-desktop.md) for the complete settings.
+
+**Validation.** The actual Desktop-launched Python process and
+`/system_stats` both confirmed CPU mode and the intended interpreter.
+The runtime log confirmed INT8/AIR hooks, cache-backed block-parameter
+omission, 4096-token AIR execution and successful first-prompt INT8 checks.
+The following prompts used Anima Turbo V1.1, Load Anima XDNA (Cache-backed),
+batch 1, four Euler/simple steps and CFG 1:
+
+| Submission | Resolution | Server execution time | Match to prior launcher output |
+|---|---|---:|---|
+| API, first prompt in the process | 1024x1024 | 74.892 s | Exact latent and RGB |
+| API, resident runtime | 1024x1024 | 26.041 s | Exact latent and RGB |
+| API, resolution regression | 512x512 | 7.092 s | Exact latent and RGB |
+| Embedded Desktop frontend, `app.queuePrompt` | 1024x1024 | 27.977 s | Exact latent and RGB |
+
+Each row ran the sampler rather than returning a cached sampler result.
+The embedded frontend loaded the cache-backed node, submitted the workflow,
+and displayed its decoded image. A separate 1024x1024 UI workflow was saved
+without replacing existing workflows.
+
+Times come from ComfyUI history's `execution_start`/`execution_success`
+timestamps and include VAE decoding and image/latent saving, but not Desktop
+startup or time spent opening the UI. These are individual functional checks,
+not a controlled speed comparison with the previously observed 33-second
+command-line runs. Do not attribute the timing difference to Desktop.
+There was no 1024x1024 CPU-only benchmark. Desktop-specific LoRA and
+other-model validation were not part of this check. Exact output parity
+refers to the same experimental INT8/AIR profile, not standard BF16 quality.
+
+Compact hashes and settings are in
+[`evidence/comfy-desktop-integration.json`](evidence/comfy-desktop-integration.json).
+The local API harness, frontend submission script and result collector are
+pinned there by SHA-256. Machine paths, logs, workflow captures, latents and
+screenshots remain local and are not committed.
+
+## One-shot Windows installer validation (2026-11-23)
+
+**Scope.** `tools/install_windows.ps1 -RuntimeProfile int8` built a separate,
+new installation on the same machine as the Desktop record above. It used
+Python 3.13.9 from python.org, ComfyUI
+`170594057a22673349ddf0a3d88624b7fa5865bb` with the installer's startup patch,
+PyTorch 2.14.1+cpu, the XRT SDK 2.21.75 and the alpha.3 runtime bundle
+(`anima-xdna-int8-runtime-0.2.0-alpha.3-win-x64.zip`, SHA-256
+`d5d98af3f8b6264ccd3a903581fe76a70223bafbb9692ef8e6c3bfd93aeb9d6f`), supplied
+locally with `-RuntimeBundlePath` before the release existed. The four
+toolchain wheels came from a local `-WheelDirectory` at the versions in
+`tools/windows-cp313-constraints.txt`. Three were the published upstream
+wheels; the validated `mlir-air` nightly is no longer published upstream, so
+it was repacked from the validated environment's installed files. This
+validates the installer with these inputs, not wheel availability for other
+users. The existing deployed installation, its Desktop instance and models
+were not modified; `-ModelsDirectory` pointed to the existing model root.
+
+**Installer result.** The final run reused the ComfyUI checkout and virtual
+environment from an earlier interrupted run and exited with code 0. The probe
+reported target `npu2` and runtime `xrt`, and the `--quick-test-for-ci` load
+reported the installer-written `xdna-runtime\anima-xdna.json`. That file
+contains only the profile, XRT SDK path and a relative Triton cache directory.
+
+**Generation parity.** The server was started as Desktop starts it, with
+`main.py --cpu --listen 127.0.0.1 --preview-method none --cache-classic` and
+without `XRT_DEV_DIR`, `PYTHONUTF8` or any `ANIMA_XDNA_*` variable. The
+custom node applied the configuration file. The Triton cache started empty
+and compiled without `PYTHONUTF8`. The local API harness used Anima Turbo
+V1.1, Load Anima XDNA (Cache-backed), batch 1, four Euler/simple steps and
+CFG 1:
+
+| Prompt | Resolution | Server time, run 1 | Server time, run 2 | Match to Desktop record |
+|---|---|---:|---:|---|
+| First prompt in the process (run 1), new seed (run 2) | 1024x1024 | 78.37 s | 59.16 s | Exact latent and RGB |
+| Resident runtime | 1024x1024 | 59.27 s | 59.11 s | Exact latent and RGB |
+| Resolution regression | 512x512 | 12.55 s | 13.06 s | Exact latent and RGB |
+
+The two runs were in one server process. The run 1 first prompt includes the
+Triton compilation and first-prompt INT8 checks. The new installation was not
+registered in Comfy Desktop for this check; the server command matches the
+Startup Args documented in the [setup guide](comfy-desktop.md).
+
+**Timing.** These times are much slower than the Desktop record
+(26.0 s at 1024x1024 and 7.1 s at 512x512 for the resident runtime). Warm
+1024x1024 sampling ran at about 13.3 s/it. The configuration file is not the
+cause: restarting the same installation with the eleven explicit Desktop
+variables, differing only in a separate Triton cache, gave 14.1 s/it,
+62.88 s at 1024x1024 and 13.48 s at 512x512, with the same output hashes. The
+runtime bundle payload, host DLLs and Python package versions were identical
+to the Desktop-validated installation. The cause was not identified.
+During one 1024x1024 sampling run, about 1.6–3.4 GB of memory was available
+and the disk read about 230–280 MB/s for about 16 s, which is consistent with
+memory pressure from other running applications but was not confirmed. The
+Desktop-validated installation was not rerun for a same-day comparison. No
+NPU power-mode or other system setting was changed, and there was no
+1024x1024 CPU-only run.
+
+Compact hashes and settings are in
+[`evidence/one-shot-installer-validation.json`](evidence/one-shot-installer-validation.json).
+Machine paths, logs, latents and images remain local and are not committed.
+
 ## Public verification ladder
 
 Set placeholders only in the current shell; do not commit paths or captures.

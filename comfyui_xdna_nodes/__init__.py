@@ -2,7 +2,12 @@
 
 import os
 
-from .model_wrapper import (
+from .runtime_config import apply_runtime_config
+
+# Installer-written defaults must be in place before any runtime module reads them.
+apply_runtime_config()
+
+from .model_wrapper import (  # noqa: E402
     NODE_CLASS_MAPPINGS,
     NODE_DISPLAY_NAME_MAPPINGS,
 )

@@ -1,0 +1,133 @@
+{
+  "date": "2026-11-23",
+  "status": "passed",
+  "scope": "one_shot_windows_installer_new_installation",
+  "versions": {
+    "package": "0.2.0a3",
+    "python": "3.13.9",
+    "comfyui_commit": "170594057a22673349ddf0a3d88624b7fa5865bb",
+    "torch": "2.14.1+cpu",
+    "torchvision": "0.29.1",
+    "xrt_sdk": "2.21.75",
+    "triton_xdna": "3.6.0.2026093004+75679dc",
+    "mlir_air": "0.0.1.2026092206+ff5d95c.no.rtti",
+    "mlir_aie_no_rtti": "1.4.3.dev55+g10767b5",
+    "llvm_aie": "22.0.0.2026090201+a36c62b9"
+  },
+  "installer": {
+    "script": "tools/install_windows.ps1",
+    "runtime_profile": "int8",
+    "runtime_bundle": "anima-xdna-int8-runtime-0.2.0-alpha.3-win-x64.zip",
+    "runtime_bundle_sha256": "d5d98af3f8b6264ccd3a903581fe76a70223bafbb9692ef8e6c3bfd93aeb9d6f",
+    "runtime_bundle_source": "local_RuntimeBundlePath",
+    "toolchain_wheels": "local_WheelDirectory; mlir-air repacked from the validated environment",
+    "models_directory": "existing_model_root",
+    "exit_code": 0,
+    "probe": {
+      "target": "npu2",
+      "runtime": "xrt"
+    },
+    "quick_test_runtime_config_loaded": true,
+    "config_keys": [
+      "schema_version",
+      "profile",
+      "xrt_dev_dir",
+      "triton_cache_dir"
+    ]
+  },
+  "server": {
+    "arguments": "--cpu --listen 127.0.0.1 --preview-method none --cache-classic",
+    "environment": "no XRT_DEV_DIR, PYTHONUTF8 or ANIMA_XDNA_* variables",
+    "configuration_source": "xdna-runtime/anima-xdna.json",
+    "triton_cache": "empty_at_start",
+    "model": "anima_turboV11.safetensors",
+    "loader": "LoadAnimaXDNACache",
+    "batch": 1,
+    "steps": 4,
+    "cfg": 1.0,
+    "sampler": "euler",
+    "scheduler": "simple"
+  },
+  "runs": [
+    {
+      "prompt": "first_prompt_then_new_seed",
+      "size": 1024,
+      "seed": 700755787614900,
+      "server_e2e_s": [
+        78.37,
+        59.16
+      ],
+      "latent_sha256": "ec56fcbbd25cae94a01026ff94d289c93c630ec943cc85f9d611a4a23d50e7c2",
+      "rgb_sha256": "83a5159e11e145dceb581b0ec7a666b38bd372eb87a907c052f6855d3519408e",
+      "matches_desktop_record": true,
+      "note": "run 1 is the first prompt in the process, including Triton compilation"
+    },
+    {
+      "prompt": "resident",
+      "size": 1024,
+      "seed": 700755787614899,
+      "server_e2e_s": [
+        59.27,
+        59.11
+      ],
+      "latent_sha256": "0107a68286504e82851d9452240f3995a3d9ab0f48b0cc6ce228df2d66b102b0",
+      "rgb_sha256": "7bb6d1aeed05524df43f217df803465891af5b2bb9976ad01d1445f40e6dcfac",
+      "matches_desktop_record": true
+    },
+    {
+      "prompt": "resident_resolution_change",
+      "size": 512,
+      "seed": 700755787614899,
+      "server_e2e_s": [
+        12.55,
+        13.06
+      ],
+      "latent_sha256": "4e4de4471ee4c36249a491d21676304c175f43b03ffe64d896df612cea2f8559",
+      "rgb_sha256": "e15a473efb7bc04da8532c078458a8047abaff6282e5755c885342db8a3457b6",
+      "matches_desktop_record": true
+    }
+  ],
+  "explicit_environment_ab": {
+    "environment": "eleven Desktop-record variables; separate Triton cache",
+    "warm_1024_s_per_it": 14.1,
+    "server_e2e_s": {
+      "first_prompt_1024": 85.22,
+      "resident_1024": 62.88,
+      "resident_512": 13.48
+    },
+    "output_hashes_match": true
+  },
+  "timing_observations": {
+    "warm_1024_s_per_it": 13.3,
+    "desktop_record_resident_server_e2e_s": {
+      "1024": 26.041,
+      "512": 7.092
+    },
+    "identical_to_desktop_installation": [
+      "runtime bundle payload",
+      "host DLLs",
+      "Python package versions"
+    ],
+    "available_memory_gb_during_1024_sampling": [
+      1.6,
+      3.4
+    ],
+    "disk_read_mb_s_during_1024_sampling": [
+      230,
+      280
+    ],
+    "cause": "not identified"
+  },
+  "harness_sha256": {
+    "smoke_api.py": "8c7450cc6e37a7ba1c2aed0564538d5a3bd14b17158c3b3a911bc20e437a63c2"
+  },
+  "limitations": [
+    "Validates the installer with locally supplied wheels and bundle, not public wheel availability.",
+    "Single machine; the Desktop-validated installation was not rerun for a same-day timing comparison.",
+    "Server times include sampling, VAE decoding and image/latent saving.",
+    "Output parity is against the same experimental INT8/AIR profile, not standard BF16.",
+    "The new installation was not registered in Comfy Desktop in this check.",
+    "No NPU power-mode change and no 1024x1024 CPU-only run.",
+    "Local paths, logs, latents and images are not published."
+  ]
+}

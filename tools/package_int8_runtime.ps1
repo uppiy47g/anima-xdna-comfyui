@@ -58,7 +58,7 @@ foreach ($name in @("i8-qkv-shared-l1k64", "i8-qkv-cross-l1k64")) {
             "xdna-runtime\int8-attn-l1k64-nq8pp\$name\$file"
     }
 }
-foreach ($name in @("self", "cross")) {
+foreach ($name in @("self", "cross", "self4096")) {
     foreach ($file in @("aie.elf", "manifest.json")) {
         Add-BundleFile "air-attention-nq8pp\$name\$file" `
             "xdna-runtime\air-attention-nq8pp\$name\$file"

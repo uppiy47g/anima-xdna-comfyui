@@ -121,9 +121,9 @@ equivalence claim.
 
 At 1024x1024 the profile runs its 512x512 INT8 kernels once per 1024-row tile
 and needs the AIR `self4096` artifact beside `self` and `cross` in the AIR
-directory. The runtime bundle installed by `install_int8_runtime.ps1` ships
-only the `self` and `cross` artifacts, so a 1024x1024 INT8 run needs a
-`self4096` directory added to that AIR directory by hand. The
+directory. The alpha.3 runtime bundle installed by `install_int8_runtime.ps1`
+includes it; an installation from the alpha.2 bundle needs a `self4096`
+directory added to that AIR directory by hand. The
 checked first prompt in a process runs sequentially, and later prompts overlap
 host work with NPU jobs, including AIR attention (bitwise identical results,
 about 18% faster warm sampling); set
@@ -137,8 +137,13 @@ remain part of the cache identity.
 
 ## Installation
 
-Place or clone this repository below `ComfyUI\custom_nodes`, then install it in
-the same Python environment that starts ComfyUI:
+On Windows, the
+[one-shot installer](../README.md#one-shot-windows-installer)
+(`tools\install_windows.ps1`) creates a dedicated ComfyUI installation with
+this node, its Python dependencies, the XRT SDK and the runtime
+configuration. To install manually instead, place or clone this repository
+below `ComfyUI\custom_nodes`, then install it in the same Python environment
+that starts ComfyUI:
 
 ```powershell
 git clone https://github.com/uppiy47g/anima-xdna-comfyui.git `
@@ -149,8 +154,14 @@ python -m pip install -e .
 
 That environment also needs the Windows XRT SDK/`pyxrt`, Triton-XDNA and its
 matching MLIR wheels. Set `XRT_DEV_DIR` to the XRT SDK directory before
-starting ComfyUI. The packed cache defaults to
+starting ComfyUI, or provide it in `xdna-runtime\anima-xdna.json` below the
+ComfyUI root, which the node reads at startup. The packed cache defaults to
 `%USERPROFILE%\.cache\anima-xdna\weights`.
+
+For a Desktop window around this same CPU + NPU backend, follow the
+[Comfy Desktop guide](../docs/comfy-desktop.md). Register the existing
+environment rather than installing the node into a GPU Python environment;
+the `--cpu` requirement remains unchanged.
 
 ## Nodes
 

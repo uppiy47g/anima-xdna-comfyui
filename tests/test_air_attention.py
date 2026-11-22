@@ -132,14 +132,15 @@ class AIRAttentionTests(unittest.TestCase):
         self.assertIn("$env:ANIMA_XDNA_ATTENTION_BACKEND = $AttentionBackend", launcher)
         self.assertIn('if ($AttentionBackend -eq "air")', launcher)
         self.assertIn("-AttentionBackend air requires -AIRAttentionDirectory.", launcher)
-        self.assertIn('version = "0.2.0a2"', (root / "pyproject.toml").read_text())
+        self.assertIn('version = "0.2.0a3"', (root / "pyproject.toml").read_text())
         notes = (root / "docs" / "releases" / "0.2.0-alpha.1.md").read_text()
         for warning in ("29.035%", "15.975/255", "27.095", "18.765", "28.98"):
             self.assertIn(warning, notes)
         runtime_notes = (root / "docs" / "releases" / "0.2.0-alpha.2.md").read_text()
         self.assertIn("versioned Windows x64 runtime bundle", runtime_notes)
+        self.assertIn("self4096", (root / "docs" / "releases" / "0.2.0-alpha.3.md").read_text())
         installer = (root / "tools" / "install_int8_runtime.ps1").read_text()
-        self.assertIn('$releaseTag = "v0.2.0-alpha.2"', installer)
+        self.assertIn('$releaseTag = "v0.2.0-alpha.3"', installer)
         self.assertIn("$asset.digest", installer)
 
     def test_backend_rejects_masks_and_cleans_partial_loads(self):

@@ -5,8 +5,8 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$releaseTag = "v0.2.0-alpha.2"
-$assetName = "anima-xdna-int8-runtime-0.2.0-alpha.2-win-x64.zip"
+$releaseTag = "v0.2.0-alpha.3"
+$assetName = "anima-xdna-int8-runtime-0.2.0-alpha.3-win-x64.zip"
 $nodeRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..")).Path
 $comfyRoot = (Resolve-Path -LiteralPath $ComfyUIRoot).Path
 $nodePackage = Join-Path $nodeRoot "anima_xdna_poc"
@@ -47,7 +47,7 @@ function Get-ExpectedBundlePaths {
             $paths.Add("xdna-runtime/int8-attn-l1k64-nq8pp/$name/$file")
         }
     }
-    foreach ($name in @("self", "cross")) {
+    foreach ($name in @("self", "cross", "self4096")) {
         foreach ($file in @("aie.elf", "manifest.json")) {
             $paths.Add("xdna-runtime/air-attention-nq8pp/$name/$file")
         }
